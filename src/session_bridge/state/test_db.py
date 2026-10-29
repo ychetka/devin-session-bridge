@@ -479,3 +479,101 @@ def test_item04_mark_notified_dedup_window(db_path):
         (int(time.time()) - 400, tid),
     )
     assert db.mark_notified(tid, path=db_path) is True
+
+
+def test_item04_gwt9_set_awaiting_user_clears_lease_stays_live(db_path):
+    tid = _enqueue_running(db_path, "s1", "w1")
+    # a stale owner cannot park somebody else's run
+    assert db.set_awaiting_user(tid, "w2", path=db_path) is False
+    assert db.set_awaiting_user(tid, "w1", note="parked", path=db_path)
+
+    row = db.get_task(tid, path=db_path)
+    assert row["status"] == "awaiting_user"
+    assert row["note"] == "parked"
+    # awaiting_user is live but carries no lease
+    assert row["lease_owner"] is None
+    assert row["lease_expires_at"] is None
+    assert db.enqueue("s1", "blocked", path=db_path) is None
+    # lease recovery ignores it - there is no lease to expire
+    _exec(db_path, "UPDATE tasks SET lease_expires_at=1 WHERE id=?", (tid,))
+    assert db.recover_stale(path=db_path) == []
+    _exec(db_path, "UPDATE tasks SET lease_expires_at=NULL WHERE id=?", (tid,))
+
+    # manual unpark is the only way back into the lifecycle
+    assert db.unpark(tid, path=db_path) is True
+    row = db.get_task(tid, path=db_path)
+    assert row["status"] == "queued"
+    assert db.claim_queued(tid, "w3", "hook-queue", path=db_path) is True
+
+
+def test_item04_gwt10_fallback_to_hook_atomic_requeue(db_path):
+    tid = db.enqueue("s1", "x", path=db_path)
+    assert db.claim_queued(tid, "w1", "acp-push", path=db_path)
+    # acp-push refused (session locked): a different owner cannot do it
+    assert db.fallback_to_hook(tid, "w2", path=db_path) is False
+    assert db.fallback_to_hook(tid, "w1", path=db_path) is True
+
+    row = db.get_task(tid, path=db_path)
+    # one statement: queued + hook transport, no half-state
+    assert row["status"] == "queued"
+    assert row["transport"] == "hook-queue"
+    assert row["lease_owner"] is None
+    # the task is claimable again through the hook path
+    assert db.claim_queued(tid, "w2", "hook-queue", path=db_path) is True
+    # fallback only applies to dispatch_decided
+    assert db.mark_running(tid, "w2", path=db_path)
+    assert db.fallback_to_hook(tid, "w2", path=db_path) is False
+
+
+def test_item04_gwt11_pause_unpark_cycle(db_path):
+    tid = db.enqueue("s1", "x", path=db_path)
+    assert db.pause(tid, path=db_path) is True
+    row = db.get_task(tid, path=db_path)
+    assert row["status"] == "paused"
+    # paused is not live: claim skips it and enqueue is not blocked
+    assert db.claim_queued(tid, "w", "acp-push", path=db_path) is False
+    live = db.enqueue("s1", "other live task", path=db_path)
+    assert live is not None
+
+    # unpark cannot resurrect while another live task holds the slot
+    assert db.unpark(tid, path=db_path) is False
+    row = db.get_task(tid, path=db_path)
+    assert row["status"] == "paused"  # untouched, not crashed
+
+    # once the slot frees, unpark lands the task back in queued
+    assert db.clear(live, path=db_path) is True
+    assert db.unpark(tid, path=db_path) is True
+    row = db.get_task(tid, path=db_path)
+    assert row["status"] == "queued"
+
+    # pause/unpark only apply to their declared manual edges
+    assert db.claim_queued(tid, "w", "acp-push", path=db_path)
+    assert db.pause(tid, path=db_path) is False  # dispatch_decided, not queued
+    assert db.unpark(tid, path=db_path) is False  # not parked/awaiting
+
+
+def test_item04_gwt12_clear_queued_only(db_path):
+    tid = db.enqueue("s1", "x", path=db_path)
+    assert db.clear(tid, path=db_path) is True
+    assert db.get_task(tid, path=db_path) is None
+
+    # clearing is refused beyond queued
+    tid2 = _enqueue_running(db_path, "s1", "w1")
+    assert db.clear(tid2, path=db_path) is False
+    row = db.get_task(tid2, path=db_path)
+    assert row["status"] == "running"
+
+
+def test_item04_gwt13_session_pause_helper(db_path):
+    # pausing a session that has no row yet creates it
+    db.session_pause("s1", True, path=db_path)
+    row = db.get_session("s1", path=db_path)
+    assert row["queue_paused"] == 1
+
+    tid = db.enqueue("s1", "x", path=db_path)
+    assert db.claim_queued(tid, "w", "acp-push", path=db_path) is False
+
+    db.session_pause("s1", False, path=db_path)
+    row = db.get_session("s1", path=db_path)
+    assert row["queue_paused"] == 0
+    assert db.claim_queued(tid, "w", "acp-push", path=db_path) is True

@@ -26,6 +26,7 @@ from .contract import (
     MAX_ATTEMPTS,
     WRITER_RETRIES,
     TaskStatus,
+    Transport,
 )
 
 
@@ -524,6 +525,153 @@ def mark_notified(task_id: int, *, path=None) -> bool:
     return _retry(op)
 
 
+def set_awaiting_user(
+    task_id: int, owner: str, note: str | None = None, *, path=None
+) -> bool:
+    """CAS ``running > awaiting_user`` for the lease owner.
+
+    ``awaiting_user`` is live (still blocks ``enqueue``) but carries no
+    lease - lease owner and expiry are cleared. A stale worker loses
+    the CAS and cannot park somebody else's run.
+    """
+    ts = _now()
+
+    def op():
+        con = connect(path)
+        try:
+            cur = con.execute(
+                "UPDATE tasks SET status=?, note=COALESCE(?,note),"
+                " lease_owner=NULL, lease_expires_at=NULL, updated_at=?"
+                " WHERE id=? AND status=? AND lease_owner=?",
+                (
+                    TaskStatus.AWAITING_USER.value,
+                    note,
+                    ts,
+                    task_id,
+                    TaskStatus.RUNNING.value,
+                    owner,
+                ),
+            )
+            return cur.rowcount == 1
+        finally:
+            con.close()
+
+    return _retry(op)
+
+
+def fallback_to_hook(task_id: int, owner: str, *, path=None) -> bool:
+    """CAS ``dispatch_decided > queued`` switching transport to hook-queue.
+
+    The atomic transport fallback: an acp-push refused because the
+    session turned out locked requeues the task for the hook path in
+    one statement - no half-state. The stale claim's lease_owner is
+    cleared so the next claimant starts clean.
+    """
+    ts = _now()
+
+    def op():
+        con = connect(path)
+        try:
+            cur = con.execute(
+                "UPDATE tasks SET status=?, transport=?, lease_owner=NULL,"
+                " updated_at=? WHERE id=? AND status=? AND lease_owner=?",
+                (
+                    TaskStatus.QUEUED.value,
+                    Transport.HOOK_QUEUE.value,
+                    ts,
+                    task_id,
+                    TaskStatus.DISPATCH_DECIDED.value,
+                    owner,
+                ),
+            )
+            return cur.rowcount == 1
+        finally:
+            con.close()
+
+    return _retry(op)
+
+
+def pause(task_id: int, *, path=None) -> bool:
+    """Manual ``pause`` command: ``queued > paused``.
+
+    ``paused`` is not a live status, so the task stops blocking
+    ``enqueue`` and is skipped by ``claim_queued`` until unparked.
+    """
+    ts = _now()
+
+    def op():
+        con = connect(path)
+        try:
+            cur = con.execute(
+                "UPDATE tasks SET status=?, updated_at=?"
+                " WHERE id=? AND status=?",
+                (TaskStatus.PAUSED.value, ts, task_id, TaskStatus.QUEUED.value),
+            )
+            return cur.rowcount == 1
+        finally:
+            con.close()
+
+    return _retry(op)
+
+
+def unpark(task_id: int, note: str | None = None, *, path=None) -> bool:
+    """Manual ``unpark``: ``awaiting_user > queued`` or ``paused > queued``.
+
+    Both edges are declared on the manual path and converge on queued,
+    so a single guarded UPDATE covers both. Lease fields are cleared
+    defensively. Returns False when the task is not parked/awaiting, or
+    when another live task already holds the session slot (the unique
+    live-task index rejects the move; the task stays as it is).
+    """
+    ts = _now()
+
+    def op():
+        con = connect(path)
+        try:
+            cur = con.execute(
+                "UPDATE tasks SET status=?, note=COALESCE(?,note),"
+                " lease_owner=NULL, lease_expires_at=NULL,"
+                " lease_renewed_at=NULL, updated_at=?"
+                " WHERE id=? AND status IN (?, ?)",
+                (
+                    TaskStatus.QUEUED.value,
+                    note,
+                    ts,
+                    task_id,
+                    TaskStatus.AWAITING_USER.value,
+                    TaskStatus.PAUSED.value,
+                ),
+            )
+            return cur.rowcount == 1
+        except sqlite3.IntegrityError:
+            return False  # ux_tasks_live_session: slot already taken
+        finally:
+            con.close()
+
+    return _retry(op)
+
+
+def clear(task_id: int, *, path=None) -> bool:
+    """Cancel a ``queued`` task by deleting its row.
+
+    Deletion is not a status transition, so only queued tasks are
+    clearable - anything further along the lifecycle must be resolved
+    through the transition API.
+    """
+    def op():
+        con = connect(path)
+        try:
+            cur = con.execute(
+                "DELETE FROM tasks WHERE id=? AND status=?",
+                (task_id, TaskStatus.QUEUED.value),
+            )
+            return cur.rowcount == 1
+        finally:
+            con.close()
+
+    return _retry(op)
+
+
 # --- task reads -------------------------------------------------------------
 
 
@@ -613,6 +761,15 @@ def upsert_session(session_id: str, *, path=None, **fields) -> None:
             con.close()
 
     _retry(op)
+
+
+def session_pause(session_id: str, paused: bool, *, path=None) -> None:
+    """Set or clear Session.queue_paused (the smart-kick pause flag).
+
+    Creates the sessions row when absent - pausing a session the bridge
+    has not seen yet is valid.
+    """
+    upsert_session(session_id, queue_paused=bool(paused), path=path)
 
 
 def get_session(session_id: str, *, path=None):
