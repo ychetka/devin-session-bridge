@@ -464,6 +464,20 @@ def _work_task(task_id: int, owner: str, args) -> JsonResponse:
                 "task is not owned by this worker; do not retry"
             ),
         )
+    # ownership re-check before any side effect: the row fetched above
+    # may be stale by the time the acp prompt would run (expired lease
+    # reclaimed by recover_stale, a recycled task id, a manually
+    # spawned worker with a mistyped --owner). A stale or foreign
+    # worker must never double-prompt a task owned by somebody else.
+    task = db.get_task(task_id, path=args.db)
+    if task is None or task["lease_owner"] != owner:
+        return JsonResponse(
+            session=sid,
+            status=(task["status"] if task is not None else "not_found"),
+            agent_instruction=(
+                "task is not owned by this worker; do not retry"
+            ),
+        )
 
     cwd = _session_cwd(sid, args)
     if cwd is None:
