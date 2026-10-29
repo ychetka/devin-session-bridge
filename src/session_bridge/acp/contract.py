@@ -37,6 +37,7 @@ META_IS_LOCKED: Final[str] = "cognition.ai/isLocked"
 META_LOCK_HOLDER_PID: Final[str] = "cognition.ai/lockHolderPid"
 META_HAS_USER_MESSAGES: Final[str] = "cognition.ai/hasUserMessages"
 META_ERROR_KIND: Final[str] = "cognition.ai/errorKind"
+META_RETRYABLE: Final[str] = "cognition.ai/retryable"
 
 # usage dict keys inside the session/prompt result
 USAGE_TOTAL_TOKENS: Final[str] = "totalTokens"
@@ -82,12 +83,26 @@ class SessionUpdateKind(str, Enum):
 
 
 class JsonRpcRequest(BaseModel):
-    """Outbound request envelope, one per line on the process stdin."""
+    """Outbound request envelope, one per line on the process stdin.
+    Requests always carry an ``id`` the response is matched by;
+    notifications (``session/cancel``) have none - use
+    ``JsonRpcNotification`` for those."""
 
     model_config = ConfigDict(extra="forbid")
 
     jsonrpc: Literal["2.0"] = JSONRPC_VERSION
     id: int = Field(ge=1)
+    method: Method
+    params: dict[str, Any] = Field(default_factory=dict)
+
+
+class JsonRpcNotification(BaseModel):
+    """Outbound notification envelope: a request without ``id`` (the
+    server sends no response). Used for ``session/cancel``."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    jsonrpc: Literal["2.0"] = JSONRPC_VERSION
     method: Method
     params: dict[str, Any] = Field(default_factory=dict)
 
@@ -304,14 +319,16 @@ class PromptResult(BaseModel):
 
 
 class ErrorData(BaseModel):
-    """``error.data`` payload. ``retryable`` and ``lockHolderPid`` are
-    plain keys; only the error kind is namespaced."""
+    """``error.data`` payload. All keys are namespaced under
+    ``cognition.ai/`` on the wire."""
 
     model_config = ConfigDict(extra="allow", populate_by_name=True)
 
     kind: str | None = Field(default=None, alias=META_ERROR_KIND)
-    retryable: bool | None = None
-    lock_holder_pid: int | None = Field(default=None, alias="lockHolderPid")
+    retryable: bool | None = Field(default=None, alias=META_RETRYABLE)
+    lock_holder_pid: int | None = Field(
+        default=None, alias=META_LOCK_HOLDER_PID
+    )
 
 
 class JsonRpcError(BaseModel):

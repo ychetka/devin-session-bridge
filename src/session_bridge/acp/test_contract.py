@@ -15,6 +15,7 @@ from session_bridge.acp.contract import (
     AuthenticateParams,
     ErrorKind,
     JsonRpcError,
+    JsonRpcNotification,
     JsonRpcRequest,
     Method,
     PromptBlock,
@@ -39,8 +40,8 @@ def test_item03_gwt1_session_locked_error_kind_modelled() -> None:
             "message": "session is locked",
             "data": {
                 "cognition.ai/errorKind": "session_locked",
-                "retryable": False,
-                "lockHolderPid": 4242,
+                "cognition.ai/retryable": False,
+                "cognition.ai/lockHolderPid": 4242,
             },
         }
     )
@@ -187,6 +188,29 @@ def test_item03_request_envelope_pins_jsonrpc() -> None:
         )
     with pytest.raises(ValidationError):
         JsonRpcRequest(id=0, method=Method.SESSION_LIST)
+
+
+def test_item03_session_cancel_is_a_notification() -> None:
+    # session/cancel carries no id: the server sends no response
+    note = JsonRpcNotification(
+        method=Method.SESSION_CANCEL,
+        params={"sessionId": "s1"},
+    )
+    assert note.model_dump(mode="json") == {
+        "jsonrpc": "2.0",
+        "method": "session/cancel",
+        "params": {"sessionId": "s1"},
+    }
+    # an id on a notification is a malformed message
+    with pytest.raises(ValidationError):
+        JsonRpcNotification.model_validate(
+            {"jsonrpc": "2.0", "id": 7, "method": "session/cancel"}
+        )
+    # and a request still refuses to drop its id
+    with pytest.raises(ValidationError):
+        JsonRpcRequest.model_validate(
+            {"jsonrpc": "2.0", "method": "session/list"}
+        )
 
 
 def test_item03_authenticate_params_shape() -> None:
