@@ -1,0 +1,694 @@
+"""state.db persistence layer for sessions-bridge.
+
+Implements the c_state contract (contract.py): SQLite WAL storage, a
+single live task per session, owner-CAS lease transitions and lazy
+lease-expiry recovery.
+
+Concurrency model: every public operation opens its own connection in
+autocommit mode (``isolation_level=None``). Each mutation is a single
+UPDATE guarded by a WHERE clause on the expected status/lease owner;
+``rowcount == 1`` means the CAS won, ``0`` means it lost to a
+concurrent transition - no SELECT-then-UPDATE on the claim path.
+Writers retry SQLITE_BUSY with exponential backoff on top of the
+``busy_timeout`` pragma.
+"""
+
+import os
+import sqlite3
+import time
+from enum import Enum
+
+from .contract import (
+    BUSY_TIMEOUT_MS,
+    JOURNAL_MODE,
+    LEASE_SECONDS,
+    LIVE_STATUSES,
+    MAX_ATTEMPTS,
+    WRITER_RETRIES,
+    TaskStatus,
+)
+
+
+class BridgeDBError(Exception):
+    """Unrecoverable state.db problem (e.g. a corrupt database file)."""
+
+
+def _default_db_path() -> str:
+    override = os.environ.get("SESSIONS_BRIDGE_DB")
+    if override:
+        return override
+    data_home = os.environ.get("XDG_DATA_HOME") or os.path.expanduser(
+        "~/.local/share"
+    )
+    return os.path.join(data_home, "sessions-bridge", "state.db")
+
+
+#: Default location of state.db. state.db must live at a fixed absolute
+#: path because hook workers run in foreign repositories; env override
+#: is provided for tests and manual operation.
+DB_PATH = _default_db_path()
+
+#: Devin CLI storage (read-only for us - Devin's acp owns these files).
+DEVIN_CLI_DIR = os.path.expanduser("~/.local/share/devin/cli")
+DEVIN_SESSIONS_DB = os.path.join(DEVIN_CLI_DIR, "sessions.db")
+SESSION_LOCKS_DIR = os.path.join(DEVIN_CLI_DIR, "session_locks")
+
+#: mark_notified refuses to re-flag a task inside this window.
+NOTIFY_DEDUP_SECONDS = 300
+
+_BUSY_BASE_DELAY = 0.1
+
+# Live statuses as a SQL literal list, derived from the contract so the
+# enqueue guard and the live-task index can never drift apart.
+_LIVE_SQL = ", ".join(
+    f"'{v}'" for v in sorted(s.value for s in LIVE_STATUSES)
+)
+
+_SCHEMA = f"""
+CREATE TABLE IF NOT EXISTS tasks (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id TEXT NOT NULL,
+  task_text TEXT,
+  task_file TEXT,
+  status TEXT NOT NULL,
+  transport TEXT,
+  lease_owner TEXT,
+  lease_expires_at INTEGER,
+  lease_renewed_at INTEGER,
+  attempt INTEGER NOT NULL DEFAULT 0,
+  hook_pid INTEGER,
+  last_notified_at INTEGER,
+  last_assistant_message TEXT,
+  note TEXT,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+
+-- At most one live task per session; this is what enqueue() relies on.
+CREATE UNIQUE INDEX IF NOT EXISTS ux_tasks_live_session
+  ON tasks(session_id) WHERE status IN ({_LIVE_SQL});
+
+CREATE TABLE IF NOT EXISTS sessions (
+  session_id TEXT PRIMARY KEY,
+  cwd TEXT,
+  title TEXT,
+  queue_paused INTEGER NOT NULL DEFAULT 0,
+  park_cycles_left INTEGER NOT NULL DEFAULT 5,
+  note TEXT,
+  updated_at INTEGER NOT NULL
+);
+
+PRAGMA user_version=1;
+"""
+
+_SESSION_FIELDS = frozenset(
+    {"cwd", "title", "queue_paused", "park_cycles_left", "note"}
+)
+
+
+def _now() -> int:
+    return int(time.time())
+
+
+def _val(v):
+    """Accept both plain strings and contract enums."""
+    return v.value if isinstance(v, Enum) else v
+
+
+def _path(path) -> str:
+    return os.fspath(path) if path is not None else DB_PATH
+
+
+def _is_busy(exc: sqlite3.OperationalError) -> bool:
+    return "locked" in str(exc).lower()
+
+
+def _retry(op, tries: int = WRITER_RETRIES, base: float = _BUSY_BASE_DELAY):
+    """Run ``op`` retrying SQLITE_BUSY with exponential backoff."""
+    for i in range(tries):
+        try:
+            return op()
+        except sqlite3.OperationalError as e:
+            if not _is_busy(e) or i == tries - 1:
+                raise
+            time.sleep(base * (2**i))
+
+
+def connect(path=None) -> sqlite3.Connection:
+    """Open a state.db connection: Row factory, WAL, busy_timeout.
+
+    Autocommit mode (``isolation_level=None``); single statements are
+    atomic and no explicit transaction is required. Raises
+    ``BridgeDBError`` when the file exists but is not a readable SQLite
+    database; a missing file yields a connection to a fresh empty db.
+    """
+    target = _path(path)
+    con = None
+    try:
+        con = sqlite3.connect(target, isolation_level=None)
+        con.row_factory = sqlite3.Row
+        con.execute(f"PRAGMA journal_mode={JOURNAL_MODE}")
+        con.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
+        # Probe the header so a corrupt file fails here, not mid-op.
+        con.execute("PRAGMA schema_version").fetchone()
+        return con
+    except sqlite3.DatabaseError as e:
+        if con is not None:
+            con.close()
+        if isinstance(e, sqlite3.OperationalError) and _is_busy(e):
+            raise  # transient; callers' _retry handles it
+        raise BridgeDBError(
+            f"state.db at {target} is not a readable database: {e}"
+        ) from e
+
+
+def init(path=None) -> None:
+    """Create the schema (idempotent) and set user_version=1."""
+    target = _path(path)
+    parent = os.path.dirname(target)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+    def op():
+        con = connect(target)
+        try:
+            con.executescript(_SCHEMA)
+        finally:
+            con.close()
+
+    _retry(op)
+
+
+# --- tasks -----------------------------------------------------------------
+
+
+def enqueue(
+    session_id: str,
+    task_text: str | None = None,
+    task_file: str | None = None,
+    *,
+    path=None,
+) -> int | None:
+    """Insert a queued task; return its id.
+
+    Returns ``None`` when a live task already exists for the session -
+    enforced atomically by the ``ux_tasks_live_session`` partial unique
+    index, so a concurrent enqueue can never produce two live tasks.
+    """
+    if not (task_text or task_file):
+        raise ValueError("enqueue requires task_text or task_file")
+    ts = _now()
+
+    def op():
+        con = connect(path)
+        try:
+            cur = con.execute(
+                "INSERT INTO tasks"
+                "(session_id,task_text,task_file,status,created_at,updated_at)"
+                " VALUES(?,?,?,?,?,?)",
+                (
+                    session_id,
+                    task_text,
+                    task_file,
+                    TaskStatus.QUEUED.value,
+                    ts,
+                    ts,
+                ),
+            )
+            return cur.lastrowid
+        except sqlite3.IntegrityError:
+            return None  # ux_tasks_live_session: live task exists
+        finally:
+            con.close()
+
+    return _retry(op)
+
+
+def claim_queued(task_id: int, owner: str, transport, *, path=None) -> bool:
+    """CAS ``queued > dispatch_decided`` for ``owner``.
+
+    Tasks of sessions with ``queue_paused=1`` are skipped; a session
+    without a sessions row is claimable.
+    """
+    ts = _now()
+
+    def op():
+        con = connect(path)
+        try:
+            cur = con.execute(
+                "UPDATE tasks SET status=?, transport=?, lease_owner=?,"
+                " updated_at=? WHERE id=? AND status=? AND COALESCE("
+                "  (SELECT queue_paused FROM sessions"
+                "   WHERE session_id=tasks.session_id), 0) = 0",
+                (
+                    TaskStatus.DISPATCH_DECIDED.value,
+                    _val(transport),
+                    owner,
+                    ts,
+                    task_id,
+                    TaskStatus.QUEUED.value,
+                ),
+            )
+            return cur.rowcount == 1
+        finally:
+            con.close()
+
+    return _retry(op)
+
+
+def mark_running(task_id: int, owner: str, *, path=None) -> bool:
+    """CAS ``dispatch_decided > running`` for the claimant; sets lease."""
+    ts = _now()
+
+    def op():
+        con = connect(path)
+        try:
+            cur = con.execute(
+                "UPDATE tasks SET status=?, lease_expires_at=?,"
+                " lease_renewed_at=?, updated_at=?"
+                " WHERE id=? AND status=? AND lease_owner=?",
+                (
+                    TaskStatus.RUNNING.value,
+                    ts + LEASE_SECONDS,
+                    ts,
+                    ts,
+                    task_id,
+                    TaskStatus.DISPATCH_DECIDED.value,
+                    owner,
+                ),
+            )
+            return cur.rowcount == 1
+        finally:
+            con.close()
+
+    return _retry(op)
+
+
+def renew_lease(task_id: int, owner: str, *, path=None) -> bool:
+    """Extend the lease; CAS on ``status='running' AND lease_owner``."""
+    ts = _now()
+
+    def op():
+        con = connect(path)
+        try:
+            cur = con.execute(
+                "UPDATE tasks SET lease_expires_at=?, lease_renewed_at=?,"
+                " updated_at=? WHERE id=? AND status=? AND lease_owner=?",
+                (
+                    ts + LEASE_SECONDS,
+                    ts,
+                    ts,
+                    task_id,
+                    TaskStatus.RUNNING.value,
+                    owner,
+                ),
+            )
+            return cur.rowcount == 1
+        finally:
+            con.close()
+
+    return _retry(op)
+
+
+def release_lease(task_id: int, owner: str | None = None, *, path=None) -> bool:
+    """Clear lease owner/expiry; CAS on owner when one is given."""
+    ts = _now()
+
+    def op():
+        con = connect(path)
+        try:
+            if owner is None:
+                cur = con.execute(
+                    "UPDATE tasks SET lease_owner=NULL,"
+                    " lease_expires_at=NULL, updated_at=? WHERE id=?",
+                    (ts, task_id),
+                )
+            else:
+                cur = con.execute(
+                    "UPDATE tasks SET lease_owner=NULL,"
+                    " lease_expires_at=NULL, updated_at=?"
+                    " WHERE id=? AND lease_owner=?",
+                    (ts, task_id, owner),
+                )
+            return cur.rowcount == 1
+        finally:
+            con.close()
+
+    return _retry(op)
+
+
+def requeue_or_fail(task_id: int, note: str | None = None, *, path=None):
+    """Lease-expiry recovery for a running task.
+
+    ``attempt + 1 < MAX_ATTEMPTS`` requeues to ``queued``; otherwise the
+    task lands on terminal ``failed``. Both branches are a single CAS
+    UPDATE guarded on the still-expired lease, so concurrent recoveries
+    are idempotent. Returns the new ``TaskStatus`` or ``None`` when the
+    task was already moved (renewed or recovered by someone else).
+    """
+    ts = _now()
+    guard = (
+        " WHERE id=? AND status=? AND lease_expires_at IS NOT NULL"
+        " AND lease_expires_at<?"
+    )
+
+    def op():
+        con = connect(path)
+        try:
+            cur = con.execute(
+                "UPDATE tasks SET status=?, attempt=attempt+1,"
+                " lease_owner=NULL, lease_expires_at=NULL,"
+                " note=COALESCE(?,note), updated_at=?"
+                + guard
+                + " AND attempt+1<?",
+                (
+                    TaskStatus.QUEUED.value,
+                    note,
+                    ts,
+                    task_id,
+                    TaskStatus.RUNNING.value,
+                    ts,
+                    MAX_ATTEMPTS,
+                ),
+            )
+            if cur.rowcount == 1:
+                return TaskStatus.QUEUED
+            cur = con.execute(
+                "UPDATE tasks SET status=?, attempt=attempt+1,"
+                " lease_owner=NULL, lease_expires_at=NULL,"
+                " note=COALESCE(?,note), updated_at=?"
+                + guard
+                + " AND attempt+1>=?",
+                (
+                    TaskStatus.FAILED.value,
+                    note,
+                    ts,
+                    task_id,
+                    TaskStatus.RUNNING.value,
+                    ts,
+                    MAX_ATTEMPTS,
+                ),
+            )
+            if cur.rowcount == 1:
+                return TaskStatus.FAILED
+            return None
+        finally:
+            con.close()
+
+    return _retry(op)
+
+
+def recover_stale(*, path=None) -> list[int]:
+    """Requeue-or-fail every running task whose lease has expired.
+
+    Lazy recovery: safe and cheap to call on any read path; returns the
+    ids this call actually transitioned.
+    """
+    ts = _now()
+
+    def op():
+        con = connect(path)
+        try:
+            rows = con.execute(
+                "SELECT id FROM tasks WHERE status=?"
+                " AND lease_expires_at IS NOT NULL AND lease_expires_at<?",
+                (TaskStatus.RUNNING.value, ts),
+            ).fetchall()
+            return [r["id"] for r in rows]
+        finally:
+            con.close()
+
+    stale = _retry(op)
+    recovered = []
+    for tid in stale:
+        if requeue_or_fail(tid, note="lease expired", path=path) is not None:
+            recovered.append(tid)
+    return recovered
+
+
+def finish_task(
+    task_id: int,
+    owner: str,
+    ok: bool,
+    last_assistant_message: str | None = None,
+    note: str | None = None,
+    *,
+    path=None,
+) -> bool:
+    """CAS ``running > done|failed`` for the lease owner.
+
+    A stale worker (owner mismatch, e.g. after lease expiry and reclaim)
+    loses the CAS and cannot overwrite the current owner's state.
+    """
+    target = TaskStatus.DONE.value if ok else TaskStatus.FAILED.value
+    ts = _now()
+
+    def op():
+        con = connect(path)
+        try:
+            cur = con.execute(
+                "UPDATE tasks SET status=?,"
+                " last_assistant_message=COALESCE(?,last_assistant_message),"
+                " note=COALESCE(?,note), lease_owner=NULL,"
+                " lease_expires_at=NULL, updated_at=?"
+                " WHERE id=? AND status=? AND lease_owner=?",
+                (
+                    target,
+                    last_assistant_message,
+                    note,
+                    ts,
+                    task_id,
+                    TaskStatus.RUNNING.value,
+                    owner,
+                ),
+            )
+            return cur.rowcount == 1
+        finally:
+            con.close()
+
+    return _retry(op)
+
+
+def retry(task_id: int, note: str | None = None, *, path=None) -> bool:
+    """Manual ``retry`` command: terminal ``failed > queued``.
+
+    Resets ``attempt`` and clears all lease fields. The automatic
+    transition map has no edge out of ``failed`` - this is the only exit.
+    """
+    ts = _now()
+
+    def op():
+        con = connect(path)
+        try:
+            cur = con.execute(
+                "UPDATE tasks SET status=?, attempt=0, lease_owner=NULL,"
+                " lease_expires_at=NULL, lease_renewed_at=NULL,"
+                " note=COALESCE(?,note), updated_at=?"
+                " WHERE id=? AND status=?",
+                (
+                    TaskStatus.QUEUED.value,
+                    note,
+                    ts,
+                    task_id,
+                    TaskStatus.FAILED.value,
+                ),
+            )
+            return cur.rowcount == 1
+        finally:
+            con.close()
+
+    return _retry(op)
+
+
+def mark_notified(task_id: int, *, path=None) -> bool:
+    """Flag a task as notified; deduplicated over NOTIFY_DEDUP_SECONDS.
+
+    Returns True when the flag was set (a notification should go out),
+    False when the task was already notified inside the window.
+    """
+    ts = _now()
+
+    def op():
+        con = connect(path)
+        try:
+            cur = con.execute(
+                "UPDATE tasks SET last_notified_at=?, updated_at=?"
+                " WHERE id=? AND (last_notified_at IS NULL"
+                " OR last_notified_at<=?)",
+                (ts, ts, task_id, ts - NOTIFY_DEDUP_SECONDS),
+            )
+            return cur.rowcount == 1
+        finally:
+            con.close()
+
+    return _retry(op)
+
+
+# --- task reads -------------------------------------------------------------
+
+
+def get_task(task_id: int, *, path=None):
+    def op():
+        con = connect(path)
+        try:
+            return con.execute(
+                "SELECT * FROM tasks WHERE id=?", (task_id,)
+            ).fetchone()
+        finally:
+            con.close()
+
+    return _retry(op)
+
+
+def get_live_task(session_id: str, *, path=None):
+    def op():
+        con = connect(path)
+        try:
+            return con.execute(
+                f"SELECT * FROM tasks WHERE session_id=?"
+                f" AND status IN ({_LIVE_SQL}) ORDER BY id",
+                (session_id,),
+            ).fetchone()
+        finally:
+            con.close()
+
+    return _retry(op)
+
+
+def list_tasks(status=None, *, path=None, limit: int = 50):
+    def op():
+        con = connect(path)
+        try:
+            if status is not None:
+                return con.execute(
+                    "SELECT * FROM tasks WHERE status=? ORDER BY id",
+                    (_val(status),),
+                ).fetchall()
+            return con.execute(
+                "SELECT * FROM tasks ORDER BY id DESC LIMIT ?", (limit,)
+            ).fetchall()
+        finally:
+            con.close()
+
+    return _retry(op)
+
+
+# --- sessions ---------------------------------------------------------------
+
+
+def upsert_session(session_id: str, *, path=None, **fields) -> None:
+    """Insert-or-update a sessions row (single atomic statement).
+
+    Only whitelisted columns may be written: cwd, title, queue_paused,
+    park_cycles_left, note.
+    """
+    bad = set(fields) - _SESSION_FIELDS
+    if bad:
+        raise ValueError(f"unknown session fields: {sorted(bad)}")
+    ts = _now()
+    values = {
+        k: int(v) if isinstance(v, bool) else v for k, v in fields.items()
+    }
+
+    def op():
+        con = connect(path)
+        try:
+            if values:
+                cols = list(values) + ["updated_at"]
+                ph = ", ".join("?" for _ in cols)
+                sets = ", ".join(f"{c}=excluded.{c}" for c in cols)
+                con.execute(
+                    f"INSERT INTO sessions(session_id,{', '.join(cols)})"
+                    f" VALUES(?,{ph}) ON CONFLICT(session_id)"
+                    f" DO UPDATE SET {sets}",
+                    (session_id, *values.values(), ts),
+                )
+            else:
+                con.execute(
+                    "INSERT INTO sessions(session_id,updated_at)"
+                    " VALUES(?,?) ON CONFLICT(session_id) DO NOTHING",
+                    (session_id, ts),
+                )
+        finally:
+            con.close()
+
+    _retry(op)
+
+
+def get_session(session_id: str, *, path=None):
+    def op():
+        con = connect(path)
+        try:
+            return con.execute(
+                "SELECT * FROM sessions WHERE session_id=?", (session_id,)
+            ).fetchone()
+        finally:
+            con.close()
+
+    return _retry(op)
+
+
+# --- devin cli integration (read-only) --------------------------------------
+
+
+def sessions_db_lookup(session_id: str, *, db_path=None) -> dict | None:
+    """Read-only lookup into Devin's own sessions.db.
+
+    Small retry on busy; graceful ``None`` when the file is missing or
+    unreadable. Never writes - Devin's acp owns that file.
+    """
+    target = os.path.expanduser(db_path or DEVIN_SESSIONS_DB)
+    if not os.path.exists(target):
+        return None
+
+    def op():
+        con = None
+        try:
+            con = sqlite3.connect(
+                f"file:{target}?mode=ro", uri=True, timeout=1
+            )
+            con.row_factory = sqlite3.Row
+            row = con.execute(
+                "SELECT * FROM sessions WHERE id=?", (session_id,)
+            ).fetchone()
+            return dict(row) if row is not None else None
+        except sqlite3.Error as e:
+            if isinstance(e, sqlite3.OperationalError) and _is_busy(e):
+                raise  # transient; retried below
+            return None  # unreadable file or unexpected schema
+        finally:
+            if con is not None:
+                con.close()
+
+    try:
+        return _retry(op, tries=3, base=0.1)
+    except sqlite3.OperationalError:
+        return None
+
+
+def is_locked(session_id: str) -> tuple[bool, int | None]:
+    """Whether the session is held by a live devin process.
+
+    Reads the lock-file PID and checks ``/proc/<pid>/cmdline`` for
+    'devin' - the proc read doubles as the liveness check and guards
+    against PID reuse. Returns ``(locked, pid_or_None)``.
+    """
+    lock = os.path.join(
+        os.path.expanduser(SESSION_LOCKS_DIR), f"{session_id}.lock"
+    )
+    try:
+        with open(lock) as f:
+            pid = int(f.read().strip())
+    except (OSError, ValueError):
+        return False, None
+    if _pid_is_devin(pid):
+        return True, pid
+    return False, pid
+
+
+def _pid_is_devin(pid: int) -> bool:
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            return b"devin" in f.read()
+    except OSError:
+        return False
