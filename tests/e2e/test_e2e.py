@@ -491,7 +491,9 @@ def test_item08_gwt2_locked_session_task_picked_up_via_stop(
     )
     assert res.returncode == 0, res.stderr
     hooks_file = scratch_repo / ".devin" / "hooks.v1.json"
-    hooks = json.loads(hooks_file.read_text())["hooks"]
+    # hooks.v1.json: the hooks object is the entire file - top-level
+    # keys are event names, no "hooks" wrapper (issue #7)
+    hooks = json.loads(hooks_file.read_text())
     stop_commands = [
         h["command"]
         for entry in hooks.get("Stop", [])
