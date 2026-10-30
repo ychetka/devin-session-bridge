@@ -15,6 +15,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest",
+    "pytest-timeout",
 ]
 
 [project.scripts]
@@ -22,3 +23,7 @@ bridge = "session_bridge.cli.bridge:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/session_bridge"]
+
+[tool.pytest.ini_options]
+markers = ["e2e: live tests requiring local devin binary and ACP"]
+timeout = 60

@@ -1,0 +1,26 @@
+name: Lint
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+      - name: Check lint
+        run: uvx ruff@0.17.3 check .
+      - name: Check formatting
+        run: uvx ruff@0.17.3 format --check .
