@@ -457,10 +457,10 @@ def test_item06_gwt6_install_on_repo_without_devin(tmp_path):
         "UserPromptSubmit",
         "Stop",
     ):
-        assert event in data["hooks"]
+        assert event in data
     stop_cmds = [
         h["command"]
-        for e in data["hooks"]["Stop"]
+        for e in data["Stop"]
         for h in e["hooks"]
         if "worker.py" in h.get("command", "")
     ]
@@ -472,7 +472,7 @@ def test_item06_gwt6_install_on_repo_without_devin(tmp_path):
     # installed timeout covers a park cycle
     ours = [
         h
-        for e in data["hooks"]["Stop"]
+        for e in data["Stop"]
         for h in e["hooks"]
         if "worker.py" in h.get("command", "")
     ][0]
@@ -483,26 +483,24 @@ def test_item06_gwt6_install_is_idempotent_and_preserves(tmp_path):
     repo = tmp_path / "target"
     (repo / ".devin").mkdir(parents=True)
     foreign = {
-        "hooks": {
-            "Stop": [
-                {
-                    "matcher": "",
-                    "hooks": [
-                        {
-                            "type": "command",
-                            "command": "other-tool hook",
-                            "timeout": 15,
-                        }
-                    ],
-                }
-            ]
-        }
+        "Stop": [
+            {
+                "matcher": "",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "other-tool hook",
+                        "timeout": 15,
+                    }
+                ],
+            }
+        ]
     }
     (repo / ".devin" / "hooks.v1.json").write_text(json.dumps(foreign))
     assert _install(repo).returncode == 0
     assert _install(repo).returncode == 0  # second run stays clean
     data = _hooks(repo)
-    stop = data["hooks"]["Stop"]
+    stop = data["Stop"]
     foreign_left = [
         h for e in stop for h in e["hooks"]
         if h.get("command") == "other-tool hook"
@@ -565,3 +563,149 @@ def test_item06_gwt6_install_fails_without_session_bridge(tmp_path):
     assert res.returncode != 0
     assert "session_bridge" in res.stderr
     assert not (repo / ".devin" / "hooks.v1.json").exists()
+
+
+# --- item_11: hooks.v1.json top-level format (issue #7) ------------------------
+#
+# The hooks object is the entire file: top-level keys are event names,
+# no "hooks" wrapper key. Files written by the pre-fix installer
+# ({"hooks": {...}}) are migrated in place - foreign entries move to
+# the top level along with ours.
+
+
+EVENT_NAMES = (
+    "SessionStart",
+    "SessionEnd",
+    "UserPromptSubmit",
+    "Stop",
+)
+
+LEGACY_OUR_HOOK = {
+    "type": "command",
+    "command": "PYTHONPATH=/old /usr/bin/python3 "
+               "/old/src/session_bridge/hooks/worker.py "
+               "--hook-timeout 60 --cycle-seconds 150 --cycles-max 5",
+    "timeout": 60,
+}
+
+
+def _our_hooks(data, event):
+    return [
+        h
+        for e in data.get(event, [])
+        for h in e.get("hooks", [])
+        if "session_bridge/hooks/worker.py" in h.get("command", "")
+    ]
+
+
+def test_item11_gwt1_fresh_install_uses_top_level_event_keys(tmp_path):
+    repo = tmp_path / "target"
+    repo.mkdir()
+    res = _install(repo)
+    assert res.returncode == 0, res.stderr
+    data = _hooks(repo)
+    assert "hooks" not in data  # no wrapper key in v1 format
+    for event in EVENT_NAMES:
+        assert isinstance(data.get(event), list), event
+        assert len(_our_hooks(data, event)) == 1
+
+
+def test_item11_gwt2_legacy_wrapper_migrates_to_top_level(tmp_path):
+    repo = tmp_path / "target"
+    (repo / ".devin").mkdir(parents=True)
+    legacy = {
+        "hooks": {
+            "Stop": [
+                {"matcher": "", "hooks": [dict(LEGACY_OUR_HOOK)]},
+                {
+                    "matcher": "",
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": "other-tool stop",
+                            "timeout": 15,
+                        }
+                    ],
+                },
+            ],
+            "SessionStart": [
+                {"matcher": "", "hooks": [dict(LEGACY_OUR_HOOK)]}
+            ],
+            "PreToolUse": [
+                {
+                    "matcher": "Bash",
+                    "hooks": [
+                        {"type": "command", "command": "other-tool pre"}
+                    ],
+                }
+            ],
+        }
+    }
+    (repo / ".devin" / "hooks.v1.json").write_text(json.dumps(legacy))
+    res = _install(repo)
+    assert res.returncode == 0, res.stderr
+    data = _hooks(repo)
+    assert "hooks" not in data  # wrapper migrated away
+    # our legacy entries moved to the top level and were refreshed
+    # in place - exactly one copy per event, new command + timeout
+    for event in EVENT_NAMES:
+        ours = _our_hooks(data, event)
+        assert len(ours) == 1, event
+        assert "--hook-timeout 600" in ours[0]["command"]
+    assert _our_hooks(data, "Stop")[0]["timeout"] == 600
+    # foreign entries under the wrapper were migrated, not dropped
+    migrated_foreign = [
+        h["command"]
+        for e in data["Stop"] for h in e["hooks"]
+        if h.get("command") == "other-tool stop"
+    ]
+    assert migrated_foreign == ["other-tool stop"]
+    assert data["PreToolUse"][0]["hooks"][0]["command"] == \
+        "other-tool pre"
+    assert (repo / ".devin" / "hooks.v1.json.bak").exists()
+    # the backup keeps the pre-migration bytes for recovery
+    bak = json.loads((repo / ".devin" / "hooks.v1.json.bak").read_text())
+    assert "hooks" in bak
+
+
+def test_item11_gwt3_foreign_top_level_entries_not_clobbered(tmp_path):
+    repo = tmp_path / "target"
+    (repo / ".devin").mkdir(parents=True)
+    foreign = {
+        "Stop": [
+            {
+                "matcher": "",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "other-tool stop",
+                        "timeout": 15,
+                    }
+                ],
+            }
+        ],
+        "PreToolUse": [
+            {
+                "matcher": "Bash",
+                "hooks": [
+                    {"type": "command", "command": "other-tool pre"}
+                ],
+            }
+        ],
+    }
+    (repo / ".devin" / "hooks.v1.json").write_text(json.dumps(foreign))
+    res = _install(repo)
+    assert res.returncode == 0, res.stderr
+    data = _hooks(repo)
+    assert "hooks" not in data
+    # foreign entries survive the merge untouched
+    assert data["PreToolUse"] == foreign["PreToolUse"]
+    foreign_stop = [
+        h for e in data["Stop"] for h in e["hooks"]
+        if h.get("command") == "other-tool stop"
+    ]
+    assert len(foreign_stop) == 1
+    assert foreign_stop[0]["timeout"] == 15
+    # our events were merged alongside them
+    for event in EVENT_NAMES:
+        assert len(_our_hooks(data, event)) == 1
