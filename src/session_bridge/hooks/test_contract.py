@@ -87,14 +87,10 @@ def test_item03_gwt3_common_fields_required() -> None:
     with pytest.raises(ValidationError):
         parse_hook_payload({"session_id": "s1"})  # no event name
     with pytest.raises(ValidationError):
-        parse_hook_payload(
-            {"hook_event_name": "Stop", "session_id": ""}
-        )  # empty session_id
+        parse_hook_payload({"hook_event_name": "Stop", "session_id": ""})  # empty session_id
     # events outside the installed set fail in a controlled way
     with pytest.raises(ValidationError):
-        parse_hook_payload(
-            {"hook_event_name": "PreToolUse", "session_id": "s1"}
-        )
+        parse_hook_payload({"hook_event_name": "PreToolUse", "session_id": "s1"})
 
 
 def test_item03_gwt3_event_dispatch() -> None:
@@ -160,11 +156,7 @@ def test_item03_gwt4_parkconfig_invariants() -> None:
     ok = ParkConfig(cycle_seconds=150, cycles_max=5, hook_timeout=600)
     assert ok.hook_timeout == 600
     # default timeout is the verified devin default
-    assert (
-        ParkConfig(cycle_seconds=60, cycles_max=1).hook_timeout
-        == HOOK_TIMEOUT_DEFAULT
-        == 60
-    )
+    assert ParkConfig(cycle_seconds=60, cycles_max=1).hook_timeout == HOOK_TIMEOUT_DEFAULT == 60
     # boundary: cycle equal to the timeout is allowed
     ParkConfig(cycle_seconds=60, cycles_max=1, hook_timeout=60)
 
@@ -189,15 +181,11 @@ def test_item03_gwt5_block_output_serializes() -> None:
     reason = f"{PARKED_TASK_PREFIX} do the thing"
     out = BlockOutput(reason=reason)
     assert out.model_dump() == {"decision": "block", "reason": reason}
-    assert out.model_dump_json() == (
-        '{"decision":"block","reason":"[PARKED>TASK] do the thing"}'
-    )
+    assert out.model_dump_json() == ('{"decision":"block","reason":"[PARKED>TASK] do the thing"}')
     with pytest.raises(ValidationError):
         BlockOutput(reason="")  # an empty reason is useless
     with pytest.raises(ValidationError):
-        BlockOutput.model_validate(
-            {"decision": "block", "reason": "r", "extra": 1}
-        )
+        BlockOutput.model_validate({"decision": "block", "reason": "r", "extra": 1})
     with pytest.raises(ValidationError):
         BlockOutput.model_validate({"decision": "allow", "reason": "r"})
 

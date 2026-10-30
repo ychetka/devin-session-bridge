@@ -77,9 +77,7 @@ __all__ = [
     "read_api_key",
 ]
 
-DEFAULT_CREDENTIALS_PATH = os.path.expanduser(
-    "~/.local/share/devin/credentials.toml"
-)
+DEFAULT_CREDENTIALS_PATH = os.path.expanduser("~/.local/share/devin/credentials.toml")
 DEFAULT_REQUEST_TIMEOUT = 45.0
 DEFAULT_HANDSHAKE_DELAY = 1.5
 _KILL_WAIT_SECONDS = 5.0
@@ -147,9 +145,7 @@ def _validated(model: type, payload: Any, what: str) -> Any:
     try:
         return model.model_validate(payload)
     except ValidationError as e:
-        raise AcpError(
-            f"invalid {what} from acp: {e}", kind="invalid_response"
-        ) from e
+        raise AcpError(f"invalid {what} from acp: {e}", kind="invalid_response") from e
 
 
 class AcpClient:
@@ -170,26 +166,16 @@ class AcpClient:
         handshake_delay: float = DEFAULT_HANDSHAKE_DELAY,
         stderr: Any = subprocess.DEVNULL,
     ) -> None:
-        argv = (
-            [command, "acp"]
-            if isinstance(command, str)
-            else list(command)
-        )
+        argv = [command, "acp"] if isinstance(command, str) else list(command)
         # resolve credentials before spawning so a missing key cannot
         # leak a half-initialised process
-        key = (
-            api_key
-            if api_key is not None
-            else read_api_key(credentials_path)
-        )
+        key = api_key if api_key is not None else read_api_key(credentials_path)
         self._request_timeout = request_timeout
         self._next_id = 0
         self._rbuf = b""
         self._wlock = threading.Lock()
         self._slot = threading.Lock()
-        self._notifications: deque[dict[str, Any]] = deque(
-            maxlen=_NOTIFICATION_BUFFER
-        )
+        self._notifications: deque[dict[str, Any]] = deque(maxlen=_NOTIFICATION_BUFFER)
         self._stray_responses = 0
         self.proc = subprocess.Popen(
             argv,
@@ -229,26 +215,18 @@ class AcpClient:
         data = json.dumps(payload).encode() + b"\n"
         with self._wlock:
             if self.proc.poll() is not None:
-                raise AcpError(
-                    "acp process is not running", kind="process_dead"
-                )
+                raise AcpError("acp process is not running", kind="process_dead")
             try:
                 self.proc.stdin.write(data)
                 self.proc.stdin.flush()
             except (BrokenPipeError, OSError, ValueError) as e:
-                raise AcpError(
-                    f"acp stdin write failed: {e}", kind="process_dead"
-                ) from e
+                raise AcpError(f"acp stdin write failed: {e}", kind="process_dead") from e
 
-    def _send_request(
-        self, req_id: int, method: Method | str, params: dict[str, Any]
-    ) -> None:
+    def _send_request(self, req_id: int, method: Method | str, params: dict[str, Any]) -> None:
         try:
             m = Method(method)
         except ValueError as e:
-            raise AcpError(
-                f"unknown ACP method: {method!r}", kind="invalid_request"
-            ) from e
+            raise AcpError(f"unknown ACP method: {method!r}", kind="invalid_request") from e
         req = JsonRpcRequest(id=req_id, method=m, params=params)
         self._write_line(req.model_dump(mode="json"))
 
@@ -263,7 +241,7 @@ class AcpClient:
         while True:
             nl = self._rbuf.find(b"\n")
             if nl >= 0:
-                line, self._rbuf = self._rbuf[:nl], self._rbuf[nl + 1:]
+                line, self._rbuf = self._rbuf[:nl], self._rbuf[nl + 1 :]
                 if not line.strip():
                     continue
                 try:
@@ -282,13 +260,10 @@ class AcpClient:
             try:
                 ready, _, _ = select.select([self._fd], [], [], timeout)
             except (OSError, ValueError) as e:
-                raise AcpError(
-                    f"acp stdout poll failed: {e}", kind="process_dead"
-                ) from e
+                raise AcpError(f"acp stdout poll failed: {e}", kind="process_dead") from e
             if not ready:
                 raise AcpError(
-                    f"no acp traffic for {timeout}s "
-                    "while waiting for a response",
+                    f"no acp traffic for {timeout}s while waiting for a response",
                     kind="timeout",
                     retryable=True,
                 )
@@ -297,13 +272,10 @@ class AcpClient:
                 if self._rbuf.strip():
                     lost, self._rbuf = len(self._rbuf), b""
                     raise AcpError(
-                        "acp closed stdout mid-message "
-                        f"({lost} buffered bytes lost)",
+                        f"acp closed stdout mid-message ({lost} buffered bytes lost)",
                         kind="truncated_message",
                     )
-                raise AcpError(
-                    "acp closed stdout (EOF)", kind="eof"
-                )
+                raise AcpError("acp closed stdout (EOF)", kind="eof")
             self._rbuf += chunk
 
     def _await_response(
@@ -327,9 +299,7 @@ class AcpClient:
                 # fire-and-forget authenticate) - drop it
                 self._stray_responses += 1
                 continue
-            return _validated(
-                JsonRpcResponse, msg, "JSON-RPC response envelope"
-            )
+            return _validated(JsonRpcResponse, msg, "JSON-RPC response envelope")
 
     @staticmethod
     def _unwrap_result(resp: JsonRpcResponse) -> dict[str, Any]:
@@ -366,7 +336,7 @@ class AcpClient:
         self,
         method: Method | str,
         params: dict[str, Any] | None = None,
-        timeout: float | None | object = _DEFAULT,
+        timeout: float | object | None = _DEFAULT,
     ) -> dict[str, Any]:
         """One request/response round-trip; returns ``result``.
 
@@ -384,18 +354,16 @@ class AcpClient:
     def list_sessions(
         self,
         cwd: str | None = None,
-        timeout: float | None | object = _DEFAULT,
+        timeout: float | object | None = _DEFAULT,
     ) -> list[SessionEntry]:
         params = SessionListParams(cwd=cwd).model_dump(exclude_none=True)
         result = self.rpc(Method.SESSION_LIST, params, timeout)
-        return _validated(
-            SessionListResult, result, "session/list result"
-        ).sessions
+        return _validated(SessionListResult, result, "session/list result").sessions
 
     def new_session(
         self,
         cwd: str,
-        timeout: float | None | object = _DEFAULT,
+        timeout: float | object | None = _DEFAULT,
     ) -> str:
         params = SessionNewParams(cwd=cwd).model_dump(by_alias=True)
         result = self.rpc(Method.SESSION_NEW, params, timeout)
@@ -411,23 +379,21 @@ class AcpClient:
         self,
         session_id: str,
         cwd: str,
-        timeout: float | None | object = _DEFAULT,
+        timeout: float | object | None = _DEFAULT,
     ) -> dict[str, Any]:
-        params = SessionLoadParams(
-            session_id=session_id, cwd=cwd
-        ).model_dump(by_alias=True)
+        params = SessionLoadParams(session_id=session_id, cwd=cwd).model_dump(by_alias=True)
         return self.rpc(Method.SESSION_LOAD, params, timeout)
 
     def close_session(
         self,
         session_id: str,
         force: bool = False,
-        timeout: float | None | object = _DEFAULT,
+        timeout: float | object | None = _DEFAULT,
     ) -> None:
         meta = SessionCloseMeta(force=True) if force else None
-        params = SessionCloseParams(
-            session_id=session_id, meta=meta
-        ).model_dump(by_alias=True, exclude_none=True)
+        params = SessionCloseParams(session_id=session_id, meta=meta).model_dump(
+            by_alias=True, exclude_none=True
+        )
         self.rpc(Method.SESSION_CLOSE, params, timeout)
 
     def prompt(
@@ -458,9 +424,7 @@ class AcpClient:
                 if on_chunk is not None:
                     on_chunk(piece)
 
-        params = SessionPromptParams(
-            session_id=session_id, prompt=[PromptBlock(text=text)]
-        )
+        params = SessionPromptParams(session_id=session_id, prompt=[PromptBlock(text=text)])
         with self._inflight():
             req_id = self._alloc_id()
             self._send_request(
@@ -468,13 +432,9 @@ class AcpClient:
                 Method.SESSION_PROMPT,
                 params.model_dump(by_alias=True),
             )
-            resp = self._await_response(
-                req_id, timeout, on_notification=collect
-            )
+            resp = self._await_response(req_id, timeout, on_notification=collect)
         result = self._unwrap_result(resp)
-        wire = _validated(
-            PromptResponse, result, "session/prompt result"
-        )
+        wire = _validated(PromptResponse, result, "session/prompt result")
         return PromptResult(
             text="".join(chunks),
             stop_reason=wire.stop_reason,
@@ -489,9 +449,7 @@ class AcpClient:
         """
         note = JsonRpcNotification(
             method=Method.SESSION_CANCEL,
-            params=SessionCancelParams(
-                session_id=session_id
-            ).model_dump(by_alias=True),
+            params=SessionCancelParams(session_id=session_id).model_dump(by_alias=True),
         )
         self._write_line(note.model_dump(mode="json"))
 

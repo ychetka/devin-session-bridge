@@ -112,12 +112,8 @@ class InitializeParams(BaseModel):
 
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
-    protocol_version: int = Field(
-        default=PROTOCOL_VERSION, alias="protocolVersion"
-    )
-    client_capabilities: dict[str, Any] = Field(
-        default_factory=dict, alias="clientCapabilities"
-    )
+    protocol_version: int = Field(default=PROTOCOL_VERSION, alias="protocolVersion")
+    client_capabilities: dict[str, Any] = Field(default_factory=dict, alias="clientCapabilities")
 
 
 class AuthenticateMeta(BaseModel):
@@ -213,12 +209,8 @@ class SessionMeta(BaseModel):
     model_config = ConfigDict(extra="allow", populate_by_name=True)
 
     is_locked: bool | None = Field(default=None, alias=META_IS_LOCKED)
-    lock_holder_pid: int | None = Field(
-        default=None, alias=META_LOCK_HOLDER_PID
-    )
-    has_user_messages: bool | None = Field(
-        default=None, alias=META_HAS_USER_MESSAGES
-    )
+    lock_holder_pid: int | None = Field(default=None, alias=META_LOCK_HOLDER_PID)
+    has_user_messages: bool | None = Field(default=None, alias=META_HAS_USER_MESSAGES)
 
 
 class SessionEntry(BaseModel):
@@ -285,9 +277,7 @@ class Usage(BaseModel):
     total_tokens: int = Field(alias=USAGE_TOTAL_TOKENS, ge=0)
     input_tokens: int = Field(alias=USAGE_INPUT_TOKENS, ge=0)
     output_tokens: int = Field(alias=USAGE_OUTPUT_TOKENS, ge=0)
-    cached_read_tokens: int = Field(
-        default=0, alias=USAGE_CACHED_READ_TOKENS, ge=0
-    )
+    cached_read_tokens: int = Field(default=0, alias=USAGE_CACHED_READ_TOKENS, ge=0)
 
 
 class PromptResponse(BaseModel):
@@ -326,9 +316,7 @@ class ErrorData(BaseModel):
 
     kind: str | None = Field(default=None, alias=META_ERROR_KIND)
     retryable: bool | None = Field(default=None, alias=META_RETRYABLE)
-    lock_holder_pid: int | None = Field(
-        default=None, alias=META_LOCK_HOLDER_PID
-    )
+    lock_holder_pid: int | None = Field(default=None, alias=META_LOCK_HOLDER_PID)
 
 
 class JsonRpcError(BaseModel):

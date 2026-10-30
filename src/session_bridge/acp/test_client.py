@@ -66,9 +66,7 @@ def test_item05_gwt1_rpc_session_list_parses(spawn_client):
                             "method": "session/update",
                             "params": {
                                 "sessionId": "s0",
-                                "update": {
-                                    "sessionUpdate": "session_info_update"
-                                },
+                                "update": {"sessionUpdate": "session_info_update"},
                             },
                         }
                     },
@@ -347,11 +345,7 @@ def test_item05_gwt4_truncated_eof_is_distinct_error(spawn_client):
 
 
 def test_item05_gwt4_silence_timeout_is_retryable(spawn_client):
-    scenario = {
-        "rules": [
-            {"method": "session/list", "actions": [{"sleep": 2.0}]}
-        ]
-    }
+    scenario = {"rules": [{"method": "session/list", "actions": [{"sleep": 2.0}]}]}
     client = spawn_client(scenario)
     t0 = time.monotonic()
     with pytest.raises(AcpError) as exc_info:
@@ -397,11 +391,7 @@ def test_item05_gwt5_dead_process_alive_and_kill(spawn_client):
 
 
 def test_item05_gwt5_process_exit_mid_request(spawn_client):
-    scenario = {
-        "rules": [
-            {"method": "session/list", "actions": [{"exit": 1}]}
-        ]
-    }
+    scenario = {"rules": [{"method": "session/list", "actions": [{"exit": 1}]}]}
     client = spawn_client(scenario)
     with pytest.raises(AcpError) as exc_info:
         client.list_sessions()

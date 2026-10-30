@@ -54,9 +54,7 @@ LIVE_STATUSES: Final[frozenset] = frozenset(
         TaskStatus.AWAITING_USER,
     }
 )
-TERMINAL_STATUSES: Final[frozenset] = frozenset(
-    {TaskStatus.DONE, TaskStatus.FAILED}
-)
+TERMINAL_STATUSES: Final[frozenset] = frozenset({TaskStatus.DONE, TaskStatus.FAILED})
 
 
 class Transport(str, Enum):
@@ -104,9 +102,7 @@ MANUAL_TRANSITIONS: Final[dict] = {
 }
 
 
-def allowed_targets(
-    from_status: TaskStatus, *, manual: bool = False
-) -> frozenset:
+def allowed_targets(from_status: TaskStatus, *, manual: bool = False) -> frozenset:
     """Statuses reachable from ``from_status`` on the given path."""
     table = MANUAL_TRANSITIONS if manual else TRANSITIONS
     return table.get(TaskStatus(from_status), frozenset())
@@ -116,9 +112,7 @@ def is_valid_transition(
     from_status: TaskStatus, to_status: TaskStatus, *, manual: bool = False
 ) -> bool:
     """True when ``from_status > to_status`` is a declared edge."""
-    return TaskStatus(to_status) in allowed_targets(
-        from_status, manual=manual
-    )
+    return TaskStatus(to_status) in allowed_targets(from_status, manual=manual)
 
 
 def validate_transition(
@@ -139,9 +133,7 @@ class Transition(BaseModel):
 
     @model_validator(mode="after")
     def _edge_is_declared(self) -> "Transition":
-        if not is_valid_transition(
-            self.from_status, self.to_status, manual=self.manual
-        ):
+        if not is_valid_transition(self.from_status, self.to_status, manual=self.manual):
             path = "manual" if self.manual else "automatic"
             raise ValueError(
                 f"{path} transition {self.from_status.value} > "
@@ -191,9 +183,7 @@ class Task(BaseModel):
         chosen path. Extra keyword arguments patch other fields on the
         returned copy (validated again).
         """
-        Transition(
-            from_status=self.status, to_status=to_status, manual=manual
-        )
+        Transition(from_status=self.status, to_status=to_status, manual=manual)
         data = self.model_dump()
         data.update(updates)
         data["status"] = TaskStatus(to_status)
@@ -207,11 +197,7 @@ class Task(BaseModel):
         and the lease fields are cleared either way.
         """
         attempt = self.attempt + 1
-        target = (
-            TaskStatus.QUEUED
-            if attempt < MAX_ATTEMPTS
-            else TaskStatus.FAILED
-        )
+        target = TaskStatus.QUEUED if attempt < MAX_ATTEMPTS else TaskStatus.FAILED
         updates = {
             "attempt": attempt,
             "lease_owner": None,
@@ -238,10 +224,7 @@ class Task(BaseModel):
                         "loc": ("status",),
                         "input": self.status.value,
                         "ctx": {
-                            "error": ValueError(
-                                "manual retry is only defined "
-                                "for failed tasks"
-                            )
+                            "error": ValueError("manual retry is only defined for failed tasks")
                         },
                     }
                 ],

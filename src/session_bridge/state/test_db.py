@@ -94,9 +94,7 @@ def test_item04_gwt2_concurrent_claim_single_winner(db_path):
     with ThreadPoolExecutor(max_workers=len(owners)) as ex:
         results = list(
             ex.map(
-                lambda o: db.claim_queued(
-                    tid, o, "acp-push", path=db_path
-                ),
+                lambda o: db.claim_queued(tid, o, "acp-push", path=db_path),
                 owners,
             )
         )
@@ -143,15 +141,13 @@ def test_item04_gwt4_recover_vs_claim_race_consistent(db_path):
         _expire(db_path, tid)
         outcome = {}
 
-        def do_recover():
+        def do_recover(outcome=outcome):
             outcome["recovered"] = db.recover_stale(path=db_path)
 
-        def do_claim():
+        def do_claim(tid=tid, outcome=outcome):
             # claim only wins once the requeue has landed
             for _ in range(1000):
-                if db.claim_queued(
-                    tid, "w_new", "acp-push", path=db_path
-                ):
+                if db.claim_queued(tid, "w_new", "acp-push", path=db_path):
                     outcome["claimed"] = True
                     return
                 time.sleep(0.001)
@@ -165,9 +161,7 @@ def test_item04_gwt4_recover_vs_claim_race_consistent(db_path):
 
         row = db.get_task(tid, path=db_path)
         # invariant: the expired owner can never be running again
-        assert not (
-            row["status"] == "running" and row["lease_owner"] == "w_old"
-        )
+        assert not (row["status"] == "running" and row["lease_owner"] == "w_old")
         assert row["attempt"] == 1
         if outcome["claimed"]:
             assert row["status"] == "dispatch_decided"
@@ -195,12 +189,7 @@ def test_item04_gwt5_parallel_writers_lose_nothing(tmp_path):
     db.init(path)
     per_writer = 25
     ctx = multiprocessing.get_context("fork")
-    procs = [
-        ctx.Process(
-            target=_writer_proc, args=(path, f"w{i}-s", per_writer)
-        )
-        for i in range(2)
-    ]
+    procs = [ctx.Process(target=_writer_proc, args=(path, f"w{i}-s", per_writer)) for i in range(2)]
     for p in procs:
         p.start()
     for p in procs:
@@ -241,12 +230,7 @@ def test_item04_gwt7_stale_finish_does_not_overwrite(db_path):
     assert db.mark_running(tid, "w_new", path=db_path)
 
     # the zombie worker's report must not clobber the live run
-    assert (
-        db.finish_task(
-            tid, "w_old", True, last_assistant_message="stale", path=db_path
-        )
-        is False
-    )
+    assert db.finish_task(tid, "w_old", True, last_assistant_message="stale", path=db_path) is False
     row = db.get_task(tid, path=db_path)
     assert row["status"] == "running"
     assert row["lease_owner"] == "w_new"
@@ -319,9 +303,7 @@ def test_item04_lease_lifecycle(db_path):
 
 def test_item04_finish_done_clears_lease_and_frees_slot(db_path):
     tid = _enqueue_running(db_path, "s1", "w1")
-    assert db.finish_task(
-        tid, "w1", True, last_assistant_message="all done", path=db_path
-    )
+    assert db.finish_task(tid, "w1", True, last_assistant_message="all done", path=db_path)
     row = db.get_task(tid, path=db_path)
     assert row["status"] == "done"
     assert row["lease_owner"] is None
@@ -390,10 +372,7 @@ def test_item04_sessions_db_lookup(tmp_path, monkeypatch):
     # a real sessions.db -> row dict
     real = tmp_path / "sessions.db"
     con = sqlite3.connect(str(real))
-    con.execute(
-        "CREATE TABLE sessions(id TEXT PRIMARY KEY,"
-        " working_directory TEXT, title TEXT)"
-    )
+    con.execute("CREATE TABLE sessions(id TEXT PRIMARY KEY, working_directory TEXT, title TEXT)")
     con.execute(
         "INSERT INTO sessions VALUES(?,?,?)",
         ("s1", "/repo", "my session"),
@@ -605,9 +584,7 @@ def test_item04_release_lease_expected_status_guard(db_path):
     assert db.mark_running(tid, "w1", path=db_path)
     # a stale cleanup guarded on dispatch_decided must not strip the
     # lease of a task that is already running
-    assert db.release_lease(
-        tid, "w1", expected_status="dispatch_decided", path=db_path
-    ) is False
+    assert db.release_lease(tid, "w1", expected_status="dispatch_decided", path=db_path) is False
     row = db.get_task(tid, path=db_path)
     assert row["status"] == "running"
     assert row["lease_owner"] == "w1"
@@ -616,9 +593,7 @@ def test_item04_release_lease_expected_status_guard(db_path):
     # the release still lands while the task is in the expected status
     tid2 = db.enqueue("s2", "x", path=db_path)
     assert db.claim_queued(tid2, "w1", "acp-push", path=db_path)
-    assert db.release_lease(
-        tid2, "w1", expected_status="dispatch_decided", path=db_path
-    ) is True
+    assert db.release_lease(tid2, "w1", expected_status="dispatch_decided", path=db_path) is True
     assert db.get_task(tid2, path=db_path)["lease_owner"] is None
 
 

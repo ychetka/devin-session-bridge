@@ -66,11 +66,7 @@ def _wait_for_status(db_path, tid, statuses, timeout):
     """Poll the task row until it reaches one of ``statuses``."""
     deadline = time.monotonic() + timeout
     row = db.get_task(tid, path=db_path)
-    while (
-        row is not None
-        and row["status"] not in statuses
-        and time.monotonic() < deadline
-    ):
+    while row is not None and row["status"] not in statuses and time.monotonic() < deadline:
         time.sleep(0.4)
         row = db.get_task(tid, path=db_path)
     return row
@@ -231,17 +227,14 @@ class _E2EWorld:
         cli_dir = devin_dir / "cli"
         self.locks_dir = cli_dir / "session_locks"
         self.locks_dir.mkdir(parents=True)
-        (devin_dir / "credentials.toml").write_text(
-            'windsurf_api_key = "e2e-fake-key"\n'
-        )
+        (devin_dir / "credentials.toml").write_text('windsurf_api_key = "e2e-fake-key"\n')
         # devin's own sessions.db, faked under the redirected HOME;
         # sessions_db_lookup only needs id + working_directory
         self.devin_sessions_db = cli_dir / "sessions.db"
         con = sqlite3.connect(self.devin_sessions_db)
         try:
             con.execute(
-                "CREATE TABLE sessions (id TEXT PRIMARY KEY,"
-                " working_directory TEXT, title TEXT)"
+                "CREATE TABLE sessions (id TEXT PRIMARY KEY, working_directory TEXT, title TEXT)"
             )
             con.commit()
         finally:
@@ -269,9 +262,7 @@ class _E2EWorld:
         env["HOME"] = str(self.home)
         env["PATH"] = f"{self.bin}{os.pathsep}{env['PATH']}"
         prev = env.get("PYTHONPATH")
-        env["PYTHONPATH"] = (
-            f"{SRC_DIR}{os.pathsep}{prev}" if prev else str(SRC_DIR)
-        )
+        env["PYTHONPATH"] = f"{SRC_DIR}{os.pathsep}{prev}" if prev else str(SRC_DIR)
         env["SESSIONS_BRIDGE_DB"] = self.db
         env["SESSIONS_BRIDGE_QUEUE_DIR"] = str(self.qdir)
         env["SESSIONS_BRIDGE_WORK_TIMEOUT"] = "120"
@@ -282,9 +273,7 @@ class _E2EWorld:
             env["FAKE_ACP_SCENARIO"] = str(path)
         return env
 
-    def bridge(
-        self, *argv, scenario=None, timeout=30
-    ) -> subprocess.CompletedProcess:
+    def bridge(self, *argv, scenario=None, timeout=30) -> subprocess.CompletedProcess:
         return subprocess.run(
             [
                 sys.executable,
@@ -302,9 +291,7 @@ class _E2EWorld:
             timeout=timeout,
         )
 
-    def hook(
-        self, payload: dict, timeout=30
-    ) -> subprocess.CompletedProcess:
+    def hook(self, payload: dict, timeout=30) -> subprocess.CompletedProcess:
         return subprocess.run(
             [
                 sys.executable,
@@ -334,8 +321,7 @@ class _E2EWorld:
         con = sqlite3.connect(self.devin_sessions_db)
         try:
             con.execute(
-                "INSERT OR REPLACE INTO sessions"
-                " (id, working_directory) VALUES (?, ?)",
+                "INSERT OR REPLACE INTO sessions (id, working_directory) VALUES (?, ?)",
                 (sid, cwd),
             )
             con.commit()
@@ -388,13 +374,13 @@ def _live_acp_skip_reason() -> str | None:
 _LIVE_SKIP_REASON = _live_acp_skip_reason()
 
 
+@pytest.mark.e2e
+@pytest.mark.timeout(360)
 @pytest.mark.skipif(
     _LIVE_SKIP_REASON is not None,
     reason=_LIVE_SKIP_REASON or "live devin acp unavailable",
 )
-def test_item08_gwt1_live_acp_push_reaches_done(
-    tmp_path, scratch_repo, scratch_sessions
-):
+def test_item08_gwt1_live_acp_push_reaches_done(tmp_path, scratch_repo, scratch_sessions):
     """Live acp: ``bridge push`` on a scratch session runs to done.
 
     The scratch session is registered for ``devin rm --force``
@@ -428,9 +414,7 @@ def test_item08_gwt1_live_acp_push_reaches_done(
     db.upsert_session(sid, cwd=str(scratch_repo), path=db_path)
     env = dict(os.environ)
     prev = env.get("PYTHONPATH")
-    env["PYTHONPATH"] = (
-        f"{SRC_DIR}{os.pathsep}{prev}" if prev else str(SRC_DIR)
-    )
+    env["PYTHONPATH"] = f"{SRC_DIR}{os.pathsep}{prev}" if prev else str(SRC_DIR)
     env["SESSIONS_BRIDGE_DB"] = db_path
     env["SESSIONS_BRIDGE_QUEUE_DIR"] = str(tmp_path / "queue")
     env["SESSIONS_BRIDGE_WORK_TIMEOUT"] = "240"
@@ -463,18 +447,14 @@ def test_item08_gwt1_live_acp_push_reaches_done(
         timeout=300,
     )
     assert row is not None
-    assert row["status"] == TaskStatus.DONE.value, (
-        f"task did not reach done: {dict(row)}"
-    )
+    assert row["status"] == TaskStatus.DONE.value, f"task did not reach done: {dict(row)}"
     assert row["last_assistant_message"]
 
 
 # --- GWT-2: queued task picked up by the Stop hook (block chain) ---------------
 
 
-def test_item08_gwt2_locked_session_task_picked_up_via_stop(
-    e2e, scratch_repo
-):
+def test_item08_gwt2_locked_session_task_picked_up_via_stop(e2e, scratch_repo):
     """Hooks installed into a scratch repo by install_hooks.sh; a Stop
     event on a locked session claims the queued task (block chain)."""
     # install the real hook wiring into the scratch repo
@@ -515,8 +495,7 @@ def test_item08_gwt2_locked_session_task_picked_up_via_stop(
         )
 
     e2e.lock_session(SID)
-    res = e2e.bridge("push", SID, "--task", "summarize the ledger",
-                     "--json")
+    res = e2e.bridge("push", SID, "--task", "summarize the ledger", "--json")
     assert res.returncode == 0, res.stderr
     out = json.loads(res.stdout.strip())
     tid = out["data"]["task_id"]
@@ -610,9 +589,7 @@ def test_item08_gwt3_killed_worker_recovered_and_redispatched(e2e):
         {TaskStatus.DONE.value, TaskStatus.FAILED.value},
         timeout=45,
     )
-    assert row["status"] == TaskStatus.DONE.value, (
-        f"redispatched task did not finish: {dict(row)}"
-    )
+    assert row["status"] == TaskStatus.DONE.value, f"redispatched task did not finish: {dict(row)}"
     assert row["last_assistant_message"] == "e2e reply body"
 
 
@@ -638,10 +615,7 @@ def test_item08_gwt3_stale_lease_fails_at_max_attempts(e2e):
     assert row["attempt"] == MAX_ATTEMPTS
     assert row["lease_owner"] is None
     out = json.loads(res.stdout.strip())
-    assert any(
-        e["kind"] == "FAILED" and e["task_id"] == tid
-        for e in out["events"]
-    )
+    assert any(e["kind"] == "FAILED" and e["task_id"] == tid for e in out["events"])
 
 
 # --- hardening: _work ownership re-check ----------------------------------------
@@ -658,9 +632,7 @@ def test_item08_hardening_stale_owner_exits_without_prompt(e2e):
     assert db.mark_running(tid, owner, path=e2e.db)
     # no FAKE_ACP_SCENARIO on purpose: if the stale worker still tried
     # acp, the shim would fail loudly after logging the invocation
-    res = e2e.bridge(
-        "_work", str(tid), "--owner", "acp-stale-9", "--json"
-    )
+    res = e2e.bridge("_work", str(tid), "--owner", "acp-stale-9", "--json")
     assert res.returncode == 0, res.stderr
     out = json.loads(res.stdout.strip())
     assert out["status"] == TaskStatus.RUNNING.value

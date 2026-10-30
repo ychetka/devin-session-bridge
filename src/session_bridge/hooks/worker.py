@@ -55,9 +55,6 @@ import subprocess
 import sys
 import time
 
-from session_bridge.state import db
-from session_bridge.state.contract import TaskStatus, Transport
-
 from session_bridge.hooks.contract import (
     HOOK_TIMEOUT_DEFAULT,
     PARKED_TASK_PREFIX,
@@ -74,6 +71,8 @@ from session_bridge.hooks.contract import (
     UserPromptSubmitPayload,
     parse_hook_payload,
 )
+from session_bridge.state import db
+from session_bridge.state.contract import TaskStatus, Transport
 
 __all__ = ["main"]
 
@@ -121,9 +120,7 @@ def _parse_args(argv) -> argparse.Namespace:
     p.add_argument(
         "--cycle-seconds",
         type=int,
-        default=_env_int(
-            "SESSIONS_BRIDGE_PARK_CYCLE_SECONDS", PARK_CYCLE_SECONDS
-        ),
+        default=_env_int("SESSIONS_BRIDGE_PARK_CYCLE_SECONDS", PARK_CYCLE_SECONDS),
     )
     p.add_argument(
         "--cycles-max",
@@ -198,9 +195,7 @@ def _block_deliver(task) -> str:
 
 def _claim_running(task_id: int, owner: str, args) -> bool:
     """queued > dispatch_decided > running under ``owner``."""
-    if not db.claim_queued(
-        task_id, owner, Transport.HOOK_QUEUE, path=args.db
-    ):
+    if not db.claim_queued(task_id, owner, Transport.HOOK_QUEUE, path=args.db):
         return False
     if db.mark_running(task_id, owner, path=args.db):
         return True
@@ -237,12 +232,8 @@ def _flag_awaiting_user(task, owner: str, args, note: str) -> None:
         if _claim_running(tid, owner, args):
             db.set_awaiting_user(tid, owner, note=note, path=args.db)
         db.mark_notified(tid, path=args.db)
-    elif st == TaskStatus.RUNNING.value and _is_hook_owner(
-        task["lease_owner"]
-    ):
-        db.set_awaiting_user(
-            tid, task["lease_owner"], note=note, path=args.db
-        )
+    elif st == TaskStatus.RUNNING.value and _is_hook_owner(task["lease_owner"]):
+        db.set_awaiting_user(tid, task["lease_owner"], note=note, path=args.db)
         db.mark_notified(tid, path=args.db)
     # dispatch_decided / acp-owned running / awaiting_user: another
     # worker owns the transition, or the flag is already in place
@@ -290,9 +281,7 @@ def _wait_for_trigger(queue_dir: str, session_id: str, seconds: float) -> bool:
     ``inotifywait`` on the queue directory when available, else a ~2s
     poll fallback. Returns True on a consumed valid trigger.
     """
-    queue_file = os.path.join(
-        queue_dir, db.trigger_filename(session_id)
-    )
+    queue_file = os.path.join(queue_dir, db.trigger_filename(session_id))
     deadline = time.monotonic() + seconds
     watcher = _inotifywait()
     while True:
@@ -331,10 +320,7 @@ def _wait_for_trigger(queue_dir: str, session_id: str, seconds: float) -> bool:
                 # 0 = event seen, 1 = timeout; anything else is a
                 # watcher error that would busy-loop - fall back to poll
                 if res.returncode not in (0, 1):
-                    _log(
-                        f"inotifywait exited {res.returncode};"
-                        " polling instead"
-                    )
+                    _log(f"inotifywait exited {res.returncode}; polling instead")
                     watcher = None
         else:
             time.sleep(min(_POLL_SECONDS, remaining))
@@ -372,9 +358,7 @@ def _park_empty(session_id: str, owner: str, args, cfg: ParkConfig):
     if cycles_left <= 0:
         return _park_exhausted(session_id, owner, args)
 
-    if _wait_for_trigger(
-        _queue_dir(args), session_id, cfg.cycle_seconds
-    ):
+    if _wait_for_trigger(_queue_dir(args), session_id, cfg.cycle_seconds):
         task = db.get_live_task(session_id, path=args.db)
         if (
             task is not None
@@ -386,9 +370,7 @@ def _park_empty(session_id: str, owner: str, args, cfg: ParkConfig):
 
     # atomic decrement: a read-modify-write here could lose the update
     # against a SessionStart reset or a second parked hook
-    cycles_left = db.decrement_park_cycles(
-        session_id, cfg.cycles_max, path=args.db
-    )
+    cycles_left = db.decrement_park_cycles(session_id, cfg.cycles_max, path=args.db)
     if cycles_left <= 0 or _session_paused(session_id, args):
         return _park_exhausted(session_id, owner, args)
     stamp = time.strftime("%Y-%m-%dT%H:%M:%S%z")
@@ -409,22 +391,16 @@ def _on_stop(p: StopPayload, args, cfg: ParkConfig | None):
             # an already-spent park budget means the block chain gave up:
             # flag for a human kick instead of burning another LLM turn
             if _cycles_left(session_id, args, cfg) <= 0:
-                _flag_awaiting_user(
-                    task, owner, args, "park budget exhausted"
-                )
+                _flag_awaiting_user(task, owner, args, "park budget exhausted")
                 return None
             if _claim_running(task["id"], owner, args):
                 _reset_cycles(session_id, cfg, args)
                 return _block_deliver(task)
             # the CAS refused: queue_paused or a racing claimant
             if _session_paused(session_id, args):
-                _flag_awaiting_user(
-                    task, owner, args, "queue paused; awaiting user kick"
-                )
+                _flag_awaiting_user(task, owner, args, "queue paused; awaiting user kick")
             return None
-        if st == TaskStatus.RUNNING.value and _is_hook_owner(
-            task["lease_owner"]
-        ):
+        if st == TaskStatus.RUNNING.value and _is_hook_owner(task["lease_owner"]):
             # the agent finished the turn running the injected task
             _flag_awaiting_user(
                 task,
@@ -466,9 +442,7 @@ def _on_user_prompt(p: UserPromptSubmitPayload, args, cfg):
 
 def _on_session_start(p: SessionStartPayload, args, cfg):
     session_id = p.session_id
-    fields: dict = {
-        "park_cycles_left": cfg.cycles_max if cfg else PARK_CYCLES_MAX
-    }
+    fields: dict = {"park_cycles_left": cfg.cycles_max if cfg else PARK_CYCLES_MAX}
     cwd = (p.model_extra or {}).get("cwd")
     if isinstance(cwd, str) and cwd:
         fields["cwd"] = cwd
@@ -480,9 +454,7 @@ def _on_session_start(p: SessionStartPayload, args, cfg):
 
 def _on_session_end(p: SessionEndPayload, args):
     session_id = p.session_id
-    db.upsert_session(
-        session_id, note=f"session ended: {p.reason}", path=args.db
-    )
+    db.upsert_session(session_id, note=f"session ended: {p.reason}", path=args.db)
     task = db.get_live_task(session_id, path=args.db)
     if task is None:
         return None
@@ -503,27 +475,19 @@ def _on_session_end(p: SessionEndPayload, args):
             _log(f"session end: cannot retire queued task {tid}")
     elif st == TaskStatus.DISPATCH_DECIDED.value:
         lease_owner = task["lease_owner"]
-        if lease_owner and db.mark_running(
-            tid, lease_owner, path=args.db
-        ):
-            db.set_awaiting_user(
-                tid, lease_owner, note=SESSION_ENDED_NOTE, path=args.db
-            )
+        if lease_owner and db.mark_running(tid, lease_owner, path=args.db):
+            db.set_awaiting_user(tid, lease_owner, note=SESSION_ENDED_NOTE, path=args.db)
         elif lease_owner:
             # the mark_running CAS lost: either the owner already moved
             # the task on (leave it alone), or the claim lease expired -
             # an expired claim is a wedge, so let the attempt budget
             # decide (requeue-or-fail) instead of stripping the lease,
             # which would strand the task invisibly
-            db.requeue_or_fail(
-                tid, note=SESSION_ENDED_NOTE, path=args.db
-            )
+            db.requeue_or_fail(tid, note=SESSION_ENDED_NOTE, path=args.db)
     elif st == TaskStatus.RUNNING.value:
         lease_owner = task["lease_owner"]
         if lease_owner:
-            db.set_awaiting_user(
-                tid, lease_owner, note=SESSION_ENDED_NOTE, path=args.db
-            )
+            db.set_awaiting_user(tid, lease_owner, note=SESSION_ENDED_NOTE, path=args.db)
     return None
 
 
