@@ -15,7 +15,9 @@
 # Idempotent: existing non-bridge hook entries are preserved, our own
 # entries are refreshed in place (duplicates of our hook are dropped),
 # and a pre-existing hooks.v1.json is backed up to hooks.v1.json.bak
-# before merging. The Stop hook timeout must cover the parking cycle
+# before merging; if the post-merge validation fails the backup is
+# moved back, restoring the pre-install file. The Stop hook timeout
+# must cover the parking cycle
 # (ParkConfig precondition); it is set to a safe custom value and
 # validated after the merge.
 #
@@ -145,7 +147,9 @@ for event, timeout in EVENTS.items():
     for entry in entries:
         inner = entry.get("hooks") if isinstance(entry, dict) else None
         if not isinstance(inner, list) or not any(
-            isinstance(h, dict) and MARKER in h.get("command", "")
+            isinstance(h, dict)
+            and isinstance(h.get("command"), str)
+            and MARKER in h["command"]
             for h in inner
         ):
             kept.append(entry)  # foreign entry passes through untouched
@@ -155,7 +159,11 @@ for event, timeout in EVENTS.items():
         # top-level entry) are dropped so the hook fires exactly once
         new_inner = []
         for h in inner:
-            if isinstance(h, dict) and MARKER in h.get("command", ""):
+            if (
+                isinstance(h, dict)
+                and isinstance(h.get("command"), str)
+                and MARKER in h["command"]
+            ):
                 if found:
                     continue
                 found = True
@@ -182,7 +190,10 @@ with open(path, "w", encoding="utf-8") as fh:
 PYEOF
 
 # Post-merge validation: the installed Stop timeout must cover a cycle.
-"$PYTHON_BIN" - "$HOOKS_FILE" "$COMMAND" "$STOP_TIMEOUT" \
+# On failure the merged file is suspect - when a pre-install backup
+# exists, move it back so the repo returns to its previous state
+# instead of keeping a broken hooks.v1.json next to a dangling .bak.
+if ! "$PYTHON_BIN" - "$HOOKS_FILE" "$COMMAND" "$STOP_TIMEOUT" \
     "$CYCLE_SECONDS" <<'PYEOF'
 import json
 import sys
@@ -202,11 +213,11 @@ broken = [
     event for event in EVENTS
     if not isinstance(data.get(event), list)
     or not any(
-        MARKER in h.get("command", "")
+        MARKER in h["command"]
         for entry in data[event]
         if isinstance(entry, dict)
         for h in entry.get("hooks", [])
-        if isinstance(h, dict)
+        if isinstance(h, dict) and isinstance(h.get("command"), str)
     )
 ]
 if "hooks" in data or broken:
@@ -222,7 +233,9 @@ ours = [
     for entry in data.get("Stop", [])
     if isinstance(entry, dict)
     for h in entry.get("hooks", [])
-    if isinstance(h, dict) and MARKER in h.get("command", "")
+    if isinstance(h, dict)
+    and isinstance(h.get("command"), str)
+    and MARKER in h["command"]
 ]
 actual = max(ours) if ours else 0
 if actual < cycle:
@@ -233,3 +246,11 @@ if actual < cycle:
 print(f"install_hooks: hooks installed into {path} "
       f"(stop timeout={actual}s, cycle={cycle}s)")
 PYEOF
+then
+    if [ -f "$HOOKS_FILE.bak" ]; then
+        mv "$HOOKS_FILE.bak" "$HOOKS_FILE"
+        echo "install_hooks: restored pre-install $HOOKS_FILE" \
+            "from backup" >&2
+    fi
+    exit 1
+fi

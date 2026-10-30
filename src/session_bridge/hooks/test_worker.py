@@ -594,7 +594,8 @@ def _our_hooks(data, event):
         h
         for e in data.get(event, [])
         for h in e.get("hooks", [])
-        if "session_bridge/hooks/worker.py" in h.get("command", "")
+        if isinstance(h.get("command"), str)
+        and "session_bridge/hooks/worker.py" in h["command"]
     ]
 
 
@@ -707,5 +708,91 @@ def test_item11_gwt3_foreign_top_level_entries_not_clobbered(tmp_path):
     assert len(foreign_stop) == 1
     assert foreign_stop[0]["timeout"] == 15
     # our events were merged alongside them
+    for event in EVENT_NAMES:
+        assert len(_our_hooks(data, event)) == 1
+
+
+def test_item11_non_dict_hooks_wrapper_kept_under_legacy_key(tmp_path):
+    # a stray non-dict "hooks" value cannot be hook data - it is moved
+    # aside under "_legacy_hooks" instead of being dropped, and the
+    # rest of the file still gets a clean top-level install
+    repo = tmp_path / "target"
+    (repo / ".devin").mkdir(parents=True)
+    (repo / ".devin" / "hooks.v1.json").write_text(
+        json.dumps({"hooks": "not-a-hook-map"})
+    )
+    res = _install(repo)
+    assert res.returncode == 0, res.stderr
+    data = _hooks(repo)
+    assert "hooks" not in data
+    assert data["_legacy_hooks"] == "not-a-hook-map"
+    for event in EVENT_NAMES:
+        assert len(_our_hooks(data, event)) == 1
+
+
+def test_item11_mixed_legacy_and_top_level_dedupes_our_hook(tmp_path):
+    # our hook present both under the legacy wrapper and at the top
+    # level: migration concatenates the lists, the merge must collapse
+    # the copies to exactly one and leave no empty entry husk behind
+    repo = tmp_path / "target"
+    (repo / ".devin").mkdir(parents=True)
+    mixed = {
+        "Stop": [
+            {"matcher": "", "hooks": [dict(LEGACY_OUR_HOOK)]},
+            {
+                "matcher": "",
+                "hooks": [
+                    {"type": "command", "command": "other-tool stop"}
+                ],
+            },
+        ],
+        "hooks": {
+            "Stop": [{"matcher": "", "hooks": [dict(LEGACY_OUR_HOOK)]}],
+        },
+    }
+    (repo / ".devin" / "hooks.v1.json").write_text(json.dumps(mixed))
+    res = _install(repo)
+    assert res.returncode == 0, res.stderr
+    data = _hooks(repo)
+    assert "hooks" not in data
+    ours = _our_hooks(data, "Stop")
+    assert len(ours) == 1
+    assert ours[0]["timeout"] == 600  # refreshed, not a stale copy
+    # the deduped duplicate left no {"hooks": []} husk behind
+    assert all(e.get("hooks") for e in data["Stop"])
+    foreign = [
+        h for e in data["Stop"] for h in e["hooks"]
+        if h.get("command") == "other-tool stop"
+    ]
+    assert len(foreign) == 1
+
+
+def test_item11_foreign_hook_with_non_string_command_ignored(tmp_path):
+    # regression: a foreign hook entry whose "command" is not a string
+    # (null, int) must not crash the marker check - it is simply not
+    # ours and passes through untouched
+    repo = tmp_path / "target"
+    (repo / ".devin").mkdir(parents=True)
+    foreign = {
+        "Stop": [
+            {
+                "matcher": "",
+                "hooks": [
+                    {"type": "command", "command": 123},
+                    {"type": "command", "command": None},
+                ],
+            }
+        ]
+    }
+    (repo / ".devin" / "hooks.v1.json").write_text(json.dumps(foreign))
+    res = _install(repo)
+    assert res.returncode == 0, res.stderr
+    data = _hooks(repo)
+    non_str = [
+        h["command"]
+        for e in data["Stop"] for h in e["hooks"]
+        if not isinstance(h.get("command"), str)
+    ]
+    assert non_str == [123, None]  # preserved verbatim
     for event in EVENT_NAMES:
         assert len(_our_hooks(data, event)) == 1
