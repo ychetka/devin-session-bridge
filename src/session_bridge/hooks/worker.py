@@ -290,7 +290,9 @@ def _wait_for_trigger(queue_dir: str, session_id: str, seconds: float) -> bool:
     ``inotifywait`` on the queue directory when available, else a ~2s
     poll fallback. Returns True on a consumed valid trigger.
     """
-    queue_file = os.path.join(queue_dir, f"{session_id}.json")
+    queue_file = os.path.join(
+        queue_dir, db.trigger_filename(session_id)
+    )
     deadline = time.monotonic() + seconds
     watcher = _inotifywait()
     while True:
@@ -382,9 +384,10 @@ def _park_empty(session_id: str, owner: str, args, cfg: ParkConfig):
             _reset_cycles(session_id, cfg, args)
             return _block_deliver(task)
 
-    cycles_left -= 1
-    db.upsert_session(
-        session_id, park_cycles_left=cycles_left, path=args.db
+    # atomic decrement: a read-modify-write here could lose the update
+    # against a SessionStart reset or a second parked hook
+    cycles_left = db.decrement_park_cycles(
+        session_id, cfg.cycles_max, path=args.db
     )
     if cycles_left <= 0 or _session_paused(session_id, args):
         return _park_exhausted(session_id, owner, args)
@@ -507,7 +510,16 @@ def _on_session_end(p: SessionEndPayload, args):
                 tid, lease_owner, note=SESSION_ENDED_NOTE, path=args.db
             )
         elif lease_owner:
-            db.release_lease(tid, lease_owner, path=args.db)
+            # the mark_running CAS lost: the real owner may already be
+            # running under the same lease_owner - releasing must stay
+            # guarded on dispatch_decided so a running task can never
+            # be left without its (unrecoverable) lease
+            db.release_lease(
+                tid,
+                lease_owner,
+                expected_status=TaskStatus.DISPATCH_DECIDED,
+                path=args.db,
+            )
     elif st == TaskStatus.RUNNING.value:
         lease_owner = task["lease_owner"]
         if lease_owner:

@@ -40,6 +40,17 @@ if [ -z "$PYTHON_BIN" ]; then
 fi
 [ -n "$PYTHON_BIN" ] || die "no python interpreter found"
 
+# The hook fires on every Devin event: an interpreter missing the
+# runtime deps would install "successfully" but die on import each
+# time, silently killing the hook transport - verify before writing.
+"$PYTHON_BIN" -c "import pydantic" >/dev/null 2>&1 || die \
+    "python '$PYTHON_BIN' cannot import pydantic;" \
+    " set SESSIONS_BRIDGE_PYTHON to an interpreter that has it"
+PYTHONPATH="$SRC_DIR" "$PYTHON_BIN" -c \
+    "import session_bridge.hooks.worker" >/dev/null 2>&1 || die \
+    "python '$PYTHON_BIN' cannot import session_bridge.hooks.worker" \
+    " from $SRC_DIR; set SESSIONS_BRIDGE_PYTHON"
+
 STOP_TIMEOUT="${SESSIONS_BRIDGE_STOP_TIMEOUT:-600}"
 CYCLE_SECONDS="${SESSIONS_BRIDGE_CYCLE_SECONDS:-150}"
 CYCLES_MAX="${SESSIONS_BRIDGE_CYCLES_MAX:-5}"

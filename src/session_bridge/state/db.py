@@ -14,6 +14,7 @@ Writers retry SQLITE_BUSY with exponential backoff on top of the
 """
 
 import os
+import re
 import sqlite3
 import time
 from enum import Enum
@@ -311,26 +312,37 @@ def renew_lease(task_id: int, owner: str, *, path=None) -> bool:
     return _retry(op)
 
 
-def release_lease(task_id: int, owner: str | None = None, *, path=None) -> bool:
-    """Clear lease owner/expiry; CAS on owner when one is given."""
+def release_lease(
+    task_id: int,
+    owner: str | None = None,
+    *,
+    expected_status=None,
+    path=None,
+) -> bool:
+    """Clear lease owner/expiry; CAS on owner when one is given.
+
+    ``expected_status`` additionally guards the release on the task
+    still being in that status, so a stale cleanup cannot strip the
+    lease of a task that already moved on (e.g. dispatch_decided >
+    running - a running task without a lease is unrecoverable).
+    """
     ts = _now()
 
     def op():
         con = connect(path)
         try:
-            if owner is None:
-                cur = con.execute(
-                    "UPDATE tasks SET lease_owner=NULL,"
-                    " lease_expires_at=NULL, updated_at=? WHERE id=?",
-                    (ts, task_id),
-                )
-            else:
-                cur = con.execute(
-                    "UPDATE tasks SET lease_owner=NULL,"
-                    " lease_expires_at=NULL, updated_at=?"
-                    " WHERE id=? AND lease_owner=?",
-                    (ts, task_id, owner),
-                )
+            sql = (
+                "UPDATE tasks SET lease_owner=NULL,"
+                " lease_expires_at=NULL, updated_at=? WHERE id=?"
+            )
+            args: list = [ts, task_id]
+            if owner is not None:
+                sql += " AND lease_owner=?"
+                args.append(owner)
+            if expected_status is not None:
+                sql += " AND status=?"
+                args.append(_val(expected_status))
+            cur = con.execute(sql, args)
             return cur.rowcount == 1
         finally:
             con.close()
@@ -709,8 +721,9 @@ def list_tasks(status=None, *, path=None, limit: int = 50):
         try:
             if status is not None:
                 return con.execute(
-                    "SELECT * FROM tasks WHERE status=? ORDER BY id",
-                    (_val(status),),
+                    "SELECT * FROM tasks WHERE status=? ORDER BY id"
+                    " LIMIT ?",
+                    (_val(status), limit),
                 ).fetchall()
             return con.execute(
                 "SELECT * FROM tasks ORDER BY id DESC LIMIT ?", (limit,)
@@ -785,6 +798,57 @@ def get_session(session_id: str, *, path=None):
     return _retry(op)
 
 
+def decrement_park_cycles(
+    session_id: str, fresh_budget: int, *, path=None
+) -> int:
+    """Atomically consume one park cycle; returns the cycles left.
+
+    Single-statement read-modify-write - no lost update against a
+    concurrent SessionStart reset or a second parked hook. A missing
+    sessions row is created with ``fresh_budget - 1``, and a persisted
+    value above ``fresh_budget`` is clamped down first so a reduced
+    configured budget takes effect immediately.
+    """
+    ts = _now()
+    budget = max(int(fresh_budget), 0)
+
+    def op():
+        con = connect(path)
+        try:
+            row = con.execute(
+                "INSERT INTO"
+                " sessions(session_id,park_cycles_left,updated_at)"
+                " VALUES(?,?,?) ON CONFLICT(session_id) DO UPDATE SET"
+                " park_cycles_left=MAX(MIN(park_cycles_left,?)-1,0),"
+                " updated_at=excluded.updated_at"
+                " RETURNING park_cycles_left",
+                (session_id, max(budget - 1, 0), ts, budget),
+            ).fetchone()
+            return int(row["park_cycles_left"])
+        finally:
+            con.close()
+
+    return _retry(op)
+
+
+# --- queue trigger naming -----------------------------------------------------
+
+
+_TRIGGER_SAFE = re.compile(r"[^A-Za-z0-9._-]")
+
+
+def trigger_filename(session_id: str) -> str:
+    """Map a session id to a queue-trigger file name, sanitized.
+
+    Session ids arrive over the hook/CLI boundary unchecked; the
+    whitelist keeps the file inside the queue directory (slashes and
+    ``..`` segments cannot escape). The write and the consume sides
+    share this mapping so they always agree on the file name.
+    """
+    name = _TRIGGER_SAFE.sub("_", session_id).lstrip(".")
+    return f"{name or 'sid'}.json"
+
+
 # --- devin cli integration (read-only) --------------------------------------
 
 
@@ -826,9 +890,10 @@ def sessions_db_lookup(session_id: str, *, db_path=None) -> dict | None:
 def is_locked(session_id: str) -> tuple[bool, int | None]:
     """Whether the session is held by a live devin process.
 
-    Reads the lock-file PID and checks ``/proc/<pid>/cmdline`` for
-    'devin' - the proc read doubles as the liveness check and guards
-    against PID reuse. Returns ``(locked, pid_or_None)``.
+    Reads the lock-file PID and checks ``/proc/<pid>/cmdline`` for a
+    process actually named 'devin' - the proc read doubles as the
+    liveness check and guards against PID reuse. Returns
+    ``(locked, pid_or_None)``.
     """
     lock = os.path.join(
         os.path.expanduser(SESSION_LOCKS_DIR), f"{session_id}.lock"
@@ -846,6 +911,10 @@ def is_locked(session_id: str) -> tuple[bool, int | None]:
 def _pid_is_devin(pid: int) -> bool:
     try:
         with open(f"/proc/{pid}/cmdline", "rb") as f:
-            return b"devin" in f.read()
+            argv0 = f.read().split(b"\0", 1)[0]
     except OSError:
         return False
+    # match the process name (basename of argv[0]), not any 'devin'
+    # substring in the cmdline - a recycled pid with devin in a path
+    # argument must not mark the session locked
+    return argv0.rsplit(b"/", 1)[-1] in (b"devin", b"devin.exe")

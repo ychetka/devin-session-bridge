@@ -7,6 +7,7 @@ tmp_path - the db is the contract boundary and stays unmocked.
 
 import io
 import json
+import os
 import subprocess
 import sys
 import threading
@@ -347,6 +348,39 @@ def test_item06_gwt5_session_end_parks_running_orphan(
     assert row["lease_owner"] is None
 
 
+def test_item06_session_end_race_keeps_running_lease(
+    env, monkeypatch, capsys
+):
+    # regression: the task was dispatch_decided when read, but the real
+    # owner marked it running before our mark_running CAS arrived -
+    # the release_lease fallback must not strip the running task's
+    # lease (a running task without a lease is unrecoverable)
+    tid = _task(env)
+    owner = "acp-7-1"
+    assert db.claim_queued(tid, owner, Transport.ACP_PUSH, path=env["db"])
+
+    real_mark_running = db.mark_running
+
+    def owner_won_the_race(task_id, o, *, path=None):
+        # the owner's transition lands first; our CAS then loses
+        real_mark_running(task_id, o, path=path)
+        return False
+
+    monkeypatch.setattr(db, "mark_running", owner_won_the_race)
+    payload = {
+        "hook_event_name": "SessionEnd",
+        "session_id": SID,
+        "reason": "logout",
+    }
+    rc, out = _run(env, payload, monkeypatch, capsys)
+    assert rc == 0
+    assert out is None
+    row = _get_task(env, tid)
+    assert row["status"] == "running"
+    assert row["lease_owner"] == owner
+    assert row["lease_expires_at"] is not None
+
+
 # --- queue trigger inside the park cycle --------------------------------------
 
 
@@ -485,3 +519,49 @@ def test_item06_gwt6_install_is_idempotent_and_preserves(tmp_path):
 def test_item06_gwt6_install_on_missing_repo_fails(tmp_path):
     res = _install(tmp_path / "nonexistent")
     assert res.returncode != 0
+
+
+def test_item06_gwt6_install_fails_without_pydantic(tmp_path):
+    # regression: an interpreter missing the runtime deps must abort
+    # the install, not leave a hook that dies on import at every event
+    repo = tmp_path / "target"
+    repo.mkdir()
+    fake = tmp_path / "python-no-deps"
+    fake.write_text("#!/bin/sh\nexit 1\n")
+    fake.chmod(0o755)
+    res = subprocess.run(
+        ["bash", str(INSTALL_SH), str(repo)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env={**os.environ, "SESSIONS_BRIDGE_PYTHON": str(fake)},
+    )
+    assert res.returncode != 0
+    assert "pydantic" in res.stderr
+    assert not (repo / ".devin" / "hooks.v1.json").exists()
+
+
+def test_item06_gwt6_install_fails_without_session_bridge(tmp_path):
+    # a python that has pydantic but cannot import the package must
+    # abort too - the PYTHONPATH wiring is part of the check
+    repo = tmp_path / "target"
+    repo.mkdir()
+    fake = tmp_path / "python-no-bridge"
+    fake.write_text(
+        "#!/bin/sh\n"
+        'if [ "$2" = "import pydantic" ]; then\n'
+        "    exit 0\n"
+        "fi\n"
+        "exit 1\n"
+    )
+    fake.chmod(0o755)
+    res = subprocess.run(
+        ["bash", str(INSTALL_SH), str(repo)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env={**os.environ, "SESSIONS_BRIDGE_PYTHON": str(fake)},
+    )
+    assert res.returncode != 0
+    assert "session_bridge" in res.stderr
+    assert not (repo / ".devin" / "hooks.v1.json").exists()

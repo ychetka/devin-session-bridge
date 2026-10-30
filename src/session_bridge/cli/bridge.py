@@ -146,7 +146,10 @@ def _write_trigger(queue_dir: str, session_id: str) -> None:
             )
             fh.flush()
             os.fsync(fh.fileno())
-        os.replace(tmp, os.path.join(queue_dir, f"{session_id}.json"))
+        os.replace(
+            tmp,
+            os.path.join(queue_dir, db.trigger_filename(session_id)),
+        )
         tmp = None
     except OSError as e:
         _log(f"cannot write queue trigger for {session_id}: {e}")
@@ -649,6 +652,20 @@ def _cmd_push(args) -> int:
         )
     result = pump(args)
     task = db.get_task(tid, path=args.db)
+    if task is None:
+        # a concurrent `bridge clear` deleted the fresh task mid-pump
+        resp = JsonResponse(
+            session=args.session_id,
+            status="not_found",
+            queue_depth=_queue_depth(args),
+            error=f"task {tid} was cleared during dispatch",
+        )
+        return _emit(
+            args,
+            resp,
+            ExitCode.NOT_FOUND,
+            f"not found: task {tid} was cleared during dispatch",
+        )
     events = [
         e for e in result["events"] if e.session_id == args.session_id
     ]
@@ -932,7 +949,23 @@ def _cmd_clear(args) -> int:
             f"conflict: task {task['id']} is {task['status']},"
             " not queued",
         )
-    db.clear(task["id"], path=args.db)
+    if not db.clear(task["id"], path=args.db):
+        # the task left `queued` between our check and the delete -
+        # e.g. claim_queued already dispatched it
+        row = db.get_task(task["id"], path=args.db)
+        status = row["status"] if row is not None else "gone"
+        resp = JsonResponse(
+            session=args.session,
+            status=status,
+            queue_depth=_queue_depth(args),
+            error=f"task {task['id']} is {status}; not cleared",
+        )
+        return _emit(
+            args,
+            resp,
+            ExitCode.CONFLICT,
+            f"conflict: task {task['id']} is {status}, not cleared",
+        )
     pump(args)
     resp = JsonResponse(
         session=args.session,

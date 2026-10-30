@@ -1,6 +1,7 @@
 """Persistence and concurrency tests for the state.db layer (item_04)."""
 
 import multiprocessing
+import shutil
 import sqlite3
 import subprocess
 import time
@@ -414,6 +415,14 @@ def test_item04_sessions_db_lookup(tmp_path, monkeypatch):
     assert bad.read_bytes() == b"junk"
 
 
+def _named_exe(tmp_path, name):
+    """A ``sleep`` binary reachable under ``name`` via symlink, so the
+    spawned process's argv[0] basename is exactly ``name``."""
+    exe = tmp_path / name
+    exe.symlink_to(shutil.which("sleep"))
+    return str(exe)
+
+
 def _spawn_cmdline(argv, marker):
     """Spawn a process and wait until /proc/<pid>/cmdline shows the
     final exec'd argv (fork/exec race: cmdline is the parent's first)."""
@@ -446,8 +455,8 @@ def test_item04_is_locked(tmp_path, monkeypatch):
     (locks / "dead.lock").write_text(str(dead_pid))
     assert db.is_locked("dead") == (False, dead_pid)
 
-    # live process whose cmdline contains 'devin' -> locked
-    proc = _spawn_cmdline(["bash", "-c", "exec -a devin-x sleep 30"], b"devin-x")
+    # live process whose argv[0] basename is 'devin' -> locked
+    proc = _spawn_cmdline([_named_exe(tmp_path, "devin"), "30"], b"devin")
     (locks / "live.lock").write_text(str(proc.pid))
     try:
         assert db.is_locked("live") == (True, proc.pid)
@@ -457,14 +466,25 @@ def test_item04_is_locked(tmp_path, monkeypatch):
     # holder died -> lock released even though the file remains
     assert db.is_locked("live") == (False, proc.pid)
 
-    # live pid reused by a non-devin process -> PID-reuse guard
-    proc2 = _spawn_cmdline(["sleep", "30"], b"sleep")
-    (locks / "alien.lock").write_text(str(proc2.pid))
+    # 'devin' anywhere else in the cmdline is not enough: a basename
+    # that merely mentions devin must not lock (PID-reuse guard)
+    lookalike = _named_exe(tmp_path, "devin-checkout")
+    proc2 = _spawn_cmdline([lookalike, "30"], b"devin-checkout")
+    (locks / "lookalike.lock").write_text(str(proc2.pid))
     try:
-        assert db.is_locked("alien") == (False, proc2.pid)
+        assert db.is_locked("lookalike") == (False, proc2.pid)
     finally:
         proc2.terminate()
         proc2.wait()
+
+    # live pid reused by a non-devin process -> PID-reuse guard
+    proc3 = _spawn_cmdline(["sleep", "30"], b"sleep")
+    (locks / "alien.lock").write_text(str(proc3.pid))
+    try:
+        assert db.is_locked("alien") == (False, proc3.pid)
+    finally:
+        proc3.terminate()
+        proc3.wait()
 
 
 def test_item04_mark_notified_dedup_window(db_path):
@@ -577,3 +597,82 @@ def test_item04_gwt13_session_pause_helper(db_path):
     row = db.get_session("s1", path=db_path)
     assert row["queue_paused"] == 0
     assert db.claim_queued(tid, "w", "acp-push", path=db_path) is True
+
+
+def test_item04_release_lease_expected_status_guard(db_path):
+    tid = db.enqueue("s1", "x", path=db_path)
+    assert db.claim_queued(tid, "w1", "acp-push", path=db_path)
+    assert db.mark_running(tid, "w1", path=db_path)
+    # a stale cleanup guarded on dispatch_decided must not strip the
+    # lease of a task that is already running
+    assert db.release_lease(
+        tid, "w1", expected_status="dispatch_decided", path=db_path
+    ) is False
+    row = db.get_task(tid, path=db_path)
+    assert row["status"] == "running"
+    assert row["lease_owner"] == "w1"
+    assert row["lease_expires_at"] is not None
+
+    # the release still lands while the task is in the expected status
+    tid2 = db.enqueue("s2", "x", path=db_path)
+    assert db.claim_queued(tid2, "w1", "acp-push", path=db_path)
+    assert db.release_lease(
+        tid2, "w1", expected_status="dispatch_decided", path=db_path
+    ) is True
+    assert db.get_task(tid2, path=db_path)["lease_owner"] is None
+
+
+def test_item04_decrement_park_cycles_atomic(db_path):
+    # a missing row is created with fresh_budget - 1
+    assert db.decrement_park_cycles("s1", 5, path=db_path) == 4
+    assert db.decrement_park_cycles("s1", 5, path=db_path) == 3
+    # clamps at zero and never resurrects the budget
+    _exec(
+        db_path,
+        "UPDATE sessions SET park_cycles_left=1 WHERE session_id='s1'",
+    )
+    assert db.decrement_park_cycles("s1", 5, path=db_path) == 0
+    assert db.decrement_park_cycles("s1", 5, path=db_path) == 0
+    # a persisted value above the configured budget is clamped down
+    _exec(
+        db_path,
+        "UPDATE sessions SET park_cycles_left=9 WHERE session_id='s1'",
+    )
+    assert db.decrement_park_cycles("s1", 5, path=db_path) == 4
+
+    # concurrent decrements each consume a distinct cycle - the
+    # read-modify-write version could lose updates and double-spend
+    db.upsert_session("s2", park_cycles_left=3, path=db_path)
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        results = sorted(
+            ex.map(
+                lambda _: db.decrement_park_cycles("s2", 5, path=db_path),
+                range(4),
+            )
+        )
+    assert results == [0, 0, 1, 2]
+    assert db.get_session("s2", path=db_path)["park_cycles_left"] == 0
+
+
+def test_item04_list_tasks_limit_applies_with_status(db_path):
+    for i in range(5):
+        assert db.enqueue(f"s{i}", "x", path=db_path) is not None
+    rows = db.list_tasks(status="queued", limit=3, path=db_path)
+    assert len(rows) == 3
+    # FIFO order is preserved for the dispatch pass
+    ids = [r["id"] for r in rows]
+    assert ids == sorted(ids)
+    # the unfiltered listing stays newest-first
+    rows = db.list_tasks(limit=2, path=db_path)
+    assert len(rows) == 2
+    assert rows[0]["id"] > rows[1]["id"]
+
+
+def test_item04_trigger_filename_sanitized():
+    assert db.trigger_filename("abc-123_OK.9") == "abc-123_OK.9.json"
+    # traversal segments and slashes cannot escape the queue dir
+    for sid in ("../x", "..", "a/b", "a\\b", "...", ".env"):
+        name = db.trigger_filename(sid)
+        assert "/" not in name and "\\" not in name
+        assert not name.startswith(".")
+    assert db.trigger_filename("") == "sid.json"

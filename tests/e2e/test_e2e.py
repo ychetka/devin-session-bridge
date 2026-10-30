@@ -14,7 +14,7 @@ Headless coverage runs against an injected fake environment:
   ``cli/sessions.db`` and ``cli/session_locks/`` (all devin paths are
   resolved via ``os.path.expanduser`` at import time inside the
   subprocess, so HOME redirection is sufficient);
-- a fake lock file + a live process whose /proc cmdline contains
+- a fake lock file + a live process whose argv[0] basename is
   "devin" simulates a Desktop-held session.
 
 The full bridge > state.db > _work > acp chain then runs with no
@@ -345,9 +345,12 @@ class _E2EWorld:
 
     def lock_session(self, sid: str) -> None:
         """Simulate a Desktop-held session: a lock file naming a live
-        PID whose /proc cmdline contains "devin"."""
+        PID whose argv[0] basename is "devin"."""
+        exe = self.tmp / "devin"
+        if not exe.exists():
+            exe.symlink_to(shutil.which("sleep"))
         proc = subprocess.Popen(
-            ["bash", "-c", "exec -a devin-e2e sleep 300"],
+            [str(exe), "300"],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
