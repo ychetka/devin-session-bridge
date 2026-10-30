@@ -216,6 +216,7 @@ class Task(BaseModel):
             "attempt": attempt,
             "lease_owner": None,
             "lease_expires_at": None,
+            "lease_renewed_at": None,
         }
         if note is not None:
             updates["note"] = note

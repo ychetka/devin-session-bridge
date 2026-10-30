@@ -625,6 +625,41 @@ def test_item10_gwt2_concurrent_pumps_never_exceed_semaphore(env):
     assert out["data"]["concurrency"]["active"] == bridge.SEMAPHOR
 
 
+def test_item10_mark_running_lease_refusal_is_not_saturation(
+    env, capsys, monkeypatch
+):
+    # a mark_running refusal on an expired claim lease is not
+    # semaphore saturation: status --json must not report
+    # MAX_CONCURRENT_REACHED for a non-semaphore CAS loss
+    env.devin[SID] = {"working_directory": "/repo"}
+    tid = _task(env)
+
+    real_claim = db.claim_queued
+
+    def claim_then_expire(tid_, owner, transport, *, path=None):
+        ok = real_claim(tid_, owner, transport, path=path)
+        if ok:
+            con = db.connect(path)
+            try:
+                con.execute(
+                    "UPDATE tasks SET lease_expires_at=? WHERE id=?",
+                    (int(time.time()) - 1, tid_),
+                )
+            finally:
+                con.close()
+        return ok
+
+    monkeypatch.setattr(db, "claim_queued", claim_then_expire)
+
+    rc, out = _run(["status", "--json"], capsys)
+    assert rc == ExitCode.OK
+    assert "saturation_reason" not in out["data"]
+    # the refused claim folded back to queued, never wedged
+    row = db.get_task(tid, path=env.db)
+    assert row["status"] == TaskStatus.QUEUED.value
+    assert env.spawned == []
+
+
 def test_item10_gwt4_detached_worker_stderr_log(tmp_path, monkeypatch):
     db_path = str(tmp_path / "state.db")
     db.init(db_path)
@@ -697,3 +732,35 @@ def test_item10_gwt4_log_sweep_cap_and_retention(tmp_path):
     assert data.rstrip().endswith(b"TAIL")
     oldest_gone = log_dir / "worker_0_0_100.log"
     assert not oldest_gone.exists()
+
+
+def test_item10_gwt4_log_sweep_never_unlinks_fresh_logs(tmp_path):
+    db_path = str(tmp_path / "state.db")
+    db.init(db_path)
+    args = SimpleNamespace(db=db_path)
+    log_dir = Path(bridge._logs_dir(args))
+    log_dir.mkdir(parents=True)
+    now = time.time()
+    # more files than WORKER_LOG_KEEP, but the newest three are fresh
+    # enough to belong to a live worker and must survive retention
+    old = []
+    for i in range(12):
+        p = log_dir / f"worker_{i}_0_{100 + i}.log"
+        p.write_bytes(f"old {i}\n".encode())
+        mtime = now - 2 * bridge.WORKER_LOG_MIN_AGE_SECONDS + i
+        os.utime(p, (mtime, mtime))
+        old.append(p)
+    fresh = []
+    for i in range(3):
+        p = log_dir / f"worker_9{i}_0_200.log"
+        p.write_bytes(f"fresh {i}\n".encode())
+        fresh.append(p)  # mtime=now: inside the lease window
+    bridge._sweep_worker_logs(args)
+
+    files = sorted(log_dir.glob("worker_*.log"))
+    # every fresh log survives; only stale files are trimmed to KEEP
+    assert all(p.exists() for p in fresh)
+    assert len(files) == bridge.WORKER_LOG_KEEP + len(fresh)
+    assert not old[0].exists()
+    assert not old[1].exists()
+    assert all(p.exists() for p in old[2:])

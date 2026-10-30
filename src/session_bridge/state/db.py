@@ -390,7 +390,7 @@ def release_lease(
     expected_status=None,
     path=None,
 ) -> bool:
-    """Clear lease owner/expiry; CAS on owner when one is given.
+    """Clear all lease fields; CAS on owner when one is given.
 
     ``expected_status`` additionally guards the release on the task
     still being in that status, so a stale cleanup cannot strip the
@@ -404,7 +404,8 @@ def release_lease(
         try:
             sql = (
                 "UPDATE tasks SET lease_owner=NULL,"
-                " lease_expires_at=NULL, updated_at=? WHERE id=?"
+                " lease_expires_at=NULL, lease_renewed_at=NULL,"
+                " updated_at=? WHERE id=?"
             )
             args: list = [ts, task_id]
             if owner is not None:

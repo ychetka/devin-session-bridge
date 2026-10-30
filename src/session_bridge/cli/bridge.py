@@ -133,6 +133,9 @@ def _queue_depth(args) -> int:
 #: per-invocation worker log: <state_dir>/logs/worker_<tid>_<attempt>_<ts>.log
 WORKER_LOG_MAX_BYTES = 1_000_000  # oversized logs keep their tail
 WORKER_LOG_KEEP = 10  # retention: newest files survive the pump sweep
+#: retention never unlinks a log touched inside one lease window: a
+#: file that fresh can still belong to a live, writing worker
+WORKER_LOG_MIN_AGE_SECONDS = LEASE_SECONDS
 _STDERR_TAIL_LINES = 3
 
 
@@ -165,16 +168,27 @@ def _sweep_worker_logs(args) -> None:
         try:
             if os.path.getsize(p) <= WORKER_LOG_MAX_BYTES:
                 continue
+            mtime = os.path.getmtime(p)
             with open(p, "rb+") as fh:
                 fh.seek(-WORKER_LOG_MAX_BYTES, os.SEEK_END)
                 tail = fh.read()
                 fh.seek(0)
                 fh.write(tail)
                 fh.truncate()
+            # restore mtime: the tail-cap is our own maintenance
+            # write, not worker activity - it must not make an old
+            # log look fresh to the retention pass below
+            os.utime(p, (mtime, mtime))
         except OSError:
             continue
     try:
-        paths = [p for p in paths if os.path.exists(p)]
+        now = time.time()
+        paths = [
+            p
+            for p in paths
+            if os.path.exists(p)
+            and now - os.path.getmtime(p) > WORKER_LOG_MIN_AGE_SECONDS
+        ]
         paths.sort(key=lambda p: os.path.getmtime(p))
         for p in paths[: max(0, len(paths) - WORKER_LOG_KEEP)]:
             os.unlink(p)
@@ -379,8 +393,8 @@ def pump(args) -> dict:
     for the calling command's response. The queue is scanned in capped
     batches paginated by task id, so every queued task is visited even
     beyond the ``list_tasks`` limit; hook-folded tasks land back in
-    ``queued`` with a lower id and are never revisited in the same
-    pass.
+    ``queued`` keeping the same id - already below ``last_id``, so
+    they are never revisited in the same pass.
     """
     events: list[Event] = []
     hooked: list[int] = []
@@ -461,11 +475,28 @@ def pump(args) -> dict:
                     and row["status"] == TaskStatus.DISPATCH_DECIDED.value
                     and row["lease_owner"] == owner
                 ):
-                    # the semaphore was the refusing guard: fold the
-                    # claim back so the task waits for the next pass
-                    # instead of wedging on a dying lease
+                    # the claim is still ours: fold it back so the
+                    # task waits for the next pass instead of wedging
+                    # on a dying lease
                     db.release_claim(tid, owner, path=args.db)
-                    saturated = True
+                    # report saturation only when the semaphore was
+                    # the refusing guard: a claim lease still alive
+                    # now was alive at CAS time, and a live running
+                    # count at the cap leaves the count predicate as
+                    # the only one that could have failed - an
+                    # expired claim lease or another CAS loss is not
+                    # semaphore saturation
+                    if (
+                        row["lease_expires_at"] is not None
+                        and row["lease_expires_at"] > int(time.time())
+                        and db.count_tasks(
+                            status=TaskStatus.RUNNING,
+                            transport=Transport.ACP_PUSH,
+                            path=args.db,
+                        )
+                        >= SEMAPHOR
+                    ):
+                        saturated = True
                 continue
             try:
                 _spawn_worker(tid, owner, args)
