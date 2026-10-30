@@ -80,6 +80,7 @@ DISPATCH_OWNER_PREFIX = "bridge-"
 
 #: per-session STATE names shown by ``status``.
 STATE_RUNNING = "RUNNING"
+STATE_DISPATCHING = "DISPATCHING"
 STATE_PARKED = "PARKED"
 STATE_HEADLESS_IDLE = "HEADLESS-IDLE"
 STATE_NEEDS_KICK = "NEEDS-KICK"
@@ -123,7 +124,90 @@ def _queue_dir(args) -> str:
 
 
 def _queue_depth(args) -> int:
-    return len(db.list_tasks(status=TaskStatus.QUEUED, path=args.db))
+    """True queued count - a COUNT(*), never the capped task list."""
+    return db.count_tasks(status=TaskStatus.QUEUED, path=args.db)
+
+
+# --- worker stderr logs --------------------------------------------------------
+
+#: per-invocation worker log: <state_dir>/logs/worker_<tid>_<attempt>_<ts>.log
+WORKER_LOG_MAX_BYTES = 1_000_000  # oversized logs keep their tail
+WORKER_LOG_KEEP = 10  # retention: newest files survive the pump sweep
+_STDERR_TAIL_LINES = 3
+
+
+def _logs_dir(args) -> str:
+    base = args.db if args.db else db.DB_PATH
+    return os.path.join(os.path.dirname(os.path.abspath(base)), "logs")
+
+
+def _worker_log_path(task_id: int, args) -> str:
+    task = db.get_task(task_id, path=args.db)
+    attempt = task["attempt"] if task is not None else 0
+    return os.path.join(
+        _logs_dir(args),
+        f"worker_{task_id}_{attempt}_{int(time.time())}.log",
+    )
+
+
+def _sweep_worker_logs(args) -> None:
+    """Bound the worker log dir: tail-cap oversized files, keep newest."""
+    log_dir = _logs_dir(args)
+    try:
+        paths = [
+            os.path.join(log_dir, n)
+            for n in os.listdir(log_dir)
+            if n.startswith("worker_") and n.endswith(".log")
+        ]
+    except OSError:
+        return
+    for p in paths:
+        try:
+            if os.path.getsize(p) <= WORKER_LOG_MAX_BYTES:
+                continue
+            with open(p, "rb+") as fh:
+                fh.seek(-WORKER_LOG_MAX_BYTES, os.SEEK_END)
+                tail = fh.read()
+                fh.seek(0)
+                fh.write(tail)
+                fh.truncate()
+        except OSError:
+            continue
+    try:
+        paths = [p for p in paths if os.path.exists(p)]
+        paths.sort(key=lambda p: os.path.getmtime(p))
+        for p in paths[: max(0, len(paths) - WORKER_LOG_KEEP)]:
+            os.unlink(p)
+    except OSError:
+        pass
+
+
+def _worker_log_tail(args, task_id: int):
+    """(path, tail) of the newest log a worker wrote for ``task_id``."""
+    log_dir = _logs_dir(args)
+    try:
+        paths = [
+            os.path.join(log_dir, n)
+            for n in os.listdir(log_dir)
+            if n.startswith(f"worker_{task_id}_") and n.endswith(".log")
+        ]
+    except OSError:
+        return None, None
+    if not paths:
+        return None, None
+    try:
+        path = max(paths, key=lambda p: os.path.getmtime(p))
+        with open(path, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            fh.seek(max(0, size - 8192))
+            raw = fh.read()
+    except OSError:
+        return None, None
+    lines = [
+        l for l in raw.decode("utf-8", "replace").splitlines() if l.strip()
+    ]
+    return path, "\n".join(lines[-_STDERR_TAIL_LINES:]) or None
 
 
 # --- queue trigger ------------------------------------------------------------
@@ -248,15 +332,30 @@ def _spawn_worker(task_id: int, owner: str, args) -> subprocess.Popen:
     )
     prev = env.get("PYTHONPATH")
     env["PYTHONPATH"] = f"{src}{os.pathsep}{prev}" if prev else src
-    return subprocess.Popen(
-        argv,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,
-        close_fds=True,
-        env=env,
-    )
+    # stderr goes to a per-invocation log (not DEVNULL) so a crashed
+    # worker stays diagnosable; the pump sweep bounds size and count
+    stderr: object = subprocess.DEVNULL
+    log_fh = None
+    try:
+        os.makedirs(_logs_dir(args), exist_ok=True)
+        log_fh = open(_worker_log_path(task_id, args), "ab")
+        stderr = log_fh
+    except OSError as e:
+        _log(f"cannot open worker log for task {task_id}: {e}")
+    try:
+        proc = subprocess.Popen(
+            argv,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=stderr,
+            start_new_session=True,
+            close_fds=True,
+            env=env,
+        )
+    finally:
+        if log_fh is not None:
+            log_fh.close()  # the child keeps its own dup of the fd
+    return proc
 
 
 def _task_to_hook_queue(task_id: int, owner: str, args) -> bool:
@@ -264,45 +363,32 @@ def _task_to_hook_queue(task_id: int, owner: str, args) -> bool:
 
     The task can be in either of two states when this runs: still
     ``dispatch_decided`` (``fallback_to_hook`` wins) or already
-    ``running`` under our lease (pump marked it before the worker
-    answered). Both are settled with a single guarded UPDATE each -
-    no half-state is ever committed. ``running > queued`` is a
-    declared automatic edge; this mirrors ``fallback_to_hook``'s CAS
-    for the running side.
+    ``running`` under our lease (pump admitted it before the worker
+    answered - ``demote_running_to_hook`` wins). Both are single
+    guarded UPDATEs in db.py - no half-state is ever committed.
     """
     if db.fallback_to_hook(task_id, owner, path=args.db):
         return True
-    ts = int(time.time())
-    con = db.connect(args.db)
-    try:
-        cur = con.execute(
-            "UPDATE tasks SET status=?, transport=?, lease_owner=NULL,"
-            " lease_expires_at=NULL, updated_at=?"
-            " WHERE id=? AND status=? AND lease_owner=?",
-            (
-                TaskStatus.QUEUED.value,
-                Transport.HOOK_QUEUE.value,
-                ts,
-                task_id,
-                TaskStatus.RUNNING.value,
-                owner,
-            ),
-        )
-        return cur.rowcount == 1
-    finally:
-        con.close()
+    return db.demote_running_to_hook(task_id, owner, path=args.db)
 
 
 def pump(args) -> dict:
     """Lazy recovery + one dispatch pass over queued tasks.
 
-    Returns ``{"events", "hooked", "spawned", "unknown"}`` for the
-    calling command's response.
+    Returns ``{"events", "hooked", "spawned", "unknown", "saturated"}``
+    for the calling command's response. The queue is scanned in capped
+    batches paginated by task id, so every queued task is visited even
+    beyond the ``list_tasks`` limit; hook-folded tasks land back in
+    ``queued`` with a lower id and are never revisited in the same
+    pass.
     """
     events: list[Event] = []
     hooked: list[int] = []
     spawned: list[int] = []
     unknown: list[str] = []
+    saturated = False
+
+    _sweep_worker_logs(args)
 
     for tid in db.recover_stale(path=args.db):
         row = db.get_task(tid, path=args.db)
@@ -319,60 +405,87 @@ def pump(args) -> dict:
             )
             _notify(args, row, "FAILED", detail)
 
-    running_acp = sum(
-        1
-        for t in db.list_tasks(status=TaskStatus.RUNNING, path=args.db)
-        if t["transport"] == Transport.ACP_PUSH.value
+    running_acp = db.count_tasks(
+        status=TaskStatus.RUNNING,
+        transport=Transport.ACP_PUSH,
+        path=args.db,
     )
 
-    for task in db.list_tasks(status=TaskStatus.QUEUED, path=args.db):
-        tid = task["id"]
-        sid = task["session_id"]
-        locked, _pid = db.is_locked(sid)
-        if locked:
-            # transport decision: the session is open in devin, so the
-            # parked Stop hook delivers it - claim + fold back to
-            # queued with the hook transport, then wake the hook
-            owner = f"{DISPATCH_OWNER_PREFIX}{os.getpid()}-{tid}"
-            if db.claim_queued(
-                tid, owner, Transport.HOOK_QUEUE, path=args.db
-            ) and db.fallback_to_hook(tid, owner, path=args.db):
-                _write_trigger(_queue_dir(args), sid)
-                hooked.append(tid)
-            continue
-        if running_acp >= SEMAPHOR:
-            continue  # stays queued until a slot frees
-        if not _session_known(sid, args):
-            if sid not in unknown:
-                unknown.append(sid)
-            continue
-        owner = f"{ACP_OWNER_PREFIX}{os.getpid()}-{tid}"
-        if not db.claim_queued(tid, owner, Transport.ACP_PUSH, path=args.db):
-            continue
-        # running + lease is set before the child exists so a spawn
-        # failure cannot strand a dispatch_decided task
-        if not db.mark_running(tid, owner, path=args.db):
-            db.fallback_to_hook(tid, owner, path=args.db)
-            _write_trigger(_queue_dir(args), sid)
-            continue
-        try:
-            _spawn_worker(tid, owner, args)
-        except OSError as e:
-            _log(
-                f"worker spawn failed for task {tid}: {e};"
-                " requeueing for the hook path"
-            )
-            if _task_to_hook_queue(tid, owner, args):
-                _write_trigger(_queue_dir(args), sid)
-                hooked.append(tid)
-            continue
-        spawned.append(tid)
-        running_acp += 1
+    last_id = 0
+    while True:
+        batch = db.list_tasks(
+            status=TaskStatus.QUEUED,
+            path=args.db,
+            after_id=last_id,
+        )
+        if not batch:
+            break
+        for task in batch:
+            last_id = task["id"]
+            tid = task["id"]
+            sid = task["session_id"]
+            locked, _pid = db.is_locked(sid)
+            if locked:
+                # transport decision: the session is open in devin, so
+                # the parked Stop hook delivers it - claim + fold back
+                # to queued with the hook transport, then wake the hook
+                owner = f"{DISPATCH_OWNER_PREFIX}{os.getpid()}-{tid}"
+                if db.claim_queued(
+                    tid, owner, Transport.HOOK_QUEUE, path=args.db
+                ) and db.fallback_to_hook(tid, owner, path=args.db):
+                    _write_trigger(_queue_dir(args), sid)
+                    hooked.append(tid)
+                continue
+            if running_acp >= SEMAPHOR:
+                saturated = True
+                continue  # stays queued until a slot frees
+            if not _session_known(sid, args):
+                if sid not in unknown:
+                    unknown.append(sid)
+                continue
+            owner = f"{ACP_OWNER_PREFIX}{os.getpid()}-{tid}"
+            if not db.claim_queued(
+                tid, owner, Transport.ACP_PUSH, path=args.db
+            ):
+                continue
+            # atomic admission: the running count is checked inside the
+            # same CAS statement, so racing pumps can never exceed
+            # SEMAPHOR; running + lease is set before the child exists
+            # so a spawn failure cannot strand a dispatch_decided task
+            if not db.mark_running(
+                tid, owner, max_running=SEMAPHOR, path=args.db
+            ):
+                row = db.get_task(tid, path=args.db)
+                if (
+                    row is not None
+                    and row["status"] == TaskStatus.DISPATCH_DECIDED.value
+                    and row["lease_owner"] == owner
+                ):
+                    # the semaphore was the refusing guard: fold the
+                    # claim back so the task waits for the next pass
+                    # instead of wedging on a dying lease
+                    db.release_claim(tid, owner, path=args.db)
+                    saturated = True
+                continue
+            try:
+                _spawn_worker(tid, owner, args)
+            except OSError as e:
+                _log(
+                    f"worker spawn failed for task {tid}: {e};"
+                    " requeueing for the hook path"
+                )
+                if _task_to_hook_queue(tid, owner, args):
+                    _write_trigger(_queue_dir(args), sid)
+                    hooked.append(tid)
+                continue
+            spawned.append(tid)
+            running_acp += 1
     return {
         "events": events,
         "hooked": hooked,
         "spawned": spawned,
         "unknown": unknown,
+        "saturated": saturated,
     }
 
 
@@ -467,13 +580,13 @@ def _work_task(task_id: int, owner: str, args) -> JsonResponse:
                 "task is not owned by this worker; do not retry"
             ),
         )
-    # ownership re-check before any side effect: the row fetched above
-    # may be stale by the time the acp prompt would run (expired lease
-    # reclaimed by recover_stale, a recycled task id, a manually
-    # spawned worker with a mistyped --owner). A stale or foreign
-    # worker must never double-prompt a task owned by somebody else.
+    # ownership re-confirm immediately before any transport side
+    # effect: a single CAS statement proves status='running' AND
+    # lease_owner=me and pushes the expiry out. A task reclaimed by
+    # recover_stale (or moved by any other transition) loses the CAS
+    # and the worker backs off instead of double-prompting.
     task = db.get_task(task_id, path=args.db)
-    if task is None or task["lease_owner"] != owner:
+    if task is None or not db.renew_lease(task_id, owner, path=args.db):
         return JsonResponse(
             session=sid,
             status=(task["status"] if task is not None else "not_found"),
@@ -716,9 +829,17 @@ def _all_session_rows(args):
         con.close()
 
 
-def _session_views(args) -> tuple[list[dict], list[Event]]:
-    """Fold state.db sessions + tasks into per-session status views."""
+def _session_views(args) -> tuple[list[dict], list[Event], int]:
+    """Fold state.db sessions + tasks into per-session status views.
+
+    Returns (views, events, queue_shown) - queue_shown is how many
+    queued tasks the capped listing actually folded into views, so the
+    caller can flag truncation against the true COUNT(*).
+    """
     tasks = db.list_tasks(limit=1000, path=args.db)
+    queue_shown = sum(
+        1 for t in tasks if t["status"] == TaskStatus.QUEUED.value
+    )
     by_session: dict[str, list] = {}
     for t in tasks:  # newest first
         by_session.setdefault(t["session_id"], []).append(t)
@@ -746,8 +867,16 @@ def _session_views(args) -> tuple[list[dict], list[Event]]:
         paused = bool(srow["queue_paused"]) if srow is not None else False
 
         notify_task = None
+        log_path = stderr_tail = None
         if live is not None and live["status"] == TaskStatus.RUNNING.value:
             state, action = STATE_RUNNING, "-"
+        elif (
+            live is not None
+            and live["status"] == TaskStatus.DISPATCH_DECIDED.value
+        ):
+            # a claimed task mid-dispatch is visible, not a silent wedge
+            state = STATE_DISPATCHING
+            action = "dispatch in progress"
         elif (
             live is not None
             and live["status"] == TaskStatus.AWAITING_USER.value
@@ -772,6 +901,9 @@ def _session_views(args) -> tuple[list[dict], list[Event]]:
             state = STATE_FAILED
             action = f"bridge retry {sid}"
             notify_task = (last_terminal, EventKind.FAILED)
+            log_path, stderr_tail = _worker_log_tail(
+                args, last_terminal["id"]
+            )
         else:
             state, action = STATE_HEADLESS_IDLE, "push a task"
 
@@ -807,23 +939,46 @@ def _session_views(args) -> tuple[list[dict], list[Event]]:
                 and live["status"] == TaskStatus.QUEUED.value
                 else 0,
                 "action": action,
+                "log_path": log_path,
+                "stderr_tail": stderr_tail,
             }
         )
-    return views, events
+    return views, events, queue_shown
 
 
 def _cmd_status(args) -> int:
     result = pump(args)
-    views, events = _session_views(args)
+    views, events, queue_shown = _session_views(args)
     seen = {(e.kind, e.task_id) for e in result["events"]}
     events = result["events"] + [
         e for e in events if (e.kind, e.task_id) not in seen
     ]
+    queue_depth = _queue_depth(args)
+    data = {
+        "sessions": views,
+        # queue_depth is the true COUNT(*); queue_shown is what the
+        # capped session listing folded in - truncation is explicit
+        "queue_shown": queue_shown,
+        "queue_truncated": queue_depth > queue_shown,
+        "in_flight_dispatch": db.count_tasks(
+            status=TaskStatus.DISPATCH_DECIDED, path=args.db
+        ),
+        "concurrency": {
+            "active": db.count_tasks(
+                status=TaskStatus.RUNNING,
+                transport=Transport.ACP_PUSH,
+                path=args.db,
+            ),
+            "max": SEMAPHOR,
+        },
+    }
+    if result["saturated"]:
+        data["saturation_reason"] = "MAX_CONCURRENT_REACHED"
     resp = JsonResponse(
         status="ok",
-        queue_depth=_queue_depth(args),
+        queue_depth=queue_depth,
         events=events,
-        data={"sessions": views},
+        data=data,
     )
     lines = ["SESSION | REPO | TRANSPORT | STATE | QUEUE | ACTION"]
     for v in views:
@@ -831,6 +986,10 @@ def _cmd_status(args) -> int:
             f"{v['session']} | {v['repo']} | {v['transport'] or '-'}"
             f" | {v['state']} | {v['queue']} | {v['action']}"
         )
+        if v["stderr_tail"]:
+            lines.append(f"    log: {v['log_path']}")
+            for tail_line in v["stderr_tail"].splitlines():
+                lines.append(f"    stderr: {tail_line}")
     if len(lines) == 1:
         lines.append("(no sessions)")
     return _emit(args, resp, ExitCode.OK, "\n".join(lines))

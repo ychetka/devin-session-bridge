@@ -510,15 +510,13 @@ def _on_session_end(p: SessionEndPayload, args):
                 tid, lease_owner, note=SESSION_ENDED_NOTE, path=args.db
             )
         elif lease_owner:
-            # the mark_running CAS lost: the real owner may already be
-            # running under the same lease_owner - releasing must stay
-            # guarded on dispatch_decided so a running task can never
-            # be left without its (unrecoverable) lease
-            db.release_lease(
-                tid,
-                lease_owner,
-                expected_status=TaskStatus.DISPATCH_DECIDED,
-                path=args.db,
+            # the mark_running CAS lost: either the owner already moved
+            # the task on (leave it alone), or the claim lease expired -
+            # an expired claim is a wedge, so let the attempt budget
+            # decide (requeue-or-fail) instead of stripping the lease,
+            # which would strand the task invisibly
+            db.requeue_or_fail(
+                tid, note=SESSION_ENDED_NOTE, path=args.db
             )
     elif st == TaskStatus.RUNNING.value:
         lease_owner = task["lease_owner"]
