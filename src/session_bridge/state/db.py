@@ -90,6 +90,9 @@ CREATE TABLE IF NOT EXISTS tasks (
 CREATE UNIQUE INDEX IF NOT EXISTS ux_tasks_live_session
   ON tasks(session_id) WHERE status IN ({_LIVE_SQL});
 
+-- Supports the status scans (queue depth, recovery, dispatch).
+CREATE INDEX IF NOT EXISTS ix_tasks_status ON tasks(status);
+
 CREATE TABLE IF NOT EXISTS sessions (
   session_id TEXT PRIMARY KEY,
   cwd TEXT,
@@ -231,6 +234,12 @@ def claim_queued(task_id: int, owner: str, transport, *, path=None) -> bool:
 
     Tasks of sessions with ``queue_paused=1`` are skipped; a session
     without a sessions row is claimable.
+
+    The claim carries a lease so a crash between the claim and the
+    transport does not wedge the task invisibly: ``recover_stale``
+    treats an expired dispatch_decided lease like an expired running
+    one and the owner must re-confirm via ``mark_running`` before the
+    transport runs.
     """
     ts = _now()
 
@@ -239,13 +248,16 @@ def claim_queued(task_id: int, owner: str, transport, *, path=None) -> bool:
         try:
             cur = con.execute(
                 "UPDATE tasks SET status=?, transport=?, lease_owner=?,"
-                " updated_at=? WHERE id=? AND status=? AND COALESCE("
+                " lease_expires_at=?, lease_renewed_at=?, updated_at=?"
+                " WHERE id=? AND status=? AND COALESCE("
                 "  (SELECT queue_paused FROM sessions"
                 "   WHERE session_id=tasks.session_id), 0) = 0",
                 (
                     TaskStatus.DISPATCH_DECIDED.value,
                     _val(transport),
                     owner,
+                    ts + LEASE_SECONDS,
+                    ts,
                     ts,
                     task_id,
                     TaskStatus.QUEUED.value,
@@ -258,21 +270,80 @@ def claim_queued(task_id: int, owner: str, transport, *, path=None) -> bool:
     return _retry(op)
 
 
-def mark_running(task_id: int, owner: str, *, path=None) -> bool:
-    """CAS ``dispatch_decided > running`` for the claimant; sets lease."""
+def mark_running(
+    task_id: int, owner: str, *, max_running: int | None = None, path=None
+) -> bool:
+    """CAS ``dispatch_decided > running`` for the claimant; sets lease.
+
+    The CAS requires the claim lease to be owned and unexpired: once a
+    lease lapses, ``recover_stale`` owns the transition and a late
+    owner can never promote the task (no double transport).
+
+    ``max_running`` adds atomic admission to the same statement: the
+    count of ``running`` acp-push tasks must stay below the cap, so
+    concurrent pump processes can never oversubscribe the semaphore.
+    A False return with the row still dispatch_decided under ``owner``
+    means the cap was hit - the caller should ``release_claim``.
+    """
+    ts = _now()
+
+    def op():
+        con = connect(path)
+        try:
+            sql = (
+                "UPDATE tasks SET status=?, lease_expires_at=?,"
+                " lease_renewed_at=?, updated_at=?"
+                " WHERE id=? AND status=? AND lease_owner=?"
+                " AND lease_expires_at IS NOT NULL"
+                " AND lease_expires_at>?"
+            )
+            args: list = [
+                TaskStatus.RUNNING.value,
+                ts + LEASE_SECONDS,
+                ts,
+                ts,
+                task_id,
+                TaskStatus.DISPATCH_DECIDED.value,
+                owner,
+                ts,
+            ]
+            if max_running is not None:
+                sql += (
+                    " AND (SELECT COUNT(*) FROM tasks WHERE status=?"
+                    " AND transport=?)<?"
+                )
+                args += [
+                    TaskStatus.RUNNING.value,
+                    Transport.ACP_PUSH.value,
+                    int(max_running),
+                ]
+            cur = con.execute(sql, args)
+            return cur.rowcount == 1
+        finally:
+            con.close()
+
+    return _retry(op)
+
+
+def release_claim(task_id: int, owner: str, *, path=None) -> bool:
+    """CAS ``dispatch_decided > queued`` dropping the claim and lease.
+
+    Used when admission is refused after ``claim_queued`` (semaphore
+    full): the task folds back to queued keeping its transport
+    decision instead of sitting in dispatch_decided on a dying lease.
+    """
     ts = _now()
 
     def op():
         con = connect(path)
         try:
             cur = con.execute(
-                "UPDATE tasks SET status=?, lease_expires_at=?,"
-                " lease_renewed_at=?, updated_at=?"
+                "UPDATE tasks SET status=?, lease_owner=NULL,"
+                " lease_expires_at=NULL, lease_renewed_at=NULL,"
+                " updated_at=?"
                 " WHERE id=? AND status=? AND lease_owner=?",
                 (
-                    TaskStatus.RUNNING.value,
-                    ts + LEASE_SECONDS,
-                    ts,
+                    TaskStatus.QUEUED.value,
                     ts,
                     task_id,
                     TaskStatus.DISPATCH_DECIDED.value,
@@ -319,7 +390,7 @@ def release_lease(
     expected_status=None,
     path=None,
 ) -> bool:
-    """Clear lease owner/expiry; CAS on owner when one is given.
+    """Clear all lease fields; CAS on owner when one is given.
 
     ``expected_status`` additionally guards the release on the task
     still being in that status, so a stale cleanup cannot strip the
@@ -333,7 +404,8 @@ def release_lease(
         try:
             sql = (
                 "UPDATE tasks SET lease_owner=NULL,"
-                " lease_expires_at=NULL, updated_at=? WHERE id=?"
+                " lease_expires_at=NULL, lease_renewed_at=NULL,"
+                " updated_at=? WHERE id=?"
             )
             args: list = [ts, task_id]
             if owner is not None:
@@ -351,18 +423,28 @@ def release_lease(
 
 
 def requeue_or_fail(task_id: int, note: str | None = None, *, path=None):
-    """Lease-expiry recovery for a running task.
+    """Lease-expiry recovery for a leased live task.
 
-    ``attempt + 1 < MAX_ATTEMPTS`` requeues to ``queued``; otherwise the
-    task lands on terminal ``failed``. Both branches are a single CAS
-    UPDATE guarded on the still-expired lease, so concurrent recoveries
-    are idempotent. Returns the new ``TaskStatus`` or ``None`` when the
-    task was already moved (renewed or recovered by someone else).
+    Covers ``running`` and ``dispatch_decided``: an expired claim lease
+    means the claimant died before the transport ran (a wedge that was
+    previously invisible). ``attempt + 1 < MAX_ATTEMPTS`` requeues to
+    ``queued``; otherwise the task lands on terminal ``failed`` - a
+    repeated wedge is a poison pill, not another requeue. Both branches
+    are a single CAS UPDATE guarded on the still-expired lease, so
+    concurrent recoveries (and a racing owner re-confirm, which loses
+    its CAS the moment the lease lapses) are consistent: exactly one
+    side wins. Returns the new ``TaskStatus`` or ``None`` when the task
+    was already moved.
     """
     ts = _now()
     guard = (
-        " WHERE id=? AND status=? AND lease_expires_at IS NOT NULL"
+        " WHERE id=? AND status IN (?, ?) AND lease_expires_at IS NOT NULL"
         " AND lease_expires_at<?"
+    )
+    guard_args = (
+        TaskStatus.RUNNING.value,
+        TaskStatus.DISPATCH_DECIDED.value,
+        ts,
     )
 
     def op():
@@ -371,6 +453,7 @@ def requeue_or_fail(task_id: int, note: str | None = None, *, path=None):
             cur = con.execute(
                 "UPDATE tasks SET status=?, attempt=attempt+1,"
                 " lease_owner=NULL, lease_expires_at=NULL,"
+                " lease_renewed_at=NULL,"
                 " note=COALESCE(?,note), updated_at=?"
                 + guard
                 + " AND attempt+1<?",
@@ -379,8 +462,7 @@ def requeue_or_fail(task_id: int, note: str | None = None, *, path=None):
                     note,
                     ts,
                     task_id,
-                    TaskStatus.RUNNING.value,
-                    ts,
+                    *guard_args,
                     MAX_ATTEMPTS,
                 ),
             )
@@ -389,6 +471,7 @@ def requeue_or_fail(task_id: int, note: str | None = None, *, path=None):
             cur = con.execute(
                 "UPDATE tasks SET status=?, attempt=attempt+1,"
                 " lease_owner=NULL, lease_expires_at=NULL,"
+                " lease_renewed_at=NULL,"
                 " note=COALESCE(?,note), updated_at=?"
                 + guard
                 + " AND attempt+1>=?",
@@ -397,8 +480,7 @@ def requeue_or_fail(task_id: int, note: str | None = None, *, path=None):
                     note,
                     ts,
                     task_id,
-                    TaskStatus.RUNNING.value,
-                    ts,
+                    *guard_args,
                     MAX_ATTEMPTS,
                 ),
             )
@@ -412,10 +494,11 @@ def requeue_or_fail(task_id: int, note: str | None = None, *, path=None):
 
 
 def recover_stale(*, path=None) -> list[int]:
-    """Requeue-or-fail every running task whose lease has expired.
+    """Requeue-or-fail every leased task whose lease has expired.
 
-    Lazy recovery: safe and cheap to call on any read path; returns the
-    ids this call actually transitioned.
+    Covers ``running`` and ``dispatch_decided`` rows; lazy recovery:
+    safe and cheap to call on any read path, returns the ids this call
+    actually transitioned.
     """
     ts = _now()
 
@@ -423,9 +506,13 @@ def recover_stale(*, path=None) -> list[int]:
         con = connect(path)
         try:
             rows = con.execute(
-                "SELECT id FROM tasks WHERE status=?"
+                "SELECT id FROM tasks WHERE status IN (?, ?)"
                 " AND lease_expires_at IS NOT NULL AND lease_expires_at<?",
-                (TaskStatus.RUNNING.value, ts),
+                (
+                    TaskStatus.RUNNING.value,
+                    TaskStatus.DISPATCH_DECIDED.value,
+                    ts,
+                ),
             ).fetchall()
             return [r["id"] for r in rows]
         finally:
@@ -576,8 +663,8 @@ def fallback_to_hook(task_id: int, owner: str, *, path=None) -> bool:
 
     The atomic transport fallback: an acp-push refused because the
     session turned out locked requeues the task for the hook path in
-    one statement - no half-state. The stale claim's lease_owner is
-    cleared so the next claimant starts clean.
+    one statement - no half-state. The stale claim's lease is cleared
+    so the next claimant starts clean.
     """
     ts = _now()
 
@@ -586,6 +673,7 @@ def fallback_to_hook(task_id: int, owner: str, *, path=None) -> bool:
         try:
             cur = con.execute(
                 "UPDATE tasks SET status=?, transport=?, lease_owner=NULL,"
+                " lease_expires_at=NULL, lease_renewed_at=NULL,"
                 " updated_at=? WHERE id=? AND status=? AND lease_owner=?",
                 (
                     TaskStatus.QUEUED.value,
@@ -593,6 +681,40 @@ def fallback_to_hook(task_id: int, owner: str, *, path=None) -> bool:
                     ts,
                     task_id,
                     TaskStatus.DISPATCH_DECIDED.value,
+                    owner,
+                ),
+            )
+            return cur.rowcount == 1
+        finally:
+            con.close()
+
+    return _retry(op)
+
+
+def demote_running_to_hook(task_id: int, owner: str, *, path=None) -> bool:
+    """CAS ``running > queued`` switching transport to hook-queue.
+
+    The running-side mirror of ``fallback_to_hook``: the acp transport
+    was already admitted when the session turned out locked after all
+    (e.g. session/load answered session_locked), so the task folds
+    back to queued on the hook transport in one statement. The lease
+    is cleared - a queued task carries no lease.
+    """
+    ts = _now()
+
+    def op():
+        con = connect(path)
+        try:
+            cur = con.execute(
+                "UPDATE tasks SET status=?, transport=?, lease_owner=NULL,"
+                " lease_expires_at=NULL, lease_renewed_at=NULL,"
+                " updated_at=? WHERE id=? AND status=? AND lease_owner=?",
+                (
+                    TaskStatus.QUEUED.value,
+                    Transport.HOOK_QUEUE.value,
+                    ts,
+                    task_id,
+                    TaskStatus.RUNNING.value,
                     owner,
                 ),
             )
@@ -715,19 +837,53 @@ def get_live_task(session_id: str, *, path=None):
     return _retry(op)
 
 
-def list_tasks(status=None, *, path=None, limit: int = 50):
+def list_tasks(status=None, *, path=None, limit: int = 50, after_id=None):
+    """List tasks (``ORDER BY id`` with a status filter, newest-first
+    without one). ``after_id`` paginates the filtered listing by id so
+    a dispatch pass can scan the whole queue in capped batches."""
     def op():
         con = connect(path)
         try:
             if status is not None:
-                return con.execute(
-                    "SELECT * FROM tasks WHERE status=? ORDER BY id"
-                    " LIMIT ?",
-                    (_val(status), limit),
-                ).fetchall()
+                sql = "SELECT * FROM tasks WHERE status=?"
+                args: list = [_val(status)]
+                if after_id is not None:
+                    sql += " AND id>?"
+                    args.append(after_id)
+                sql += " ORDER BY id LIMIT ?"
+                args.append(limit)
+                return con.execute(sql, args).fetchall()
             return con.execute(
                 "SELECT * FROM tasks ORDER BY id DESC LIMIT ?", (limit,)
             ).fetchall()
+        finally:
+            con.close()
+
+    return _retry(op)
+
+
+def count_tasks(status=None, *, transport=None, path=None) -> int:
+    """Exact ``COUNT(*)`` for a status (optionally a transport too).
+
+    Unlike ``list_tasks`` there is no cap - ``status --json`` reports
+    the true queue depth from this even when the embedded task list
+    stays truncated.
+    """
+    def op():
+        con = connect(path)
+        try:
+            sql = "SELECT COUNT(*) AS c FROM tasks"
+            conds: list[str] = []
+            args: list = []
+            if status is not None:
+                conds.append("status=?")
+                args.append(_val(status))
+            if transport is not None:
+                conds.append("transport=?")
+                args.append(_val(transport))
+            if conds:
+                sql += " WHERE " + " AND ".join(conds)
+            return int(con.execute(sql, args).fetchone()["c"])
         finally:
             con.close()
 

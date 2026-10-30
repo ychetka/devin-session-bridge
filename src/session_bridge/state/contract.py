@@ -71,11 +71,14 @@ class Transport(str, Enum):
 # {done, failed, requeue(queued), awaiting_user}.
 # dispatch_decided > queued is the atomic transport fallback (e.g. an ACP
 # push refused because the session turned out locked requeues for the
-# hook path). FAILED has no outgoing edges: it is terminal.
+# hook path). dispatch_decided > queued/failed is the lease-expiry
+# recovery of a dead claimant (requeue within the attempt budget, then
+# failed - a repeated wedge is a poison pill). FAILED has no outgoing
+# edges: it is terminal.
 TRANSITIONS: Final[dict] = {
     TaskStatus.QUEUED: frozenset({TaskStatus.DISPATCH_DECIDED}),
     TaskStatus.DISPATCH_DECIDED: frozenset(
-        {TaskStatus.RUNNING, TaskStatus.QUEUED}
+        {TaskStatus.RUNNING, TaskStatus.QUEUED, TaskStatus.FAILED}
     ),
     TaskStatus.RUNNING: frozenset(
         {
@@ -197,7 +200,7 @@ class Task(BaseModel):
         return type(self).model_validate(data)
 
     def requeue_or_fail(self, note: str | None = None) -> "Task":
-        """Automatic lease-expiry recovery for a running task.
+        """Automatic lease-expiry recovery for a leased live task.
 
         ``attempt + 1 < MAX_ATTEMPTS`` requeues the task; otherwise it
         lands on terminal ``failed``. The attempt counter is incremented
@@ -213,6 +216,7 @@ class Task(BaseModel):
             "attempt": attempt,
             "lease_owner": None,
             "lease_expires_at": None,
+            "lease_renewed_at": None,
         }
         if note is not None:
             updates["note"] = note

@@ -668,6 +668,109 @@ def test_item04_list_tasks_limit_applies_with_status(db_path):
     assert rows[0]["id"] > rows[1]["id"]
 
 
+def test_item10_gwt3_dispatch_decided_wedge_recovers(db_path):
+    # the claim itself carries a lease, so a claimant that dies before
+    # the transport is visible to recovery instead of wedging silently
+    tid = db.enqueue("s1", "x", path=db_path)
+    assert db.claim_queued(tid, "w_dead", "acp-push", path=db_path)
+    row = db.get_task(tid, path=db_path)
+    assert row["status"] == "dispatch_decided"
+    assert row["lease_expires_at"] is not None
+
+    _expire(db_path, tid)
+    # the dead owner cannot promote the task anymore: its re-confirm
+    # CAS is guarded on the unexpired lease and sees 0 rows
+    assert db.mark_running(tid, "w_dead", path=db_path) is False
+    assert db.recover_stale(path=db_path) == [tid]
+    row = db.get_task(tid, path=db_path)
+    assert row["status"] == "queued"
+    assert row["attempt"] == 1
+    assert row["lease_owner"] is None
+    assert row["lease_expires_at"] is None
+
+    # a repeated wedge on the same task exhausts the attempt budget:
+    # poison pill to terminal failed, never another requeue
+    assert db.claim_queued(tid, "w_dead2", "acp-push", path=db_path)
+    _expire(db_path, tid)
+    assert db.recover_stale(path=db_path) == [tid]
+    row = db.get_task(tid, path=db_path)
+    assert row["status"] == "failed"
+    assert row["attempt"] == MAX_ATTEMPTS
+
+
+def test_item10_gwt3_owner_confirm_vs_recover_single_winner(db_path):
+    # expired claim lease: recovery CAS wins, the late owner backs off
+    tid = db.enqueue("s1", "x", path=db_path)
+    assert db.claim_queued(tid, "w1", "acp-push", path=db_path)
+    _expire(db_path, tid)
+    outcome = {}
+
+    def do_confirm():
+        outcome["confirmed"] = db.mark_running(tid, "w1", path=db_path)
+
+    def do_recover():
+        outcome["recovered"] = db.recover_stale(path=db_path)
+
+    with ThreadPoolExecutor(2) as ex:
+        f_confirm = ex.submit(do_confirm)
+        f_recover = ex.submit(do_recover)
+        f_confirm.result()
+        f_recover.result()
+    # exactly one side transitioned the task: the owner lost (expired
+    # lease) and recovery requeued it - no double transport possible
+    assert outcome["confirmed"] is False
+    assert outcome["recovered"] == [tid]
+    row = db.get_task(tid, path=db_path)
+    assert row["status"] == "queued"
+    assert row["lease_owner"] is None
+
+    # unexpired claim lease: the owner CAS wins and recovery sees the
+    # fresh lease expiry - it must not touch the task
+    assert db.claim_queued(tid, "w2", "acp-push", path=db_path)
+    outcome.clear()
+
+    def do_confirm2():
+        outcome["confirmed"] = db.mark_running(tid, "w2", path=db_path)
+
+    with ThreadPoolExecutor(2) as ex:
+        f_confirm = ex.submit(do_confirm2)
+        f_recover = ex.submit(do_recover)
+        f_confirm.result()
+        f_recover.result()
+    assert outcome["confirmed"] is True
+    assert outcome["recovered"] == []
+    row = db.get_task(tid, path=db_path)
+    assert row["status"] == "running"
+    assert row["lease_owner"] == "w2"
+
+
+def test_item10_gwt5_demote_running_to_hook(db_path):
+    tid = _enqueue_running(db_path, "s1", "w1")
+    # a foreign owner cannot demote somebody else's running task
+    assert db.demote_running_to_hook(tid, "w2", path=db_path) is False
+    row = db.get_task(tid, path=db_path)
+    assert row["status"] == "running"
+    assert row["transport"] == "acp-push"
+
+    assert db.demote_running_to_hook(tid, "w1", path=db_path) is True
+    row = db.get_task(tid, path=db_path)
+    # one statement: queued + hook transport, lease fully cleared
+    assert row["status"] == "queued"
+    assert row["transport"] == "hook-queue"
+    assert row["lease_owner"] is None
+    assert row["lease_expires_at"] is None
+    assert row["lease_renewed_at"] is None
+    # the demoted task is claimable again through the hook path
+    assert db.claim_queued(tid, "w2", "hook-queue", path=db_path) is True
+
+    # the CAS applies to running only - dispatch_decided is handled by
+    # fallback_to_hook
+    tid2 = db.enqueue("s2", "x", path=db_path)
+    assert db.claim_queued(tid2, "w1", "acp-push", path=db_path)
+    assert db.demote_running_to_hook(tid2, "w1", path=db_path) is False
+    assert db.get_task(tid2, path=db_path)["status"] == "dispatch_decided"
+
+
 def test_item04_trigger_filename_sanitized():
     assert db.trigger_filename("abc-123_OK.9") == "abc-123_OK.9.json"
     # traversal segments and slashes cannot escape the queue dir

@@ -56,7 +56,7 @@ def test_item02_gwt1_task_status_lists_full_set() -> None:
 def test_item02_gwt1_transition_map_declares_lifecycle() -> None:
     # queued > dispatch_decided > running > {done, failed, requeue, awaiting_user}
     assert TRANSITIONS[Q] == frozenset({DD})
-    assert TRANSITIONS[DD] == frozenset({R, Q})
+    assert TRANSITIONS[DD] == frozenset({R, Q, FAILED})
     assert TRANSITIONS[R] == frozenset({DONE, FAILED, Q, AU})
     # every status is a key; terminal statuses have no outgoing edges
     assert set(TRANSITIONS) == set(TaskStatus)
@@ -73,7 +73,6 @@ def test_item02_gwt1_invalid_transition_raises_validation_error() -> None:
         (Q, R),
         (Q, DONE),
         (Q, FAILED),
-        (DD, FAILED),
         (DD, DONE),
         (R, DD),
         (R, PAUSED),

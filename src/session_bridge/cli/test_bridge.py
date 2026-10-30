@@ -7,7 +7,11 @@ storage), ``bridge._spawn_worker`` (subprocess boundary) and
 tmp_path via ``SESSIONS_BRIDGE_DB``.
 """
 
+import io
 import json
+import os
+import sys
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -524,3 +528,239 @@ def test_item07_pump_recovers_stale_running(env, capsys):
         TaskStatus.RUNNING.value,  # redispatched in the same pass
     )
     assert row["attempt"] == 1
+
+
+# --- item_10: hardening follow-ups -------------------------------------------
+
+
+def _run_status_json(args_db):
+    """Invoke ``bridge --db <db> status --json``; returns (rc, dict)."""
+    buf = io.StringIO()
+    old = sys.stdout
+    try:
+        sys.stdout = buf
+        rc = bridge.main(["--db", args_db, "status", "--json"])
+    finally:
+        sys.stdout = old
+    return rc, json.loads(buf.getvalue().strip())
+
+
+def test_item10_gwt1_queue_depth_true_count_pump_processes_all(
+    env, capsys
+):
+    # 60 queued tasks on locked sessions: beyond the old limit=50 scan
+    for i in range(60):
+        sid = f"lock{i}"
+        env.locks[sid] = (True, 1000 + i)
+        _task(env, sid=sid)
+    rc, out = _run(["status", "--json"], capsys)
+    assert rc == ExitCode.OK
+    # the true COUNT(*) is reported, not the capped task list
+    assert out["queue_depth"] == 60
+    assert out["data"]["queue_shown"] == 60
+    assert out["data"]["queue_truncated"] is False
+    assert out["data"]["in_flight_dispatch"] == 0
+    assert out["data"]["concurrency"] == {
+        "active": 0,
+        "max": bridge.SEMAPHOR,
+    }
+    # one pump pass folded every queued task onto the hook transport
+    tasks = db.list_tasks(
+        status=TaskStatus.QUEUED, path=env.db, limit=100
+    )
+    assert len(tasks) == 60
+    assert all(
+        t["transport"] == Transport.HOOK_QUEUE.value for t in tasks
+    )
+    assert len(list(Path(env.qdir).glob("*.json"))) == 60
+    assert env.spawned == []
+
+
+def test_item10_gwt2_concurrent_pumps_never_exceed_semaphore(env):
+    for i in range(8):
+        sid = f"s{i}"
+        env.devin[sid] = {"working_directory": f"/r{i}"}
+        _task(env, sid=sid)
+    args = SimpleNamespace(
+        db=env.db, queue_dir=str(env.qdir), timeout=None
+    )
+    max_seen = [0]
+
+    threads = [
+        threading.Thread(target=lambda: bridge.pump(args))
+        for _ in range(3)
+    ]
+    for t in threads:
+        t.start()
+    while any(t.is_alive() for t in threads):
+        n = db.count_tasks(
+            status=TaskStatus.RUNNING,
+            transport=Transport.ACP_PUSH,
+            path=env.db,
+        )
+        max_seen[0] = max(max_seen[0], n)
+        time.sleep(0.005)
+    for t in threads:
+        t.join(30)
+
+    # atomic admission: racing pumps can never oversubscribe the
+    # semaphore, sampled or final
+    running = db.count_tasks(
+        status=TaskStatus.RUNNING,
+        transport=Transport.ACP_PUSH,
+        path=env.db,
+    )
+    assert running == bridge.SEMAPHOR
+    assert max_seen[0] <= bridge.SEMAPHOR
+    assert len(env.spawned) == bridge.SEMAPHOR
+    # unadmitted tasks folded back to queued, never wedged
+    assert db.count_tasks(status=TaskStatus.QUEUED, path=env.db) == 5
+    assert db.count_tasks(
+        status=TaskStatus.DISPATCH_DECIDED, path=env.db
+    ) == 0
+
+    # and status surfaces the saturation to the operator
+    _rc, out = _run_status_json(args_db=env.db)
+    assert out["data"]["saturation_reason"] == "MAX_CONCURRENT_REACHED"
+    assert out["data"]["concurrency"]["active"] == bridge.SEMAPHOR
+
+
+def test_item10_mark_running_lease_refusal_is_not_saturation(
+    env, capsys, monkeypatch
+):
+    # a mark_running refusal on an expired claim lease is not
+    # semaphore saturation: status --json must not report
+    # MAX_CONCURRENT_REACHED for a non-semaphore CAS loss
+    env.devin[SID] = {"working_directory": "/repo"}
+    tid = _task(env)
+
+    real_claim = db.claim_queued
+
+    def claim_then_expire(tid_, owner, transport, *, path=None):
+        ok = real_claim(tid_, owner, transport, path=path)
+        if ok:
+            con = db.connect(path)
+            try:
+                con.execute(
+                    "UPDATE tasks SET lease_expires_at=? WHERE id=?",
+                    (int(time.time()) - 1, tid_),
+                )
+            finally:
+                con.close()
+        return ok
+
+    monkeypatch.setattr(db, "claim_queued", claim_then_expire)
+
+    rc, out = _run(["status", "--json"], capsys)
+    assert rc == ExitCode.OK
+    assert "saturation_reason" not in out["data"]
+    # the refused claim folded back to queued, never wedged
+    row = db.get_task(tid, path=env.db)
+    assert row["status"] == TaskStatus.QUEUED.value
+    assert env.spawned == []
+
+
+def test_item10_gwt4_detached_worker_stderr_log(tmp_path, monkeypatch):
+    db_path = str(tmp_path / "state.db")
+    db.init(db_path)
+    # a python wrapper that emits a deterministic stderr line, then
+    # execs the real interpreter - proves stderr lands in the log file
+    real_python = sys.executable
+    wrapper = tmp_path / "fakepy.sh"
+    wrapper.write_text(
+        '#!/bin/sh\necho "worker stderr marker" >&2\n'
+        f'exec "{real_python}" "$@"\n'
+    )
+    wrapper.chmod(0o755)
+    monkeypatch.setattr(sys, "executable", str(wrapper))
+
+    tid = db.enqueue(SID, "do the thing", path=db_path)
+    owner = "acp-9-9"
+    assert db.claim_queued(tid, owner, Transport.ACP_PUSH, path=db_path)
+    args = SimpleNamespace(
+        db=db_path,
+        queue_dir=str(tmp_path / "queue"),
+        timeout=5,
+    )
+    proc = bridge._spawn_worker(tid, owner, args)
+    assert proc.wait(timeout=120) == 0
+
+    logs = list(
+        (tmp_path / "logs").glob(f"worker_{tid}_*_*.log")
+    )
+    assert len(logs) == 1
+    content = logs[0].read_text()
+    assert "worker stderr marker" in content
+    assert logs[0].stat().st_size <= bridge.WORKER_LOG_MAX_BYTES
+
+    # the crashed/failed task surfaces log_path + stderr_tail
+    rc, out = _run_status_json(args_db=db_path)
+    assert rc == ExitCode.OK
+    view = next(
+        v for v in out["data"]["sessions"] if v["session"] == SID
+    )
+    assert view["state"] == bridge.STATE_FAILED
+    assert view["log_path"] == str(logs[0])
+    assert "worker stderr marker" in view["stderr_tail"]
+
+
+def test_item10_gwt4_log_sweep_cap_and_retention(tmp_path):
+    db_path = str(tmp_path / "state.db")
+    db.init(db_path)
+    args = SimpleNamespace(db=db_path)
+    log_dir = Path(bridge._logs_dir(args))
+    log_dir.mkdir(parents=True)
+    # 12 small logs with increasing mtime + one oversized log (newest)
+    for i in range(12):
+        p = log_dir / f"worker_{i}_0_{100 + i}.log"
+        p.write_bytes(f"log line {i}\n".encode())
+        os.utime(p, (1000 + i, 1000 + i))
+    big = log_dir / "worker_99_0_999.log"
+    big.write_bytes(
+        b"HEAD\n" + b"y" * (bridge.WORKER_LOG_MAX_BYTES + 64) + b"TAIL\n"
+    )
+    os.utime(big, (2000, 2000))
+    bridge._sweep_worker_logs(args)
+
+    files = sorted(log_dir.glob("worker_*.log"))
+    # retention keeps only the newest WORKER_LOG_KEEP files
+    assert len(files) == bridge.WORKER_LOG_KEEP
+    assert big in files
+    # the oversized file keeps its tail within the cap
+    data = big.read_bytes()
+    assert len(data) <= bridge.WORKER_LOG_MAX_BYTES
+    assert data.rstrip().endswith(b"TAIL")
+    oldest_gone = log_dir / "worker_0_0_100.log"
+    assert not oldest_gone.exists()
+
+
+def test_item10_gwt4_log_sweep_never_unlinks_fresh_logs(tmp_path):
+    db_path = str(tmp_path / "state.db")
+    db.init(db_path)
+    args = SimpleNamespace(db=db_path)
+    log_dir = Path(bridge._logs_dir(args))
+    log_dir.mkdir(parents=True)
+    now = time.time()
+    # more files than WORKER_LOG_KEEP, but the newest three are fresh
+    # enough to belong to a live worker and must survive retention
+    old = []
+    for i in range(12):
+        p = log_dir / f"worker_{i}_0_{100 + i}.log"
+        p.write_bytes(f"old {i}\n".encode())
+        mtime = now - 2 * bridge.WORKER_LOG_MIN_AGE_SECONDS + i
+        os.utime(p, (mtime, mtime))
+        old.append(p)
+    fresh = []
+    for i in range(3):
+        p = log_dir / f"worker_9{i}_0_200.log"
+        p.write_bytes(f"fresh {i}\n".encode())
+        fresh.append(p)  # mtime=now: inside the lease window
+    bridge._sweep_worker_logs(args)
+
+    files = sorted(log_dir.glob("worker_*.log"))
+    # every fresh log survives; only stale files are trimmed to KEEP
+    assert all(p.exists() for p in fresh)
+    assert len(files) == bridge.WORKER_LOG_KEEP + len(fresh)
+    assert not old[0].exists()
+    assert not old[1].exists()
+    assert all(p.exists() for p in old[2:])
