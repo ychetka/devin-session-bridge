@@ -68,27 +68,21 @@ class HookPayload(BaseModel):
 class SessionStartPayload(HookPayload):
     """SessionStart payload: ``source`` says how the session began."""
 
-    hook_event_name: Literal[HookEventName.SESSION_START] = (
-        HookEventName.SESSION_START
-    )
+    hook_event_name: Literal[HookEventName.SESSION_START] = HookEventName.SESSION_START
     source: str = Field(min_length=1)
 
 
 class SessionEndPayload(HookPayload):
     """SessionEnd payload: ``reason`` says why the session ended."""
 
-    hook_event_name: Literal[HookEventName.SESSION_END] = (
-        HookEventName.SESSION_END
-    )
+    hook_event_name: Literal[HookEventName.SESSION_END] = HookEventName.SESSION_END
     reason: str = Field(min_length=1)
 
 
 class UserPromptSubmitPayload(HookPayload):
     """UserPromptSubmit payload: the raw user ``prompt`` text."""
 
-    hook_event_name: Literal[HookEventName.USER_PROMPT_SUBMIT] = (
-        HookEventName.USER_PROMPT_SUBMIT
-    )
+    hook_event_name: Literal[HookEventName.USER_PROMPT_SUBMIT] = HookEventName.USER_PROMPT_SUBMIT
     prompt: str
 
 
@@ -125,11 +119,7 @@ def parse_hook_payload(data: dict[str, Any]) -> HookPayload:
                     "type": "value_error",
                     "loc": ("hook_event_name",),
                     "input": event,
-                    "ctx": {
-                        "error": ValueError(
-                            f"unsupported hook_event_name: {event!r}"
-                        )
-                    },
+                    "ctx": {"error": ValueError(f"unsupported hook_event_name: {event!r}")},
                 }
             ],
         )
@@ -163,9 +153,7 @@ class ContextOutput(BaseModel):
 
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
-    hook_specific_output: HookSpecificOutput = Field(
-        alias="hookSpecificOutput"
-    )
+    hook_specific_output: HookSpecificOutput = Field(alias="hookSpecificOutput")
 
 
 # --- parking ------------------------------------------------------------------
@@ -192,7 +180,6 @@ class ParkConfig(BaseModel):
     def _cycle_within_timeout(self) -> "ParkConfig":
         if self.cycle_seconds > self.hook_timeout:
             raise ValueError(
-                f"cycle_seconds ({self.cycle_seconds}) exceeds "
-                f"hook_timeout ({self.hook_timeout})"
+                f"cycle_seconds ({self.cycle_seconds}) exceeds hook_timeout ({self.hook_timeout})"
             )
         return self

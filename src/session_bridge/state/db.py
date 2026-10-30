@@ -39,9 +39,7 @@ def _default_db_path() -> str:
     override = os.environ.get("SESSIONS_BRIDGE_DB")
     if override:
         return override
-    data_home = os.environ.get("XDG_DATA_HOME") or os.path.expanduser(
-        "~/.local/share"
-    )
+    data_home = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
     return os.path.join(data_home, "sessions-bridge", "state.db")
 
 
@@ -62,9 +60,7 @@ _BUSY_BASE_DELAY = 0.1
 
 # Live statuses as a SQL literal list, derived from the contract so the
 # enqueue guard and the live-task index can never drift apart.
-_LIVE_SQL = ", ".join(
-    f"'{v}'" for v in sorted(s.value for s in LIVE_STATUSES)
-)
+_LIVE_SQL = ", ".join(f"'{v}'" for v in sorted(s.value for s in LIVE_STATUSES))
 
 _SCHEMA = f"""
 CREATE TABLE IF NOT EXISTS tasks (
@@ -106,9 +102,7 @@ CREATE TABLE IF NOT EXISTS sessions (
 PRAGMA user_version=1;
 """
 
-_SESSION_FIELDS = frozenset(
-    {"cwd", "title", "queue_paused", "park_cycles_left", "note"}
-)
+_SESSION_FIELDS = frozenset({"cwd", "title", "queue_paused", "park_cycles_left", "note"})
 
 
 def _now() -> int:
@@ -162,9 +156,7 @@ def connect(path=None) -> sqlite3.Connection:
             con.close()
         if isinstance(e, sqlite3.OperationalError) and _is_busy(e):
             raise  # transient; callers' _retry handles it
-        raise BridgeDBError(
-            f"state.db at {target} is not a readable database: {e}"
-        ) from e
+        raise BridgeDBError(f"state.db at {target} is not a readable database: {e}") from e
 
 
 def init(path=None) -> None:
@@ -270,9 +262,7 @@ def claim_queued(task_id: int, owner: str, transport, *, path=None) -> bool:
     return _retry(op)
 
 
-def mark_running(
-    task_id: int, owner: str, *, max_running: int | None = None, path=None
-) -> bool:
+def mark_running(task_id: int, owner: str, *, max_running: int | None = None, path=None) -> bool:
     """CAS ``dispatch_decided > running`` for the claimant; sets lease.
 
     The CAS requires the claim lease to be owned and unexpired: once a
@@ -308,10 +298,7 @@ def mark_running(
                 ts,
             ]
             if max_running is not None:
-                sql += (
-                    " AND (SELECT COUNT(*) FROM tasks WHERE status=?"
-                    " AND transport=?)<?"
-                )
+                sql += " AND (SELECT COUNT(*) FROM tasks WHERE status=? AND transport=?)<?"
                 args += [
                     TaskStatus.RUNNING.value,
                     Transport.ACP_PUSH.value,
@@ -438,8 +425,7 @@ def requeue_or_fail(task_id: int, note: str | None = None, *, path=None):
     """
     ts = _now()
     guard = (
-        " WHERE id=? AND status IN (?, ?) AND lease_expires_at IS NOT NULL"
-        " AND lease_expires_at<?"
+        " WHERE id=? AND status IN (?, ?) AND lease_expires_at IS NOT NULL AND lease_expires_at<?"
     )
     guard_args = (
         TaskStatus.RUNNING.value,
@@ -454,9 +440,7 @@ def requeue_or_fail(task_id: int, note: str | None = None, *, path=None):
                 "UPDATE tasks SET status=?, attempt=attempt+1,"
                 " lease_owner=NULL, lease_expires_at=NULL,"
                 " lease_renewed_at=NULL,"
-                " note=COALESCE(?,note), updated_at=?"
-                + guard
-                + " AND attempt+1<?",
+                " note=COALESCE(?,note), updated_at=?" + guard + " AND attempt+1<?",
                 (
                     TaskStatus.QUEUED.value,
                     note,
@@ -472,9 +456,7 @@ def requeue_or_fail(task_id: int, note: str | None = None, *, path=None):
                 "UPDATE tasks SET status=?, attempt=attempt+1,"
                 " lease_owner=NULL, lease_expires_at=NULL,"
                 " lease_renewed_at=NULL,"
-                " note=COALESCE(?,note), updated_at=?"
-                + guard
-                + " AND attempt+1>=?",
+                " note=COALESCE(?,note), updated_at=?" + guard + " AND attempt+1>=?",
                 (
                     TaskStatus.FAILED.value,
                     note,
@@ -624,9 +606,7 @@ def mark_notified(task_id: int, *, path=None) -> bool:
     return _retry(op)
 
 
-def set_awaiting_user(
-    task_id: int, owner: str, note: str | None = None, *, path=None
-) -> bool:
+def set_awaiting_user(task_id: int, owner: str, note: str | None = None, *, path=None) -> bool:
     """CAS ``running > awaiting_user`` for the lease owner.
 
     ``awaiting_user`` is live (still blocks ``enqueue``) but carries no
@@ -737,8 +717,7 @@ def pause(task_id: int, *, path=None) -> bool:
         con = connect(path)
         try:
             cur = con.execute(
-                "UPDATE tasks SET status=?, updated_at=?"
-                " WHERE id=? AND status=?",
+                "UPDATE tasks SET status=?, updated_at=? WHERE id=? AND status=?",
                 (TaskStatus.PAUSED.value, ts, task_id, TaskStatus.QUEUED.value),
             )
             return cur.rowcount == 1
@@ -792,6 +771,7 @@ def clear(task_id: int, *, path=None) -> bool:
     clearable - anything further along the lifecycle must be resolved
     through the transition API.
     """
+
     def op():
         con = connect(path)
         try:
@@ -813,9 +793,7 @@ def get_task(task_id: int, *, path=None):
     def op():
         con = connect(path)
         try:
-            return con.execute(
-                "SELECT * FROM tasks WHERE id=?", (task_id,)
-            ).fetchone()
+            return con.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
         finally:
             con.close()
 
@@ -827,8 +805,7 @@ def get_live_task(session_id: str, *, path=None):
         con = connect(path)
         try:
             return con.execute(
-                f"SELECT * FROM tasks WHERE session_id=?"
-                f" AND status IN ({_LIVE_SQL}) ORDER BY id",
+                f"SELECT * FROM tasks WHERE session_id=? AND status IN ({_LIVE_SQL}) ORDER BY id",
                 (session_id,),
             ).fetchone()
         finally:
@@ -841,6 +818,7 @@ def list_tasks(status=None, *, path=None, limit: int = 50, after_id=None):
     """List tasks (``ORDER BY id`` with a status filter, newest-first
     without one). ``after_id`` paginates the filtered listing by id so
     a dispatch pass can scan the whole queue in capped batches."""
+
     def op():
         con = connect(path)
         try:
@@ -853,9 +831,7 @@ def list_tasks(status=None, *, path=None, limit: int = 50, after_id=None):
                 sql += " ORDER BY id LIMIT ?"
                 args.append(limit)
                 return con.execute(sql, args).fetchall()
-            return con.execute(
-                "SELECT * FROM tasks ORDER BY id DESC LIMIT ?", (limit,)
-            ).fetchall()
+            return con.execute("SELECT * FROM tasks ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
         finally:
             con.close()
 
@@ -869,6 +845,7 @@ def count_tasks(status=None, *, transport=None, path=None) -> int:
     the true queue depth from this even when the embedded task list
     stays truncated.
     """
+
     def op():
         con = connect(path)
         try:
@@ -903,15 +880,13 @@ def upsert_session(session_id: str, *, path=None, **fields) -> None:
     if bad:
         raise ValueError(f"unknown session fields: {sorted(bad)}")
     ts = _now()
-    values = {
-        k: int(v) if isinstance(v, bool) else v for k, v in fields.items()
-    }
+    values = {k: int(v) if isinstance(v, bool) else v for k, v in fields.items()}
 
     def op():
         con = connect(path)
         try:
             if values:
-                cols = list(values) + ["updated_at"]
+                cols = [*values, "updated_at"]
                 ph = ", ".join("?" for _ in cols)
                 sets = ", ".join(f"{c}=excluded.{c}" for c in cols)
                 con.execute(
@@ -954,9 +929,7 @@ def get_session(session_id: str, *, path=None):
     return _retry(op)
 
 
-def decrement_park_cycles(
-    session_id: str, fresh_budget: int, *, path=None
-) -> int:
+def decrement_park_cycles(session_id: str, fresh_budget: int, *, path=None) -> int:
     """Atomically consume one park cycle; returns the cycles left.
 
     Single-statement read-modify-write - no lost update against a
@@ -1021,13 +994,9 @@ def sessions_db_lookup(session_id: str, *, db_path=None) -> dict | None:
     def op():
         con = None
         try:
-            con = sqlite3.connect(
-                f"file:{target}?mode=ro", uri=True, timeout=1
-            )
+            con = sqlite3.connect(f"file:{target}?mode=ro", uri=True, timeout=1)
             con.row_factory = sqlite3.Row
-            row = con.execute(
-                "SELECT * FROM sessions WHERE id=?", (session_id,)
-            ).fetchone()
+            row = con.execute("SELECT * FROM sessions WHERE id=?", (session_id,)).fetchone()
             return dict(row) if row is not None else None
         except sqlite3.Error as e:
             if isinstance(e, sqlite3.OperationalError) and _is_busy(e):
@@ -1051,9 +1020,7 @@ def is_locked(session_id: str) -> tuple[bool, int | None]:
     liveness check and guards against PID reuse. Returns
     ``(locked, pid_or_None)``.
     """
-    lock = os.path.join(
-        os.path.expanduser(SESSION_LOCKS_DIR), f"{session_id}.lock"
-    )
+    lock = os.path.join(os.path.expanduser(SESSION_LOCKS_DIR), f"{session_id}.lock")
     try:
         with open(lock) as f:
             pid = int(f.read().strip())

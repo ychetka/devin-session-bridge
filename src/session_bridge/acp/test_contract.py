@@ -127,14 +127,10 @@ def test_item03_gwt2_prompt_response_wire_shape() -> None:
 
 
 def test_item03_usage_model_types() -> None:
-    u = Usage.model_validate(
-        {"totalTokens": 3, "inputTokens": 2, "outputTokens": 1}
-    )
+    u = Usage.model_validate({"totalTokens": 3, "inputTokens": 2, "outputTokens": 1})
     assert u.cached_read_tokens == 0
     with pytest.raises(ValidationError):
-        Usage.model_validate(
-            {"totalTokens": -1, "inputTokens": 0, "outputTokens": 0}
-        )
+        Usage.model_validate({"totalTokens": -1, "inputTokens": 0, "outputTokens": 0})
 
 
 def test_item03_session_list_entries_with_meta() -> None:
@@ -183,9 +179,7 @@ def test_item03_request_envelope_pins_jsonrpc() -> None:
     req = JsonRpcRequest(id=1, method=Method.SESSION_LIST)
     assert req.model_dump(mode="json")["jsonrpc"] == JSONRPC_VERSION == "2.0"
     with pytest.raises(ValidationError):
-        JsonRpcRequest.model_validate(
-            {"jsonrpc": "1.0", "id": 1, "method": "session/list"}
-        )
+        JsonRpcRequest.model_validate({"jsonrpc": "1.0", "id": 1, "method": "session/list"})
     with pytest.raises(ValidationError):
         JsonRpcRequest(id=0, method=Method.SESSION_LIST)
 
@@ -203,14 +197,10 @@ def test_item03_session_cancel_is_a_notification() -> None:
     }
     # an id on a notification is a malformed message
     with pytest.raises(ValidationError):
-        JsonRpcNotification.model_validate(
-            {"jsonrpc": "2.0", "id": 7, "method": "session/cancel"}
-        )
+        JsonRpcNotification.model_validate({"jsonrpc": "2.0", "id": 7, "method": "session/cancel"})
     # and a request still refuses to drop its id
     with pytest.raises(ValidationError):
-        JsonRpcRequest.model_validate(
-            {"jsonrpc": "2.0", "method": "session/list"}
-        )
+        JsonRpcRequest.model_validate({"jsonrpc": "2.0", "method": "session/list"})
 
 
 def test_item03_authenticate_params_shape() -> None:
@@ -228,18 +218,12 @@ def test_item03_session_close_force_flag_serializes() -> None:
         "sessionId": "s1",
         "_meta": None,
     }
-    forced = SessionCloseParams(
-        session_id="s1", meta=SessionCloseMeta(force=True)
-    )
-    assert forced.model_dump(by_alias=True)["_meta"] == {
-        "cognition.ai/force": True
-    }
+    forced = SessionCloseParams(session_id="s1", meta=SessionCloseMeta(force=True))
+    assert forced.model_dump(by_alias=True)["_meta"] == {"cognition.ai/force": True}
 
 
 def test_item03_session_prompt_params_shape() -> None:
-    p = SessionPromptParams(
-        session_id="s1", prompt=[PromptBlock(text="do it")]
-    )
+    p = SessionPromptParams(session_id="s1", prompt=[PromptBlock(text="do it")])
     assert p.model_dump(by_alias=True) == {
         "sessionId": "s1",
         "prompt": [{"type": "text", "text": "do it"}],
@@ -274,6 +258,4 @@ def test_item03_update_notification_and_chunk_helper() -> None:
     ):
         assert message_chunk_text({"sessionUpdate": kind.value}) is None
     # chunk kind without text content yields nothing too
-    assert (
-        message_chunk_text({"sessionUpdate": "agent_message_chunk"}) is None
-    )
+    assert message_chunk_text({"sessionUpdate": "agent_message_chunk"}) is None

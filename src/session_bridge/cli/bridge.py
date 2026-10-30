@@ -90,12 +90,15 @@ _END_TURN = "end_turn"
 _ASSISTANT_TAIL = 4000
 _NOTE_TAIL = 2000
 
-_LIVE_VALUES = frozenset(s.value for s in (
-    TaskStatus.QUEUED,
-    TaskStatus.DISPATCH_DECIDED,
-    TaskStatus.RUNNING,
-    TaskStatus.AWAITING_USER,
-))
+_LIVE_VALUES = frozenset(
+    s.value
+    for s in (
+        TaskStatus.QUEUED,
+        TaskStatus.DISPATCH_DECIDED,
+        TaskStatus.RUNNING,
+        TaskStatus.AWAITING_USER,
+    )
+)
 
 
 def _log(msg: str) -> None:
@@ -186,8 +189,7 @@ def _sweep_worker_logs(args) -> None:
         paths = [
             p
             for p in paths
-            if os.path.exists(p)
-            and now - os.path.getmtime(p) > WORKER_LOG_MIN_AGE_SECONDS
+            if os.path.exists(p) and now - os.path.getmtime(p) > WORKER_LOG_MIN_AGE_SECONDS
         ]
         paths.sort(key=lambda p: os.path.getmtime(p))
         for p in paths[: max(0, len(paths) - WORKER_LOG_KEEP)]:
@@ -218,9 +220,7 @@ def _worker_log_tail(args, task_id: int):
             raw = fh.read()
     except OSError:
         return None, None
-    lines = [
-        l for l in raw.decode("utf-8", "replace").splitlines() if l.strip()
-    ]
+    lines = [line for line in raw.decode("utf-8", "replace").splitlines() if line.strip()]
     return path, "\n".join(lines[-_STDERR_TAIL_LINES:]) or None
 
 
@@ -239,9 +239,7 @@ def _write_trigger(queue_dir: str, session_id: str) -> None:
         os.makedirs(queue_dir, exist_ok=True)
         fd, tmp = tempfile.mkstemp(prefix=".trigger-", dir=queue_dir)
         with os.fdopen(fd, "w") as fh:
-            json.dump(
-                {"session_id": session_id, "ts": int(time.time())}, fh
-            )
+            json.dump({"session_id": session_id, "ts": int(time.time())}, fh)
             fh.flush()
             os.fsync(fh.fileno())
         os.replace(
@@ -341,9 +339,7 @@ def _spawn_worker(task_id: int, owner: str, args) -> subprocess.Popen:
     env = dict(os.environ)
     # make the package importable even when the parent ran from a
     # source checkout without an install
-    src = os.path.dirname(
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    )
+    src = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     prev = env.get("PYTHONPATH")
     env["PYTHONPATH"] = f"{src}{os.pathsep}{prev}" if prev else src
     # stderr goes to a per-invocation log (not DEVNULL) so a crashed
@@ -458,17 +454,13 @@ def pump(args) -> dict:
                     unknown.append(sid)
                 continue
             owner = f"{ACP_OWNER_PREFIX}{os.getpid()}-{tid}"
-            if not db.claim_queued(
-                tid, owner, Transport.ACP_PUSH, path=args.db
-            ):
+            if not db.claim_queued(tid, owner, Transport.ACP_PUSH, path=args.db):
                 continue
             # atomic admission: the running count is checked inside the
             # same CAS statement, so racing pumps can never exceed
             # SEMAPHOR; running + lease is set before the child exists
             # so a spawn failure cannot strand a dispatch_decided task
-            if not db.mark_running(
-                tid, owner, max_running=SEMAPHOR, path=args.db
-            ):
+            if not db.mark_running(tid, owner, max_running=SEMAPHOR, path=args.db):
                 row = db.get_task(tid, path=args.db)
                 if (
                     row is not None
@@ -501,10 +493,7 @@ def pump(args) -> dict:
             try:
                 _spawn_worker(tid, owner, args)
             except OSError as e:
-                _log(
-                    f"worker spawn failed for task {tid}: {e};"
-                    " requeueing for the hook path"
-                )
+                _log(f"worker spawn failed for task {tid}: {e}; requeueing for the hook path")
                 if _task_to_hook_queue(tid, owner, args):
                     _write_trigger(_queue_dir(args), sid)
                     hooked.append(tid)
@@ -553,9 +542,7 @@ def _acp_failure(
     """
     kind = getattr(exc, "kind", None) or type(exc).__name__
     note = f"acp {phase} failed ({kind}): {exc}"
-    if bool(getattr(exc, "retryable", False)) and not (
-        phase == "prompt" and kind == "timeout"
-    ):
+    if bool(getattr(exc, "retryable", False)) and not (phase == "prompt" and kind == "timeout"):
         # the lease is deliberately kept: its expiry is the requeue
         # trigger in recover_stale
         return JsonResponse(
@@ -563,13 +550,10 @@ def _acp_failure(
             status=TaskStatus.RUNNING.value,
             error=note[:_NOTE_TAIL],
             agent_instruction=(
-                "transient acp failure; lease expiry will requeue"
-                " the task - do not retry manually"
+                "transient acp failure; lease expiry will requeue the task - do not retry manually"
             ),
         )
-    finished = db.finish_task(
-        task_id, owner, ok=False, note=note[:_NOTE_TAIL], path=args.db
-    )
+    finished = db.finish_task(task_id, owner, ok=False, note=note[:_NOTE_TAIL], path=args.db)
     db.release_lease(task_id, owner, path=args.db)
     events = []
     if finished:
@@ -583,8 +567,7 @@ def _acp_failure(
             )
         )
         row = db.get_task(task_id, path=args.db)
-        _notify(args, row or {"id": task_id, "session_id": sid},
-                "FAILED", note[:200])
+        _notify(args, row or {"id": task_id, "session_id": sid}, "FAILED", note[:200])
     return JsonResponse(
         session=sid,
         status=TaskStatus.FAILED.value,
@@ -597,9 +580,7 @@ def _work_task(task_id: int, owner: str, args) -> JsonResponse:
     """One acp push cycle for a claimed task."""
     task = db.get_task(task_id, path=args.db)
     if task is None:
-        return JsonResponse(
-            status="not_found", error=f"task {task_id} not found"
-        )
+        return JsonResponse(status="not_found", error=f"task {task_id} not found")
     sid = task["session_id"]
     if task["status"] == TaskStatus.DISPATCH_DECIDED.value:
         db.mark_running(task_id, owner, path=args.db)  # standalone run
@@ -607,9 +588,7 @@ def _work_task(task_id: int, owner: str, args) -> JsonResponse:
         return JsonResponse(
             session=sid,
             status=task["status"],
-            agent_instruction=(
-                "task is not owned by this worker; do not retry"
-            ),
+            agent_instruction=("task is not owned by this worker; do not retry"),
         )
     # ownership re-confirm immediately before any transport side
     # effect: a single CAS statement proves status='running' AND
@@ -621,17 +600,13 @@ def _work_task(task_id: int, owner: str, args) -> JsonResponse:
         return JsonResponse(
             session=sid,
             status=(task["status"] if task is not None else "not_found"),
-            agent_instruction=(
-                "task is not owned by this worker; do not retry"
-            ),
+            agent_instruction=("task is not owned by this worker; do not retry"),
         )
 
     cwd = _session_cwd(sid, args)
     if cwd is None:
         note = "session not found in devin sessions.db (no cwd)"
-        finished = db.finish_task(
-            task_id, owner, ok=False, note=note, path=args.db
-        )
+        finished = db.finish_task(task_id, owner, ok=False, note=note, path=args.db)
         db.release_lease(task_id, owner, path=args.db)
         events = []
         if finished:
@@ -646,8 +621,7 @@ def _work_task(task_id: int, owner: str, args) -> JsonResponse:
             )
             _notify(
                 args,
-                db.get_task(task_id, path=args.db)
-                or {"id": task_id, "session_id": sid},
+                db.get_task(task_id, path=args.db) or {"id": task_id, "session_id": sid},
                 "FAILED",
                 note,
             )
@@ -673,8 +647,7 @@ def _work_task(task_id: int, owner: str, args) -> JsonResponse:
                 session=sid,
                 status=TaskStatus.QUEUED.value,
                 agent_instruction=(
-                    "do not retry: session is open in devin; task"
-                    " queued for hook delivery"
+                    "do not retry: session is open in devin; task queued for hook delivery"
                 ),
                 data={"transport": Transport.HOOK_QUEUE.value},
             )
@@ -731,8 +704,7 @@ def _work_task(task_id: int, owner: str, args) -> JsonResponse:
         )
         _notify(
             args,
-            db.get_task(task_id, path=args.db)
-            or {"id": task_id, "session_id": sid},
+            db.get_task(task_id, path=args.db) or {"id": task_id, "session_id": sid},
             "FAILED",
             detail,
         )
@@ -782,17 +754,13 @@ def _cmd_push(args) -> int:
             status=live["status"] if live is not None else "conflict",
             queue_depth=_queue_depth(args),
             error="session already has a live task",
-            agent_instruction=(
-                "do not retry: a live task already exists for"
-                " this session"
-            ),
+            agent_instruction=("do not retry: a live task already exists for this session"),
         )
         return _emit(
             args,
             resp,
             ExitCode.CONFLICT,
-            f"conflict: session {args.session_id} already has a"
-            " live task",
+            f"conflict: session {args.session_id} already has a live task",
         )
     result = pump(args)
     task = db.get_task(tid, path=args.db)
@@ -810,9 +778,7 @@ def _cmd_push(args) -> int:
             ExitCode.NOT_FOUND,
             f"not found: task {tid} was cleared during dispatch",
         )
-    events = [
-        e for e in result["events"] if e.session_id == args.session_id
-    ]
+    events = [e for e in result["events"] if e.session_id == args.session_id]
     instruction = None
     error = None
     code = ExitCode.OK
@@ -823,14 +789,10 @@ def _cmd_push(args) -> int:
             " devin sessions.db, not locked, not seen by hooks)"
         )
         instruction = (
-            "task is preserved in the queue; verify the session id or"
-            " open the session once"
+            "task is preserved in the queue; verify the session id or open the session once"
         )
     elif task["transport"] == Transport.HOOK_QUEUE.value:
-        instruction = (
-            "do not retry: task queued for hook delivery inside the"
-            " open session"
-        )
+        instruction = "do not retry: task queued for hook delivery inside the open session"
     elif task["status"] == TaskStatus.RUNNING.value:
         instruction = "do not retry: acp worker dispatched"
     resp = JsonResponse(
@@ -853,9 +815,7 @@ def _cmd_push(args) -> int:
 def _all_session_rows(args):
     con = db.connect(args.db)
     try:
-        return con.execute(
-            "SELECT * FROM sessions ORDER BY session_id"
-        ).fetchall()
+        return con.execute("SELECT * FROM sessions ORDER BY session_id").fetchall()
     finally:
         con.close()
 
@@ -868,15 +828,11 @@ def _session_views(args) -> tuple[list[dict], list[Event], int]:
     caller can flag truncation against the true COUNT(*).
     """
     tasks = db.list_tasks(limit=1000, path=args.db)
-    queue_shown = sum(
-        1 for t in tasks if t["status"] == TaskStatus.QUEUED.value
-    )
+    queue_shown = sum(1 for t in tasks if t["status"] == TaskStatus.QUEUED.value)
     by_session: dict[str, list] = {}
     for t in tasks:  # newest first
         by_session.setdefault(t["session_id"], []).append(t)
-    sids = {r["session_id"] for r in _all_session_rows(args)} | set(
-        by_session
-    )
+    sids = {r["session_id"] for r in _all_session_rows(args)} | set(by_session)
     views = []
     events: list[Event] = []
     for sid in sorted(sids):
@@ -889,8 +845,7 @@ def _session_views(args) -> tuple[list[dict], list[Event], int]:
             (
                 t
                 for t in session_tasks
-                if t["status"]
-                in (TaskStatus.DONE.value, TaskStatus.FAILED.value)
+                if t["status"] in (TaskStatus.DONE.value, TaskStatus.FAILED.value)
             ),
             None,
         )
@@ -901,40 +856,25 @@ def _session_views(args) -> tuple[list[dict], list[Event], int]:
         log_path = stderr_tail = None
         if live is not None and live["status"] == TaskStatus.RUNNING.value:
             state, action = STATE_RUNNING, "-"
-        elif (
-            live is not None
-            and live["status"] == TaskStatus.DISPATCH_DECIDED.value
-        ):
+        elif live is not None and live["status"] == TaskStatus.DISPATCH_DECIDED.value:
             # a claimed task mid-dispatch is visible, not a silent wedge
             state = STATE_DISPATCHING
             action = "dispatch in progress"
-        elif (
-            live is not None
-            and live["status"] == TaskStatus.AWAITING_USER.value
-        ):
+        elif live is not None and live["status"] == TaskStatus.AWAITING_USER.value:
             state = STATE_NEEDS_KICK
             action = "send a short prompt (<=3 chars) to kick"
             notify_task = (live, EventKind.NEEDS_KICK)
-        elif (
-            live is not None
-            and paused
-            and live["status"] == TaskStatus.QUEUED.value
-        ):
+        elif live is not None and paused and live["status"] == TaskStatus.QUEUED.value:
             state = STATE_NEEDS_KICK
             action = "queue paused: kick or `bridge unpark`"
             notify_task = (live, EventKind.NEEDS_KICK)
         elif live is not None:
             state, action = STATE_PARKED, "waiting for dispatch"
-        elif (
-            last_terminal is not None
-            and last_terminal["status"] == TaskStatus.FAILED.value
-        ):
+        elif last_terminal is not None and last_terminal["status"] == TaskStatus.FAILED.value:
             state = STATE_FAILED
             action = f"bridge retry {sid}"
             notify_task = (last_terminal, EventKind.FAILED)
-            log_path, stderr_tail = _worker_log_tail(
-                args, last_terminal["id"]
-            )
+            log_path, stderr_tail = _worker_log_tail(args, last_terminal["id"])
         else:
             state, action = STATE_HEADLESS_IDLE, "push a task"
 
@@ -965,10 +905,7 @@ def _session_views(args) -> tuple[list[dict], list[Event], int]:
                 "repo": repo,
                 "transport": live["transport"] if live is not None else None,
                 "state": state,
-                "queue": 1
-                if live is not None
-                and live["status"] == TaskStatus.QUEUED.value
-                else 0,
+                "queue": 1 if live is not None and live["status"] == TaskStatus.QUEUED.value else 0,
                 "action": action,
                 "log_path": log_path,
                 "stderr_tail": stderr_tail,
@@ -981,9 +918,7 @@ def _cmd_status(args) -> int:
     result = pump(args)
     views, events, queue_shown = _session_views(args)
     seen = {(e.kind, e.task_id) for e in result["events"]}
-    events = result["events"] + [
-        e for e in events if (e.kind, e.task_id) not in seen
-    ]
+    events = result["events"] + [e for e in events if (e.kind, e.task_id) not in seen]
     queue_depth = _queue_depth(args)
     data = {
         "sessions": views,
@@ -991,9 +926,7 @@ def _cmd_status(args) -> int:
         # capped session listing folded in - truncation is explicit
         "queue_shown": queue_shown,
         "queue_truncated": queue_depth > queue_shown,
-        "in_flight_dispatch": db.count_tasks(
-            status=TaskStatus.DISPATCH_DECIDED, path=args.db
-        ),
+        "in_flight_dispatch": db.count_tasks(status=TaskStatus.DISPATCH_DECIDED, path=args.db),
         "concurrency": {
             "active": db.count_tasks(
                 status=TaskStatus.RUNNING,
@@ -1127,17 +1060,13 @@ def _cmd_clear(args) -> int:
         resp = JsonResponse(
             session=args.session,
             status=task["status"],
-            error=(
-                f"task {task['id']} is {task['status']}; only queued"
-                " tasks can be cleared"
-            ),
+            error=(f"task {task['id']} is {task['status']}; only queued tasks can be cleared"),
         )
         return _emit(
             args,
             resp,
             ExitCode.CONFLICT,
-            f"conflict: task {task['id']} is {task['status']},"
-            " not queued",
+            f"conflict: task {task['id']} is {task['status']}, not queued",
         )
     if not db.clear(task["id"], path=args.db):
         # the task left `queued` between our check and the delete -
@@ -1162,9 +1091,7 @@ def _cmd_clear(args) -> int:
         status="cleared",
         queue_depth=_queue_depth(args),
     )
-    return _emit(
-        args, resp, ExitCode.OK, f"cleared queued task {task['id']}"
-    )
+    return _emit(args, resp, ExitCode.OK, f"cleared queued task {task['id']}")
 
 
 def _cmd_unpark(args) -> int:
@@ -1172,10 +1099,7 @@ def _cmd_unpark(args) -> int:
     db.session_pause(sid, False, path=args.db)
     candidates = []
     live = db.get_live_task(sid, path=args.db)
-    if (
-        live is not None
-        and live["status"] == TaskStatus.AWAITING_USER.value
-    ):
+    if live is not None and live["status"] == TaskStatus.AWAITING_USER.value:
         candidates.append(live)
     for t in db.list_tasks(status=TaskStatus.PAUSED, path=args.db):
         if t["session_id"] == sid:
@@ -1210,17 +1134,13 @@ def _cmd_retry(args) -> int:
         resp = JsonResponse(
             session=task["session_id"],
             status=task["status"],
-            error=(
-                f"task {task['id']} is {task['status']}; retry only"
-                " applies to failed tasks"
-            ),
+            error=(f"task {task['id']} is {task['status']}; retry only applies to failed tasks"),
         )
         return _emit(
             args,
             resp,
             ExitCode.CONFLICT,
-            f"conflict: task {task['id']} is {task['status']},"
-            " not failed",
+            f"conflict: task {task['id']} is {task['status']}, not failed",
         )
     if not db.retry(task["id"], path=args.db):
         resp = JsonResponse(
@@ -1228,9 +1148,7 @@ def _cmd_retry(args) -> int:
             status=task["status"],
             error=f"retry of task {task['id']} lost a race",
         )
-        return _emit(
-            args, resp, ExitCode.CONFLICT, f"conflict: retry lost a race"
-        )
+        return _emit(args, resp, ExitCode.CONFLICT, "conflict: retry lost a race")
     pump(args)
     row = db.get_task(task["id"], path=args.db)
     resp = JsonResponse(
@@ -1240,18 +1158,14 @@ def _cmd_retry(args) -> int:
         agent_instruction="do not retry: task requeued",
         data={"task_id": task["id"]},
     )
-    return _emit(
-        args, resp, ExitCode.OK, f"task {task['id']} requeued"
-    )
+    return _emit(args, resp, ExitCode.OK, f"task {task['id']} requeued")
 
 
 # --- entry point -----------------------------------------------------------------
 
 
 def _add_json(sp: argparse.ArgumentParser) -> None:
-    sp.add_argument(
-        "--json", action="store_true", help="emit the JsonResponse envelope"
-    )
+    sp.add_argument("--json", action="store_true", help="emit the JsonResponse envelope")
 
 
 def _parse_args(argv) -> argparse.Namespace:
@@ -1283,9 +1197,7 @@ def _parse_args(argv) -> argparse.Namespace:
     sp = sub.add_parser(Command.STATUS.value, help="session overview")
     _add_json(sp)
 
-    sp = sub.add_parser(
-        Command.INSPECT.value, help="full task detail by session or id"
-    )
+    sp = sub.add_parser(Command.INSPECT.value, help="full task detail by session or id")
     sp.add_argument("ref", help="session id or task id")
     _add_json(sp)
 
@@ -1293,9 +1205,7 @@ def _parse_args(argv) -> argparse.Namespace:
     sp.add_argument("session")
     _add_json(sp)
 
-    sp = sub.add_parser(
-        Command.UNPARK.value, help="resume a paused/awaiting session"
-    )
+    sp = sub.add_parser(Command.UNPARK.value, help="resume a paused/awaiting session")
     sp.add_argument("session")
     _add_json(sp)
 
@@ -1304,7 +1214,8 @@ def _parse_args(argv) -> argparse.Namespace:
     _add_json(sp)
 
     sp = sub.add_parser(
-        Command.WORK.value, help=argparse.SUPPRESS  # internal worker
+        Command.WORK.value,
+        help=argparse.SUPPRESS,  # internal worker
     )
     sp.add_argument("task_id", type=int)
     sp.add_argument("--owner", default=None)
@@ -1334,9 +1245,7 @@ def main(argv=None) -> int:
     except Exception as e:
         return _emit(
             args,
-            JsonResponse(
-                status="internal", error=f"state.db init failed: {e}"
-            ),
+            JsonResponse(status="internal", error=f"state.db init failed: {e}"),
             ExitCode.INTERNAL,
         )
     try:
@@ -1344,9 +1253,7 @@ def main(argv=None) -> int:
     except Exception as e:
         return _emit(
             args,
-            JsonResponse(
-                status="internal", error=f"{type(e).__name__}: {e}"
-            ),
+            JsonResponse(status="internal", error=f"{type(e).__name__}: {e}"),
             ExitCode.INTERNAL,
         )
 

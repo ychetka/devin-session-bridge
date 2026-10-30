@@ -37,11 +37,16 @@ def env(tmp_path):
         "db": db_path,
         "qdir": qdir,
         "argv": [
-            "--db", db_path,
-            "--queue-dir", str(qdir),
-            "--hook-timeout", "60",
-            "--cycle-seconds", "1",
-            "--cycles-max", "2",
+            "--db",
+            db_path,
+            "--queue-dir",
+            str(qdir),
+            "--hook-timeout",
+            "60",
+            "--cycle-seconds",
+            "1",
+            "--cycles-max",
+            "2",
         ],
     }
 
@@ -98,11 +103,16 @@ def test_item06_gwt1_invalid_park_config_allows(env, monkeypatch, capsys):
     # cycle_seconds > hook_timeout violates the ParkConfig precondition:
     # parking is disabled and the stop is allowed (fail-safe)
     argv = [
-        "--db", env["db"],
-        "--queue-dir", str(env["qdir"]),
-        "--hook-timeout", "60",
-        "--cycle-seconds", "120",
-        "--cycles-max", "2",
+        "--db",
+        env["db"],
+        "--queue-dir",
+        str(env["qdir"]),
+        "--hook-timeout",
+        "60",
+        "--cycle-seconds",
+        "120",
+        "--cycles-max",
+        "2",
     ]
     rc, out = _run(env, _stop(), monkeypatch, capsys, argv=argv)
     assert rc == 0
@@ -202,9 +212,7 @@ def test_item06_gwt3_kick_resumes_paused_queue(env, monkeypatch, capsys):
 # --- GWT-4: exhaustion/pause -> awaiting_user + deduped notify ----------------
 
 
-def test_item06_gwt4_cycles_exhausted_flags_awaiting_user(
-    env, monkeypatch, capsys
-):
+def test_item06_gwt4_cycles_exhausted_flags_awaiting_user(env, monkeypatch, capsys):
     tid = _task(env)
     db.upsert_session(SID, park_cycles_left=0, path=env["db"])
     rc, out = _run(env, _stop(active=True), monkeypatch, capsys)
@@ -229,9 +237,7 @@ def test_item06_gwt4_notify_flag_is_deduplicated(env, monkeypatch, capsys):
     assert _get_task(env, tid)["last_notified_at"] == first
 
 
-def test_item06_gwt4_paused_queue_flags_notify_no_block(
-    env, monkeypatch, capsys
-):
+def test_item06_gwt4_paused_queue_flags_notify_no_block(env, monkeypatch, capsys):
     tid = _task(env)
     db.session_pause(SID, True, path=env["db"])
     rc, out = _run(env, _stop(), monkeypatch, capsys)
@@ -244,14 +250,11 @@ def test_item06_gwt4_paused_queue_flags_notify_no_block(
     assert row["last_notified_at"] is not None
 
 
-def test_item06_gwt4_hook_owned_running_parks_for_user(
-    env, monkeypatch, capsys
-):
+def test_item06_gwt4_hook_owned_running_parks_for_user(env, monkeypatch, capsys):
     # a hook-delivered task still running when Stop fires again means
     # the agent finished the injected turn -> awaiting_user + notify
     tid = _task(env)
-    assert db.claim_queued(tid, "hook-999", Transport.HOOK_QUEUE,
-                           path=env["db"])
+    assert db.claim_queued(tid, "hook-999", Transport.HOOK_QUEUE, path=env["db"])
     assert db.mark_running(tid, "hook-999", path=env["db"])
     rc, out = _run(env, _stop(active=True), monkeypatch, capsys)
     assert rc == 0
@@ -265,9 +268,7 @@ def test_item06_gwt4_hook_owned_running_parks_for_user(
 # --- GWT-5: SessionStart / SessionEnd ----------------------------------------
 
 
-def test_item06_gwt5_session_start_records_session(
-    env, monkeypatch, capsys
-):
+def test_item06_gwt5_session_start_records_session(env, monkeypatch, capsys):
     payload = {
         "hook_event_name": "SessionStart",
         "session_id": SID,
@@ -283,9 +284,7 @@ def test_item06_gwt5_session_start_records_session(
     assert row["park_cycles_left"] == 2  # fresh budget
 
 
-def test_item06_gwt5_session_start_resume_recovers_stale(
-    env, monkeypatch, capsys
-):
+def test_item06_gwt5_session_start_resume_recovers_stale(env, monkeypatch, capsys):
     tid = _task(env)
     assert db.claim_queued(tid, "w-old", Transport.ACP_PUSH, path=env["db"])
     assert db.mark_running(tid, "w-old", path=env["db"])
@@ -310,9 +309,7 @@ def test_item06_gwt5_session_start_resume_recovers_stale(
     assert row["attempt"] == 1
 
 
-def test_item06_gwt5_session_end_fails_queued_orphans(
-    env, monkeypatch, capsys
-):
+def test_item06_gwt5_session_end_fails_queued_orphans(env, monkeypatch, capsys):
     tid = _task(env)
     payload = {
         "hook_event_name": "SessionEnd",
@@ -328,9 +325,7 @@ def test_item06_gwt5_session_end_fails_queued_orphans(
     assert "clear" in db.get_session(SID, path=env["db"])["note"]
 
 
-def test_item06_gwt5_session_end_parks_running_orphan(
-    env, monkeypatch, capsys
-):
+def test_item06_gwt5_session_end_parks_running_orphan(env, monkeypatch, capsys):
     tid = _task(env)
     assert db.claim_queued(tid, "w-acp", Transport.ACP_PUSH, path=env["db"])
     assert db.mark_running(tid, "w-acp", path=env["db"])
@@ -348,9 +343,7 @@ def test_item06_gwt5_session_end_parks_running_orphan(
     assert row["lease_owner"] is None
 
 
-def test_item06_session_end_race_keeps_running_lease(
-    env, monkeypatch, capsys
-):
+def test_item06_session_end_race_keeps_running_lease(env, monkeypatch, capsys):
     # regression: the task was dispatch_decided when read, but the real
     # owner marked it running before our mark_running CAS arrived -
     # the release_lease fallback must not strip the running task's
@@ -384,9 +377,7 @@ def test_item06_session_end_race_keeps_running_lease(
 # --- queue trigger inside the park cycle --------------------------------------
 
 
-def test_item06_trigger_arriving_mid_park_delivers(
-    env, monkeypatch, capsys
-):
+def test_item06_trigger_arriving_mid_park_delivers(env, monkeypatch, capsys):
     trigger = Path(env["qdir"]) / f"{SID}.json"
 
     def enqueue_later():
@@ -402,9 +393,7 @@ def test_item06_trigger_arriving_mid_park_delivers(
     assert out["reason"] == "[PARKED>TASK] do the thing"
 
 
-def test_item06_invalid_trigger_is_consumed_and_parked(
-    env, monkeypatch, capsys
-):
+def test_item06_invalid_trigger_is_consumed_and_parked(env, monkeypatch, capsys):
     (Path(env["qdir"]) / f"{SID}.json").write_text("{not json")
     rc, out = _run(env, _stop(), monkeypatch, capsys)
     assert rc == 0
@@ -466,16 +455,10 @@ def test_item06_gwt6_install_on_repo_without_devin(tmp_path):
     ]
     assert len(stop_cmds) == 1
     # the command embeds the park budget and names worker.py absolutely
-    assert str(REPO_ROOT / "src/session_bridge/hooks/worker.py") in \
-        stop_cmds[0]
+    assert str(REPO_ROOT / "src/session_bridge/hooks/worker.py") in stop_cmds[0]
     assert "--cycle-seconds" in stop_cmds[0]
     # installed timeout covers a park cycle
-    ours = [
-        h
-        for e in data["Stop"]
-        for h in e["hooks"]
-        if "worker.py" in h.get("command", "")
-    ][0]
+    ours = next(h for e in data["Stop"] for h in e["hooks"] if "worker.py" in h.get("command", ""))
     assert ours["timeout"] >= 150
 
 
@@ -501,14 +484,8 @@ def test_item06_gwt6_install_is_idempotent_and_preserves(tmp_path):
     assert _install(repo).returncode == 0  # second run stays clean
     data = _hooks(repo)
     stop = data["Stop"]
-    foreign_left = [
-        h for e in stop for h in e["hooks"]
-        if h.get("command") == "other-tool hook"
-    ]
-    ours = [
-        h for e in stop for h in e["hooks"]
-        if "worker.py" in h.get("command", "")
-    ]
+    foreign_left = [h for e in stop for h in e["hooks"] if h.get("command") == "other-tool hook"]
+    ours = [h for e in stop for h in e["hooks"] if "worker.py" in h.get("command", "")]
     assert len(foreign_left) == 1  # foreign hook not clobbered
     assert len(ours) == 1  # no duplicate entries after re-install
     assert (repo / ".devin" / "hooks.v1.json.bak").exists()
@@ -545,13 +522,7 @@ def test_item06_gwt6_install_fails_without_session_bridge(tmp_path):
     repo = tmp_path / "target"
     repo.mkdir()
     fake = tmp_path / "python-no-bridge"
-    fake.write_text(
-        "#!/bin/sh\n"
-        'if [ "$2" = "import pydantic" ]; then\n'
-        "    exit 0\n"
-        "fi\n"
-        "exit 1\n"
-    )
+    fake.write_text('#!/bin/sh\nif [ "$2" = "import pydantic" ]; then\n    exit 0\nfi\nexit 1\n')
     fake.chmod(0o755)
     res = subprocess.run(
         ["bash", str(INSTALL_SH), str(repo)],
@@ -583,8 +554,8 @@ EVENT_NAMES = (
 LEGACY_OUR_HOOK = {
     "type": "command",
     "command": "PYTHONPATH=/old /usr/bin/python3 "
-               "/old/src/session_bridge/hooks/worker.py "
-               "--hook-timeout 60 --cycle-seconds 150 --cycles-max 5",
+    "/old/src/session_bridge/hooks/worker.py "
+    "--hook-timeout 60 --cycle-seconds 150 --cycles-max 5",
     "timeout": 60,
 }
 
@@ -594,8 +565,7 @@ def _our_hooks(data, event):
         h
         for e in data.get(event, [])
         for h in e.get("hooks", [])
-        if isinstance(h.get("command"), str)
-        and "session_bridge/hooks/worker.py" in h["command"]
+        if isinstance(h.get("command"), str) and "session_bridge/hooks/worker.py" in h["command"]
     ]
 
 
@@ -629,15 +599,11 @@ def test_item11_gwt2_legacy_wrapper_migrates_to_top_level(tmp_path):
                     ],
                 },
             ],
-            "SessionStart": [
-                {"matcher": "", "hooks": [dict(LEGACY_OUR_HOOK)]}
-            ],
+            "SessionStart": [{"matcher": "", "hooks": [dict(LEGACY_OUR_HOOK)]}],
             "PreToolUse": [
                 {
                     "matcher": "Bash",
-                    "hooks": [
-                        {"type": "command", "command": "other-tool pre"}
-                    ],
+                    "hooks": [{"type": "command", "command": "other-tool pre"}],
                 }
             ],
         }
@@ -657,12 +623,12 @@ def test_item11_gwt2_legacy_wrapper_migrates_to_top_level(tmp_path):
     # foreign entries under the wrapper were migrated, not dropped
     migrated_foreign = [
         h["command"]
-        for e in data["Stop"] for h in e["hooks"]
+        for e in data["Stop"]
+        for h in e["hooks"]
         if h.get("command") == "other-tool stop"
     ]
     assert migrated_foreign == ["other-tool stop"]
-    assert data["PreToolUse"][0]["hooks"][0]["command"] == \
-        "other-tool pre"
+    assert data["PreToolUse"][0]["hooks"][0]["command"] == "other-tool pre"
     assert (repo / ".devin" / "hooks.v1.json.bak").exists()
     # the backup keeps the pre-migration bytes for recovery
     bak = json.loads((repo / ".devin" / "hooks.v1.json.bak").read_text())
@@ -688,9 +654,7 @@ def test_item11_gwt3_foreign_top_level_entries_not_clobbered(tmp_path):
         "PreToolUse": [
             {
                 "matcher": "Bash",
-                "hooks": [
-                    {"type": "command", "command": "other-tool pre"}
-                ],
+                "hooks": [{"type": "command", "command": "other-tool pre"}],
             }
         ],
     }
@@ -702,8 +666,7 @@ def test_item11_gwt3_foreign_top_level_entries_not_clobbered(tmp_path):
     # foreign entries survive the merge untouched
     assert data["PreToolUse"] == foreign["PreToolUse"]
     foreign_stop = [
-        h for e in data["Stop"] for h in e["hooks"]
-        if h.get("command") == "other-tool stop"
+        h for e in data["Stop"] for h in e["hooks"] if h.get("command") == "other-tool stop"
     ]
     assert len(foreign_stop) == 1
     assert foreign_stop[0]["timeout"] == 15
@@ -718,9 +681,7 @@ def test_item11_non_dict_hooks_wrapper_kept_under_legacy_key(tmp_path):
     # rest of the file still gets a clean top-level install
     repo = tmp_path / "target"
     (repo / ".devin").mkdir(parents=True)
-    (repo / ".devin" / "hooks.v1.json").write_text(
-        json.dumps({"hooks": "not-a-hook-map"})
-    )
+    (repo / ".devin" / "hooks.v1.json").write_text(json.dumps({"hooks": "not-a-hook-map"}))
     res = _install(repo)
     assert res.returncode == 0, res.stderr
     data = _hooks(repo)
@@ -741,9 +702,7 @@ def test_item11_mixed_legacy_and_top_level_dedupes_our_hook(tmp_path):
             {"matcher": "", "hooks": [dict(LEGACY_OUR_HOOK)]},
             {
                 "matcher": "",
-                "hooks": [
-                    {"type": "command", "command": "other-tool stop"}
-                ],
+                "hooks": [{"type": "command", "command": "other-tool stop"}],
             },
         ],
         "hooks": {
@@ -760,10 +719,7 @@ def test_item11_mixed_legacy_and_top_level_dedupes_our_hook(tmp_path):
     assert ours[0]["timeout"] == 600  # refreshed, not a stale copy
     # the deduped duplicate left no {"hooks": []} husk behind
     assert all(e.get("hooks") for e in data["Stop"])
-    foreign = [
-        h for e in data["Stop"] for h in e["hooks"]
-        if h.get("command") == "other-tool stop"
-    ]
+    foreign = [h for e in data["Stop"] for h in e["hooks"] if h.get("command") == "other-tool stop"]
     assert len(foreign) == 1
 
 
@@ -790,7 +746,8 @@ def test_item11_foreign_hook_with_non_string_command_ignored(tmp_path):
     data = _hooks(repo)
     non_str = [
         h["command"]
-        for e in data["Stop"] for h in e["hooks"]
+        for e in data["Stop"]
+        for h in e["hooks"]
         if not isinstance(h.get("command"), str)
     ]
     assert non_str == [123, None]  # preserved verbatim
