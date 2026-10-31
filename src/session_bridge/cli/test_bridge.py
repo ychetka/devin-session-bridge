@@ -28,6 +28,7 @@ from session_bridge.cli.contract import (
 )
 from session_bridge.state import db
 from session_bridge.state.contract import (
+    AuditEventKind,
     NotificationKind,
     SessionMode,
     TaskStatus,
@@ -815,3 +816,226 @@ def test_item13c_unmanaged_push_unchanged(env, capsys):
     assert row["transport"] == Transport.HOOK_QUEUE.value
     assert _trigger(env).exists()
     assert db.unrelayed_notifications(SID, path=env.db) == []
+
+
+# --- item_13e1: register / ask / ack / escalate -------------------------------
+
+
+def test_item13e1_gwt1_register_orchestrator_cas(env, capsys):
+    rc, out = _run(["register", "orc1", "--role", "orchestrator", "--json"], capsys)
+    assert rc == ExitCode.OK
+    assert out["status"] == "registered"
+    assert out["data"]["role"] == "orchestrator"
+    assert out["data"]["generation"] == 1
+    # a second orchestrator is refused while the holder's heartbeat is fresh
+    rc, out = _run(["register", "orc2", "--role", "orchestrator", "--json"], capsys)
+    assert rc == ExitCode.CONFLICT
+    assert out["data"]["holder"] == "orc1"
+    assert out["data"]["heartbeat_age"] is not None
+    assert "--force" in out["agent_instruction"]
+    # --force takes over and demotes the previous holder
+    rc, out = _run(["register", "orc2", "--role", "orchestrator", "--force", "--json"], capsys)
+    assert rc == ExitCode.OK
+    assert db.get_session("orc2", path=env.db)["role"] == "orchestrator"
+    assert db.get_session("orc1", path=env.db)["role"] == "worker"
+
+
+def test_item13e1_register_worker_defaults(env, capsys):
+    rc, out = _run(["register", "w1", "--json"], capsys)
+    assert rc == ExitCode.OK
+    assert out["status"] == "registered"
+    assert out["data"]["role"] == "worker"
+    row = db.get_session("w1", path=env.db)
+    assert row["role"] == "worker"
+    assert row["cwd"] == os.getcwd()
+    # re-registering bumps the heartbeat generation
+    rc, out = _run(["register", "w1", "--json"], capsys)
+    assert out["data"]["generation"] == 2
+
+
+def test_item13e1_ask_posts_question_and_refusals(env, capsys):
+    tid = _task(env)
+    rc, out = _run(
+        ["ask", "--session", SID, "--task", str(tid), "which branch?", "--json"],
+        capsys,
+    )
+    assert rc == ExitCode.OK
+    qid = out["data"]["question_id"]
+    row = db.get_question(qid, path=env.db)
+    assert row["state"] == "pending"
+    assert row["text"] == "which branch?"
+    assert row["session_id"] == SID
+    # a second pending question on the same task is refused
+    rc, out = _run(["ask", "--session", SID, "--task", str(tid), "more?", "--json"], capsys)
+    assert rc == ExitCode.CONFLICT
+    assert out["data"]["reason"] == "pending_exists"
+    # cycle the question budget: answer each, ask again
+    assert db.claim_question(qid, "orc", path=env.db)
+    assert db.answer_question(qid, "main", path=env.db)
+    for i in (2, 3):
+        rc, out = _run(
+            ["ask", "--session", SID, "--task", str(tid), f"q{i}", "--json"],
+            capsys,
+        )
+        assert rc == ExitCode.OK
+        qi = out["data"]["question_id"]
+        assert db.claim_question(qi, "orc", path=env.db)
+        assert db.answer_question(qi, f"a{i}", path=env.db)
+    # the task carries MAX_QUESTIONS_PER_TASK questions now - refused
+    rc, out = _run(["ask", "--session", SID, "--task", str(tid), "q4", "--json"], capsys)
+    assert rc == ExitCode.CONFLICT
+    assert out["data"]["reason"] == "question_limit"
+    assert "escalate" in out["agent_instruction"]
+
+
+def test_item13e1_gwt4_ack_watermark(env, capsys):
+    db.notify(SID, NotificationKind.DIRECTIVE, "one", path=env.db)
+    n2 = db.notify(SID, NotificationKind.DIRECTIVE, "two", path=env.db)
+    n3 = db.notify(SID, NotificationKind.DIRECTIVE, "three", path=env.db)
+    rc, out = _run(["ack", "--session", SID, "--up-to", str(n2), "--json"], capsys)
+    assert rc == ExitCode.OK
+    assert out["data"]["acked"] == 2
+    # rows above the watermark stay unacked
+    unacked = db.unacked_notifications(SID, path=env.db)
+    assert [r["id"] for r in unacked] == [n3]
+    # a bare ack covers what is left; a repeat is a no-op
+    rc, out = _run(["ack", "--session", SID, "--json"], capsys)
+    assert out["data"]["acked"] == 1
+    rc, out = _run(["ack", "--session", SID, "--json"], capsys)
+    assert rc == ExitCode.OK
+    assert out["data"]["acked"] == 0
+    # the watermark persisted on the rows
+    rows = db.unacked_notifications(SID, path=env.db)
+    assert rows == []
+
+
+def _escalation(env, session_id="w1", task_id=None, question_id=None, directive=None):
+    return db.audit(
+        AuditEventKind.ESCALATION,
+        session_id=session_id,
+        task_id=task_id,
+        question_id=question_id,
+        question_text="which branch?",
+        partner_outputs={"copilot": "A", "gemini": "B"},
+        synthesis="partners disagree",
+        directive=directive,
+        doa_trigger="question_limit",
+        path=env.db,
+    )
+
+
+def test_item13e1_escalate_show_lists_open_only(env, capsys):
+    eid = _escalation(env)
+    _escalation(env, session_id="w2", directive="A")  # already resolved
+    rc, out = _run(["escalate", "show", "--json"], capsys)
+    assert rc == ExitCode.OK
+    resp = JsonResponse.model_validate(out)
+    items = resp.data["escalations"]
+    assert [i["id"] for i in items] == [eid]
+    item = items[0]
+    assert item["session_id"] == "w1"
+    assert item["doa_trigger"] == "question_limit"
+    assert item["question_text"] == "which branch?"
+    assert item["synthesis"] == "partners disagree"
+    assert item["partner_outputs"] == {"copilot": "A", "gemini": "B"}
+    assert item["reply_command"] == (f"bridge escalate reply {eid} A|B|defer|abort|override:<text>")
+
+
+def test_item13e1_escalate_show_empty(env, capsys):
+    rc, out = _run(["escalate", "show", "--json"], capsys)
+    assert rc == ExitCode.OK
+    assert out["data"]["escalations"] == []
+
+
+def test_item13e1_gwt2_defer_pauses_task_frees_slot(env, capsys):
+    tid = _task(env)
+    other = _task(env, sid="s2")
+    eid = _escalation(env, task_id=tid)
+    rc, out = _run(["escalate", "reply", str(eid), "defer", "--json"], capsys)
+    assert rc == ExitCode.OK
+    assert out["data"]["directive"] == "defer"
+    assert out["data"]["task_status"] == TaskStatus.PAUSED.value
+    row = db.get_task(tid, path=env.db)
+    assert row["status"] == TaskStatus.PAUSED.value
+    assert row["note"] == "blocked: deferred by human"
+    # paused is not live: the session slot frees for the next task
+    assert db.get_live_task(SID, path=env.db) is None
+    # the next queued task on another session stays available
+    assert db.get_task(other, path=env.db)["status"] == TaskStatus.QUEUED.value
+    # the escalation row carries the directive
+    assert db.get_audit_event(eid, path=env.db)["directive"] == "defer"
+    # the calling session was notified
+    rows = db.unrelayed_notifications("w1", path=env.db)
+    assert len(rows) == 1
+    assert rows[0]["kind"] == NotificationKind.DIRECTIVE.value
+
+
+def test_item13e1_gwt3_abort_fails_task_with_cleanup_note(env, capsys):
+    tid = _task(env)
+    owner = _claim_acp(env, tid)  # running under a worker lease
+    eid = _escalation(env, task_id=tid)
+    rc, out = _run(["escalate", "reply", str(eid), "abort", "--json"], capsys)
+    assert rc == ExitCode.OK
+    assert out["data"]["task_status"] == TaskStatus.FAILED.value
+    row = db.get_task(tid, path=env.db)
+    assert row["status"] == TaskStatus.FAILED.value
+    assert row["note"] == "aborted by human: cleanup branch"
+    assert row["lease_owner"] is None
+    # a zombie worker cannot overwrite the human's verdict
+    assert db.finish_task(tid, owner, ok=True, path=env.db) is False
+
+
+def test_item13e1_gwt5_reply_on_resolved_refused(env, capsys):
+    eid = _escalation(env)
+    rc, _out = _run(["escalate", "reply", str(eid), "A", "--json"], capsys)
+    assert rc == ExitCode.OK
+    rc, out = _run(["escalate", "reply", str(eid), "B", "--json"], capsys)
+    assert rc == ExitCode.CONFLICT
+    assert "already resolved" in out["error"]
+    # the first directive stands
+    assert db.get_audit_event(eid, path=env.db)["directive"] == "A"
+
+
+def test_item13e1_reply_not_found_and_bad_directive(env, capsys):
+    rc, _out = _run(["escalate", "reply", "999", "A", "--json"], capsys)
+    assert rc == ExitCode.NOT_FOUND
+    eid = _escalation(env)
+    rc, _out = _run(["escalate", "reply", str(eid), "bogus", "--json"], capsys)
+    assert rc == ExitCode.USAGE
+    rc, _out = _run(["escalate", "reply", str(eid), "override:", "--json"], capsys)
+    assert rc == ExitCode.USAGE
+    # invalid replies leave the escalation open
+    assert db.get_audit_event(eid, path=env.db)["directive"] is None
+
+
+def test_item13e1_reply_override_answers_claimed_question(env, capsys):
+    tid = _task(env)
+    res = db.ask("w1", tid, "which branch?", path=env.db)
+    qid = res.question_id
+    assert db.claim_question(qid, "orc1", path=env.db)
+    eid = _escalation(env, task_id=tid, question_id=qid)
+    rc, out = _run(["escalate", "reply", str(eid), "override:use main", "--json"], capsys)
+    assert rc == ExitCode.OK
+    assert out["data"]["question_answered"] is True
+    q = db.get_question(qid, path=env.db)
+    assert q["state"] == "answered"
+    assert q["answer"] == "use main"
+    rows = db.unrelayed_notifications("w1", path=env.db)
+    assert len(rows) == 1
+    assert rows[0]["kind"] == NotificationKind.DIRECTIVE.value
+    assert "use main" in rows[0]["body"]
+    assert rows[0]["task_id"] == tid
+    assert rows[0]["question_id"] == qid
+
+
+def test_item13e1_reply_answers_pending_question(env, capsys):
+    tid = _task(env)
+    res = db.ask("w1", tid, "which branch?", path=env.db)
+    eid = _escalation(env, task_id=tid, question_id=res.question_id)
+    rc, out = _run(["escalate", "reply", str(eid), "A", "--json"], capsys)
+    assert rc == ExitCode.OK
+    assert out["data"]["question_answered"] is True
+    q = db.get_question(res.question_id, path=env.db)
+    assert q["state"] == "answered"
+    assert q["answer"] == "A"
+    assert q["claimed_by"] == bridge._ESCALATE_CLAIMANT

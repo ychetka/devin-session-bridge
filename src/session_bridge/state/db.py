@@ -173,7 +173,9 @@ CREATE INDEX IF NOT EXISTS ix_questions_state ON questions(state);
 
 -- Append-only audit log: deliberation pipeline rows (question >
 -- partner outputs > synthesis > directive), escalation doa triggers
--- and turn/watcher rotations. Written, never updated.
+-- and turn/watcher rotations. Written once; the single exception is
+-- resolve_escalation(), which CAS-fills the directive column on
+-- ESCALATION rows (directive IS NULL = an open escalation).
 CREATE TABLE IF NOT EXISTS audit_events (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   kind TEXT NOT NULL,
@@ -1478,11 +1480,20 @@ def claim_question(question_id: int, claimant: str, *, path=None) -> bool:
     return _retry(op)
 
 
-def answer_question(question_id: int, answer_text: str, *, path=None) -> bool:
+def answer_question(
+    question_id: int,
+    answer_text: str,
+    *,
+    claimant: str | None = None,
+    path=None,
+) -> bool:
     """CAS ``claimed > answered``; stores the answer verbatim.
 
     Returns False on a pending question (not yet claimed) and on an
-    already answered one - ``answered`` is terminal.
+    already answered one - ``answered`` is terminal. ``claimant``
+    optionally binds the CAS to ``claimed_by``: an orchestrator whose
+    claim was released and re-taken by a successor (janitor timeout)
+    loses the CAS instead of answering into somebody else's slot.
     """
     if answer_text is None:
         raise ValueError("answer_question requires answer text")
@@ -1492,16 +1503,18 @@ def answer_question(question_id: int, answer_text: str, *, path=None) -> bool:
     def op():
         con = connect(path)
         try:
-            cur = con.execute(
-                "UPDATE questions SET state=?, answer=?, answered_at=? WHERE id=? AND state=?",
-                (
-                    QuestionState.ANSWERED.value,
-                    answer_text,
-                    ts,
-                    question_id,
-                    QuestionState.CLAIMED.value,
-                ),
-            )
+            sql = "UPDATE questions SET state=?, answer=?, answered_at=? WHERE id=? AND state=?"
+            args: list = [
+                QuestionState.ANSWERED.value,
+                answer_text,
+                ts,
+                question_id,
+                QuestionState.CLAIMED.value,
+            ]
+            if claimant is not None:
+                sql += " AND claimed_by=?"
+                args.append(claimant)
+            cur = con.execute(sql, args)
             return cur.rowcount == 1
         finally:
             con.close()
@@ -1828,6 +1841,122 @@ def ack_notifications(session_id: str, up_to_id: int | None = None, *, path=None
             con.close()
 
     return _retry(op)
+
+
+# --- message bus: escalations (item_13e1) -------------------------------------
+
+
+def get_audit_event(event_id: int, *, path=None):
+    """Fetch one ``audit_events`` row by id (None when absent)."""
+
+    def op():
+        con = connect(path)
+        try:
+            return con.execute("SELECT * FROM audit_events WHERE id=?", (event_id,)).fetchone()
+        finally:
+            con.close()
+
+    return _retry(op)
+
+
+def list_open_escalations(*, path=None) -> list:
+    """ESCALATION rows still waiting on a human directive, oldest first.
+
+    An escalation is open while its ``directive`` column is NULL; this
+    is the queue ``bridge escalate show`` renders.
+    """
+
+    def op():
+        con = connect(path)
+        try:
+            return con.execute(
+                "SELECT * FROM audit_events WHERE kind=? AND directive IS NULL ORDER BY id",
+                (AuditEventKind.ESCALATION.value,),
+            ).fetchall()
+        finally:
+            con.close()
+
+    return _retry(op)
+
+
+def resolve_escalation(event_id: int, directive: str, *, path=None) -> bool:
+    """CAS-fill ``directive`` on an open ESCALATION audit row.
+
+    The single mutation ever applied to the append-only journal: an
+    ESCALATION row is open while ``directive IS NULL`` and exactly one
+    caller wins the fill - a repeated ``escalate reply`` loses the CAS
+    and is reported as already resolved. Returns False when the row is
+    missing, not an escalation, or already carries a directive.
+    """
+    if not directive:
+        raise ValueError("resolve_escalation requires a directive")
+
+    def op():
+        con = connect(path)
+        try:
+            cur = con.execute(
+                "UPDATE audit_events SET directive=? WHERE id=? AND kind=? AND directive IS NULL",
+                (directive, event_id, AuditEventKind.ESCALATION.value),
+            )
+            return cur.rowcount == 1
+        finally:
+            con.close()
+
+    return _retry(op)
+
+
+def _block_task(task_id: int, target, note: str | None, *, path=None) -> bool:
+    """Shared CAS for the human-blocking escalation directives.
+
+    Moves any live task to ``target`` (paused|failed) in one guarded
+    UPDATE: the lease fields are cleared so the terminal/parked row
+    holds no stale lease, and the live-status guard makes the write a
+    transition-CAS - a task that already left the live set (finished,
+    cleared, already blocked by a previous reply) is untouched and the
+    caller sees False.
+    """
+    ts = _now()
+
+    def op():
+        con = connect(path)
+        try:
+            cur = con.execute(
+                f"UPDATE tasks SET status=?, note=COALESCE(?,note),"
+                f" lease_owner=NULL, lease_expires_at=NULL,"
+                f" lease_renewed_at=NULL, updated_at=?"
+                f" WHERE id=? AND status IN ({_LIVE_SQL})",
+                (_val(target), note, ts, task_id),
+            )
+            return cur.rowcount == 1
+        finally:
+            con.close()
+
+    return _retry(op)
+
+
+def defer_task(task_id: int, note: str | None = None, *, path=None) -> bool:
+    """Escalation directive ``defer``: park a live task on ``paused``.
+
+    ``queued > paused`` is the declared manual edge; for the other
+    live statuses the same park is applied as a human override - the
+    escalation reply is a human decision recorded outside the
+    automatic transition map (no new status is introduced). A paused
+    task is not live, so the session's live-task slot frees for the
+    next queued task while the row keeps its note.
+    """
+    return _block_task(task_id, TaskStatus.PAUSED, note, path=path)
+
+
+def abort_task(task_id: int, note: str | None = None, *, path=None) -> bool:
+    """Escalation directive ``abort``: drop a live task to ``failed``.
+
+    Terminal like any other ``failed`` - only a manual ``retry``
+    revives it. For ``running`` this mirrors ``finish_task``'s
+    running > failed edge without requiring the lease owner (a human
+    abort must not depend on the zombie it is cancelling); for the
+    other live statuses it lands the same human-override terminal.
+    """
+    return _block_task(task_id, TaskStatus.FAILED, note, path=path)
 
 
 # --- queue trigger naming -----------------------------------------------------

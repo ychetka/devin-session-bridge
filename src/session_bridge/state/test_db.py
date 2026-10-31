@@ -1443,3 +1443,65 @@ def test_item13d_requeue_dead_worker_fails_at_attempt_budget(db_path):
     assert db.requeue_dead_worker(tid, path=db_path) is TaskStatus.FAILED
     # terminal row is out of the live set - the CAS loses on replay
     assert db.requeue_dead_worker(tid, path=db_path) is None
+
+
+# --- item_13e1: claimant binding + escalation writers -------------------------
+
+
+def test_item13e1_answer_question_binds_to_claimant(db_path):
+    qid = _ask(db_path)
+    assert db.claim_question(qid, "orc1", path=db_path) is True
+    # a zombie orchestrator answering somebody else's claim loses the CAS
+    assert db.answer_question(qid, "wrong", claimant="zombie", path=db_path) is False
+    row = _one(db_path, "SELECT * FROM questions WHERE id=?", (qid,))
+    assert row["state"] == "claimed"
+    assert row["answer"] is None
+    # the actual claimant answers; claimant=None keeps the pre-binding behavior
+    assert db.answer_question(qid, "use main", claimant="orc1", path=db_path) is True
+    row = _one(db_path, "SELECT * FROM questions WHERE id=?", (qid,))
+    assert row["state"] == "answered"
+    assert row["answer"] == "use main"
+
+
+def test_item13e1_resolve_escalation_cas_and_open_scan(db_path):
+    eid = db.audit(
+        AuditEventKind.ESCALATION,
+        session_id="w1",
+        doa_trigger="question_limit",
+        question_text="which branch?",
+        path=db_path,
+    )
+    other = db.audit(AuditEventKind.DELIBERATION, directive="use main", path=db_path)
+    assert [r["id"] for r in db.list_open_escalations(path=db_path)] == [eid]
+    # non-escalation rows cannot be resolved
+    assert db.resolve_escalation(other, "A", path=db_path) is False
+    assert db.resolve_escalation(eid, "defer", path=db_path) is True
+    assert db.list_open_escalations(path=db_path) == []
+    # a repeated fill loses the CAS - "already resolved"
+    assert db.resolve_escalation(eid, "B", path=db_path) is False
+    row = _one(db_path, "SELECT directive FROM audit_events WHERE id=?", (eid,))
+    assert row["directive"] == "defer"
+
+
+def test_item13e1_defer_abort_task_block_writers(db_path):
+    # defer parks a queued task; paused leaves the live set
+    t1 = db.enqueue("s-a", "t1", path=db_path)
+    assert db.defer_task(t1, note="blocked: deferred by human", path=db_path) is True
+    row = db.get_task(t1, path=db_path)
+    assert row["status"] == "paused"
+    assert row["note"] == "blocked: deferred by human"
+    # already parked - the live guard loses the CAS on replay
+    assert db.defer_task(t1, path=db_path) is False
+
+    # abort drops a running task to terminal failed, lease cleared
+    t2 = _enqueue_running(db_path, "s-b", owner="w-zombie")
+    assert db.abort_task(t2, note="aborted by human: cleanup branch", path=db_path) is True
+    row = db.get_task(t2, path=db_path)
+    assert row["status"] == "failed"
+    assert row["note"] == "aborted by human: cleanup branch"
+    assert row["lease_owner"] is None
+    # the zombie owner cannot overwrite the human's verdict
+    assert db.finish_task(t2, "w-zombie", ok=True, path=db_path) is False
+    # terminal rows are out of the live set
+    assert db.abort_task(t2, path=db_path) is False
+    assert db.defer_task(t2, path=db_path) is False
