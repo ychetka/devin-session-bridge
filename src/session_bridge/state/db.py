@@ -11,12 +11,19 @@ UPDATE guarded by a WHERE clause on the expected status/lease owner;
 concurrent transition - no SELECT-then-UPDATE on the claim path.
 Writers retry SQLITE_BUSY with exponential backoff on top of the
 ``busy_timeout`` pragma.
+
+Message bus slice (schema v2, item_13b1): the sessions table gains
+``role``/``mode``/``status`` (via an idempotent migration for pre-v2
+files), ``worker_heartbeats`` holds the authoritative liveness and
+generation rows, and ``register``/``heartbeat`` implement the
+orchestrator CAS singleton and the liveness protocol.
 """
 
 import os
 import re
 import sqlite3
 import time
+from dataclasses import dataclass
 from enum import Enum
 
 from .contract import (
@@ -26,6 +33,8 @@ from .contract import (
     LIVE_STATUSES,
     MAX_ATTEMPTS,
     WRITER_RETRIES,
+    SessionRole,
+    SessionStatus,
     TaskStatus,
     Transport,
 )
@@ -55,6 +64,13 @@ SESSION_LOCKS_DIR = os.path.join(DEVIN_CLI_DIR, "session_locks")
 
 #: mark_notified refuses to re-flag a task inside this window.
 NOTIFY_DEDUP_SECONDS = 300
+
+#: Orchestration heartbeat cadence: every registered session is
+#: expected to call heartbeat() within HEARTBEAT_INTERVAL_SECONDS; a
+#: heartbeat silent for HEARTBEAT_STALE_SECONDS marks the holder dead
+#: (bounded refusal window for the orchestrator CAS singleton).
+HEARTBEAT_INTERVAL_SECONDS = 60
+HEARTBEAT_STALE_SECONDS = 2 * HEARTBEAT_INTERVAL_SECONDS
 
 _BUSY_BASE_DELAY = 0.1
 
@@ -95,12 +111,33 @@ CREATE TABLE IF NOT EXISTS sessions (
   title TEXT,
   queue_paused INTEGER NOT NULL DEFAULT 0,
   park_cycles_left INTEGER NOT NULL DEFAULT 5,
+  role TEXT NOT NULL DEFAULT 'worker',
+  mode TEXT NOT NULL DEFAULT 'unmanaged',
+  status TEXT NOT NULL DEFAULT 'active',
   note TEXT,
   updated_at INTEGER NOT NULL
 );
 
+-- Authoritative liveness + generation rows for the bus (the sessions
+-- table is deliberately not denormalized with them).
+CREATE TABLE IF NOT EXISTS worker_heartbeats (
+  session_id TEXT PRIMARY KEY,
+  last_seen_at INTEGER NOT NULL,
+  generation INTEGER NOT NULL DEFAULT 0
+);
+
 PRAGMA user_version=1;
 """
+
+# Columns the v2 schema adds to sessions. CREATE TABLE IF NOT EXISTS
+# cannot extend a pre-v2 sessions table, so init() applies these
+# ALTERs idempotently (guarded on PRAGMA table_info inside one
+# BEGIN IMMEDIATE transaction).
+_SESSION_COLUMN_MIGRATIONS = (
+    ("role", "TEXT NOT NULL DEFAULT 'worker'"),
+    ("mode", "TEXT NOT NULL DEFAULT 'unmanaged'"),
+    ("status", "TEXT NOT NULL DEFAULT 'active'"),
+)
 
 _SESSION_FIELDS = frozenset({"cwd", "title", "queue_paused", "park_cycles_left", "note"})
 
@@ -160,7 +197,18 @@ def connect(path=None) -> sqlite3.Connection:
 
 
 def init(path=None) -> None:
-    """Create the schema (idempotent) and set user_version=1."""
+    """Create the schema (idempotent) and stamp user_version=2.
+
+    The v2 sessions-column migration is a check-then-ALTER sequence:
+    it must run inside one BEGIN IMMEDIATE transaction so concurrent
+    init() calls on a pre-v2 file serialize on the writer lock. Outside
+    a transaction both racers could pass the table_info check and the
+    loser would die on a "duplicate column name" error, which is not a
+    retryable SQLITE_BUSY. A busy BEGIN IMMEDIATE IS retryable, so the
+    loser waits out the winner's migration and then finds every column
+    already present. user_version=2 commits atomically with the ALTERs,
+    so it only ever stamps a file that actually has the v2 columns.
+    """
     target = _path(path)
     parent = os.path.dirname(target)
     if parent:
@@ -170,6 +218,18 @@ def init(path=None) -> None:
         con = connect(target)
         try:
             con.executescript(_SCHEMA)
+            con.execute("BEGIN IMMEDIATE")
+            try:
+                existing = {r["name"] for r in con.execute("PRAGMA table_info(sessions)")}
+                for col, decl in _SESSION_COLUMN_MIGRATIONS:
+                    if col not in existing:
+                        con.execute(f"ALTER TABLE sessions ADD COLUMN {col} {decl}")
+                con.execute("PRAGMA user_version=2")
+                con.execute("COMMIT")
+            except BaseException:
+                if con.in_transaction:
+                    con.execute("ROLLBACK")
+                raise
         finally:
             con.close()
 
@@ -954,6 +1014,154 @@ def decrement_park_cycles(session_id: str, fresh_budget: int, *, path=None) -> i
                 (session_id, max(budget - 1, 0), ts, budget),
             ).fetchone()
             return int(row["park_cycles_left"])
+        finally:
+            con.close()
+
+    return _retry(op)
+
+
+# --- message bus: register + heartbeat ----------------------------------------
+
+
+# Shared upsert for register() and heartbeat(): the first sighting of a
+# session lands at generation 1, every later call bumps it - a caller
+# holding an older generation can tell it has been superseded.
+_HEARTBEAT_UPSERT = (
+    "INSERT INTO worker_heartbeats(session_id,last_seen_at,generation)"
+    " VALUES(?,?,1) ON CONFLICT(session_id) DO UPDATE SET"
+    " last_seen_at=excluded.last_seen_at, generation=generation+1"
+    " RETURNING generation"
+)
+
+
+@dataclass(frozen=True)
+class RegisterResult:
+    """Outcome of ``register()``.
+
+    ``accepted=False`` means the orchestrator CAS refused: ``holder``
+    is the live orchestrator's session_id and ``heartbeat_age`` the age
+    of its heartbeat in seconds. On acceptance ``generation`` is the
+    session's new heartbeat generation.
+    """
+
+    accepted: bool
+    session_id: str
+    role: str
+    holder: str | None = None
+    heartbeat_age: int | None = None
+    generation: int | None = None
+
+
+def register(
+    session_id: str,
+    workspace: str,
+    role="worker",
+    force: bool = False,
+    *,
+    path=None,
+) -> RegisterResult:
+    """Register a session on the bus; returns a ``RegisterResult``.
+
+    The contract's ``workspace`` maps to the sessions.cwd column.
+    Worker registrations are a plain upsert plus a heartbeat write
+    (generation bump). Orchestrator registrations are a CAS singleton:
+    while another session holds ``role='orchestrator'`` with a fresh
+    heartbeat (younger than HEARTBEAT_STALE_SECONDS) the registration
+    is refused - no state is written and the result carries the holder
+    sid plus its heartbeat age. A stale or heartbeat-less holder is
+    demoted to worker and the new sid takes over; ``force=True``
+    demotes any holder unconditionally. The whole read-decide-write
+    runs inside one BEGIN IMMEDIATE transaction so concurrent
+    orchestrator registrations serialize on the SQLite writer lock.
+
+    Registering is a liveness signal, so the sessions row is written
+    with ``status='active'`` (a session the supervisor marked dead
+    revives itself by re-registering).
+    """
+    role_v = _val(role)
+    if role_v not in (SessionRole.WORKER.value, SessionRole.ORCHESTRATOR.value):
+        raise ValueError(f"unknown session role: {role_v!r}")
+    ts = _now()
+
+    def op():
+        con = connect(path)
+        try:
+            con.execute("BEGIN IMMEDIATE")
+            try:
+                if role_v == SessionRole.ORCHESTRATOR.value and not force:
+                    holder = con.execute(
+                        "SELECT s.session_id AS sid, wh.last_seen_at AS seen"
+                        " FROM sessions s"
+                        " JOIN worker_heartbeats wh"
+                        "  ON wh.session_id=s.session_id"
+                        " WHERE s.role=? AND s.session_id<>? AND wh.last_seen_at>?",
+                        (
+                            SessionRole.ORCHESTRATOR.value,
+                            session_id,
+                            ts - HEARTBEAT_STALE_SECONDS,
+                        ),
+                    ).fetchone()
+                    if holder is not None:
+                        con.execute("ROLLBACK")
+                        return RegisterResult(
+                            accepted=False,
+                            session_id=session_id,
+                            role=role_v,
+                            holder=holder["sid"],
+                            heartbeat_age=ts - int(holder["seen"]),
+                        )
+                if role_v == SessionRole.ORCHESTRATOR.value:
+                    # singleton takeover: demote every other holder
+                    # (stale on the normal path, any when forced)
+                    con.execute(
+                        "UPDATE sessions SET role=?, updated_at=? WHERE role=? AND session_id<>?",
+                        (
+                            SessionRole.WORKER.value,
+                            ts,
+                            SessionRole.ORCHESTRATOR.value,
+                            session_id,
+                        ),
+                    )
+                con.execute(
+                    "INSERT INTO sessions(session_id,cwd,role,status,updated_at)"
+                    " VALUES(?,?,?,?,?)"
+                    " ON CONFLICT(session_id) DO UPDATE SET"
+                    " cwd=excluded.cwd, role=excluded.role,"
+                    " status=excluded.status, updated_at=excluded.updated_at",
+                    (session_id, workspace, role_v, SessionStatus.ACTIVE.value, ts),
+                )
+                gen = con.execute(_HEARTBEAT_UPSERT, (session_id, ts)).fetchone()["generation"]
+                con.execute("COMMIT")
+                return RegisterResult(
+                    accepted=True,
+                    session_id=session_id,
+                    role=role_v,
+                    generation=int(gen),
+                )
+            except BaseException:
+                if con.in_transaction:
+                    con.execute("ROLLBACK")
+                raise
+        finally:
+            con.close()
+
+    return _retry(op)
+
+
+def heartbeat(session_id: str, *, path=None) -> int:
+    """Refresh ``last_seen_at`` for a session; returns the generation.
+
+    Inserts the worker_heartbeats row when missing (generation 1) and
+    bumps the generation on every call, per the contract: a caller
+    holding an older generation detects it has been superseded.
+    """
+    ts = _now()
+
+    def op():
+        con = connect(path)
+        try:
+            row = con.execute(_HEARTBEAT_UPSERT, (session_id, ts)).fetchone()
+            return int(row["generation"])
         finally:
             con.close()
 
