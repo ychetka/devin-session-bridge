@@ -31,7 +31,8 @@ You are the session-orchestrator (Tech Lead) for this workspace.
 
 1. Read .windsurfrules and .devin/orchestrator/PLAYBOOK.md - your
    operating contract, including the Delegation of Authority matrix.
-2. Run `bridge register --role orchestrator`. If it refuses with
+2. Run `bridge register <your-session-name> --role orchestrator`.
+   If it refuses with
    "heartbeat fresh" and you KNOW the old session is closed, rerun
    with --force.
 3. Re-ground: `bridge status`, .devin/SESSION_STATE.md,

@@ -138,7 +138,8 @@ SID              REPO             TASK                 STATE       Q FAIL    HB
 
    1. Read .windsurfrules and .devin/orchestrator/PLAYBOOK.md - your
       operating contract, including the Delegation of Authority matrix.
-   2. Run `bridge register --role orchestrator`. If it refuses with
+   2. Run `bridge register <your-session-name> --role orchestrator`.
+      If it refuses with
       "heartbeat fresh" and you KNOW the old session is closed, rerun
       with --force.
    3. Re-ground: `bridge status`, .devin/SESSION_STATE.md,
@@ -151,7 +152,7 @@ SID              REPO             TASK                 STATE       Q FAIL    HB
       format.
    ```
 
-4. The session runs `bridge register --role orchestrator`. The
+4. The session runs `bridge register <its-sid> --role orchestrator`. The
    orchestrator role is a CAS singleton: registration is refused while
    another session holds the role with a fresh heartbeat
    (`HEARTBEAT_STALE_SECONDS = 120`).
@@ -168,7 +169,7 @@ SID              REPO             TASK                 STATE       Q FAIL    HB
      wait until its heartbeat goes stale (~120s after its last
      `bridge register`) and rerun register normally.
    - The old session is known-dead (closed tab, crashed host): rerun
-     with `bridge register --role orchestrator --force`. The takeover
+     with `bridge register <its-sid> --role orchestrator --force`. The takeover
      demotes the previous holder to worker.
    - Re-registering the same sid is always accepted and bumps the
      heartbeat generation - that is how a live orchestrator refreshes
@@ -306,6 +307,9 @@ Watchdog script `~/bin/sessions-bridge-watchdog.sh`:
 # `bridge daemon start` refuses safely if the lock is actually held,
 # so a restart attempt against a live daemon is harmless.
 set -u
+# Note: SESSIONS_BRIDGE_STATE_DIR is this script's own variable, not a
+# bridge flag - it must point at the same state dir the daemon uses
+# (the directory containing state.db / --db path's parent).
 STATE_DIR="${SESSIONS_BRIDGE_STATE_DIR:-$HOME/.local/share/sessions-bridge}"
 HB="$STATE_DIR/daemon_heartbeat.txt"
 LIMIT=120
