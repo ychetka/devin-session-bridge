@@ -18,6 +18,7 @@ from session_bridge.cli import bridge
 from session_bridge.daemon import core as daemon
 from session_bridge.state import db
 from session_bridge.state.contract import (
+    CLAIM_TIMEOUT_SECONDS,
     NotificationKind,
     SessionStatus,
     TaskStatus,
@@ -289,6 +290,45 @@ def test_item13d_requeue_note_is_reset_instruction():
     assert note.startswith("requeued-dead-worker")
     assert "stash" in note
     assert "base ref" in note
+
+
+# --- item_13g: question claim janitor inside the pass ---------------------------
+
+
+def test_item13g_daemon_pass_janitors_stale_claims(env):
+    tid = db.enqueue(SID, "do the thing", path=env.db)
+    qid = db.ask(SID, tid, "which branch?", path=env.db).question_id
+    assert db.claim_question(qid, "orc1", path=env.db)
+    _exec(
+        env.db,
+        "UPDATE questions SET claimed_at=? WHERE id=?",
+        (int(time.time()) - CLAIM_TIMEOUT_SECONDS - 5, qid),
+    )
+    assert daemon.run(env.db, env.qdir, once=True) == daemon.RUN_OK
+    q = db.get_question(qid, path=env.db)
+    # the stale claim is released back to pending, same question id
+    assert q["state"] == "pending"
+    assert q["claimed_by"] is None
+    assert q["claimed_at"] is None
+    released = [d for d in _decisions(env) if d["event"] == "question_claims_released"]
+    assert len(released) == 1
+    assert "released=1" in released[0]["detail"]
+    assert str(qid) in released[0]["detail"]
+    # a quiet pass releases nothing and logs nothing
+    assert daemon.run(env.db, env.qdir, once=True) == daemon.RUN_OK
+    assert len([d for d in _decisions(env) if d["event"] == "question_claims_released"]) == 1
+
+
+def test_item13g_fresh_claim_survives_the_pass(env):
+    tid = db.enqueue(SID, "do the thing", path=env.db)
+    qid = db.ask(SID, tid, "which branch?", path=env.db).question_id
+    assert db.claim_question(qid, "orc1", path=env.db)
+    assert daemon.run(env.db, env.qdir, once=True) == daemon.RUN_OK
+    q = db.get_question(qid, path=env.db)
+    assert q["state"] == "claimed"
+    assert q["claimed_by"] == "orc1"
+    assert _decisions(env)  # daemon_start/stop lines exist
+    assert not any(d["event"] == "question_claims_released" for d in _decisions(env))
 
 
 def test_item13d_once_via_cli(env, capsys):
