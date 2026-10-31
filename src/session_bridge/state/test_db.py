@@ -19,6 +19,7 @@ from session_bridge.state.contract import (
     MAX_QUESTIONS_PER_TASK,
     AuditEventKind,
     NotificationKind,
+    SessionMode,
     SessionRole,
     Transport,
 )
@@ -1338,3 +1339,45 @@ def test_item13b3_unrelayed_per_session_filtering(db_path):
     assert db.mark_relayed(n1, path=db_path) is True
     assert [r["id"] for r in db.unrelayed_notifications("w1", path=db_path)] == [n3]
     assert [r["id"] for r in db.unrelayed_notifications(path=db_path)] == [n2, n3]
+
+
+# --- item_13c: set_session_mode (managed arm/disarm writer) --------------------
+
+
+def test_item13c_set_session_mode_cycle(db_path):
+    sid = "s-mode"
+    db.set_session_mode(sid, SessionMode.MANAGED, path=db_path)
+    row = db.get_session(sid, path=db_path)
+    assert row is not None
+    assert row["mode"] == "managed"  # arm creates the row when absent
+    db.set_session_mode(sid, SessionMode.UNMANAGED, path=db_path)
+    assert db.get_session(sid, path=db_path)["mode"] == "unmanaged"
+
+
+def test_item13c_set_session_mode_accepts_strings_and_enums(db_path):
+    db.set_session_mode("s-a", "managed", path=db_path)
+    assert db.get_session("s-a", path=db_path)["mode"] == "managed"
+    db.set_session_mode("s-a", SessionMode.UNMANAGED, path=db_path)
+    assert db.get_session("s-a", path=db_path)["mode"] == "unmanaged"
+
+
+def test_item13c_set_session_mode_preserves_other_fields(db_path):
+    sid = "s-keep"
+    db.upsert_session(sid, cwd="/repo", queue_paused=True, path=db_path)
+    db.set_session_mode(sid, SessionMode.MANAGED, path=db_path)
+    row = db.get_session(sid, path=db_path)
+    # only mode (+ updated_at) moves; the upsert fields stay put
+    assert row["mode"] == "managed"
+    assert row["cwd"] == "/repo"
+    assert row["queue_paused"] == 1
+
+
+def test_item13c_set_session_mode_validates(db_path):
+    with pytest.raises(ValueError):
+        db.set_session_mode("s-x", "bogus", path=db_path)
+    with pytest.raises(ValueError):
+        db.set_session_mode("", SessionMode.MANAGED, path=db_path)
+    assert db.get_session("s-x", path=db_path) is None
+    # and mode stays unreachable through the plain upsert whitelist
+    with pytest.raises(ValueError):
+        db.upsert_session("s-x", mode="managed", path=db_path)

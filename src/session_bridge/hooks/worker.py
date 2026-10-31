@@ -34,10 +34,19 @@ Event handling:
   ``queue_paused`` and injects nothing.
 - ``SessionStart`` records the session (cwd when the payload carries
   it) and refreshes the park budget; ``source=resume`` additionally
-  runs ``recover_stale``.
+  runs ``recover_stale``. For a managed session it also injects the
+  mailbox duty as ``additionalContext`` (restart/turn-rotation
+  re-arm).
 - ``SessionEnd`` records the fact and releases orphans: queued tasks
   of the dead session are driven to ``failed`` and tasks holding a
   lease are parked as ``awaiting_user``, all noted "session ended".
+
+Managed sessions (``sessions.mode='managed'``, armed via
+``bridge arm``) bypass the parking/smart-kick machinery entirely:
+deliveries reach them only through the fs mailbox watcher, so a
+``Stop`` is always allowed, a ``UserPromptSubmit`` kick re-injects
+the mailbox duty as a watcher-loss reminder, and a real prompt
+injects nothing.
 
 Budget accounting: ``stop_hook_active`` marks a re-armed stop chain;
 the cycle budget is consumed where the re-arm block is emitted
@@ -71,8 +80,9 @@ from session_bridge.hooks.contract import (
     UserPromptSubmitPayload,
     parse_hook_payload,
 )
+from session_bridge.mailbox import mailbox_duty_text
 from session_bridge.state import db
-from session_bridge.state.contract import TaskStatus, Transport
+from session_bridge.state.contract import SessionMode, TaskStatus, Transport
 
 __all__ = ["main"]
 
@@ -171,13 +181,30 @@ def _block(reason: str) -> str:
     return BlockOutput(reason=reason).model_dump_json()
 
 
-def _context(text: str) -> str:
+def _context(text: str, event=HookEventName.USER_PROMPT_SUBMIT) -> str:
     return ContextOutput(
         hook_specific_output=HookSpecificOutput(
-            hook_event_name=HookEventName.USER_PROMPT_SUBMIT,
+            hook_event_name=event,
             additional_context=text,
         )
     ).model_dump_json(by_alias=True)
+
+
+# --- managed mode (mailbox duty) ----------------------------------------------
+
+
+def _is_managed(session_id: str, args) -> bool:
+    """True when the session is armed (``sessions.mode='managed'``)."""
+    row = db.get_session(session_id, path=args.db)
+    return row is not None and row["mode"] == SessionMode.MANAGED.value
+
+
+def _mailbox_duty(session_id: str, args, event) -> str:
+    """additionalContext payload arming/re-arming the mailbox watcher."""
+    return _context(
+        mailbox_duty_text(session_id, queue_dir=_queue_dir(args)),
+        event,
+    )
 
 
 def _deliver_text(task) -> str:
@@ -382,6 +409,11 @@ def _park_empty(session_id: str, owner: str, args, cfg: ParkConfig):
 
 def _on_stop(p: StopPayload, args, cfg: ParkConfig | None):
     session_id = p.session_id
+    if _is_managed(session_id, args):
+        # managed sessions take deliveries only through the mailbox
+        # watcher - the parking/claim machinery below is the unmanaged
+        # path and must not double-deliver a queued task
+        return None
     owner = _owner()
     task = db.get_live_task(session_id, path=args.db)
 
@@ -422,6 +454,12 @@ def _on_stop(p: StopPayload, args, cfg: ParkConfig | None):
 def _on_user_prompt(p: UserPromptSubmitPayload, args, cfg):
     session_id = p.session_id
     text = p.prompt.strip()
+    if _is_managed(session_id, args):
+        # managed sessions get the mailbox duty on a kick instead of
+        # the smart-kick claim - the reminder re-arms a lost watcher
+        if len(text) <= 3:
+            return _mailbox_duty(session_id, args, HookEventName.USER_PROMPT_SUBMIT)
+        return None
     if len(text) > 3:
         # a real prompt: pause queue injection until the next kick
         db.session_pause(session_id, True, path=args.db)
@@ -449,6 +487,9 @@ def _on_session_start(p: SessionStartPayload, args, cfg):
     db.upsert_session(session_id, path=args.db, **fields)
     if p.source == SOURCE_RESUME:
         db.recover_stale(path=args.db)
+    if _is_managed(session_id, args):
+        # re-arm the mailbox duty after a restart or a turn rotation
+        return _mailbox_duty(session_id, args, HookEventName.SESSION_START)
     return None
 
 
