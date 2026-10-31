@@ -18,6 +18,7 @@ from session_bridge.state.contract import (
     MAX_ATTEMPTS,
     MAX_QUESTIONS_PER_TASK,
     AuditEventKind,
+    NotificationKind,
     SessionRole,
     Transport,
 )
@@ -1218,3 +1219,122 @@ def test_item13b2_audit_insert_append_only(db_path):
 
     with pytest.raises(ValueError):
         db.audit("bogus-kind", path=db_path)
+
+
+def test_item13b3_gwt1_unrelayed_row_survives_relay_crash(db_path):
+    # notify() commits the row with relayed_at/ack_at NULL - a relay
+    # killed between the commit and the fs-write/mark must not lose it
+    nid = db.notify("w1", NotificationKind.DIRECTIVE, "steer left", task_id=7, path=db_path)
+    assert nid is not None
+    row = _one(db_path, "SELECT * FROM notifications WHERE id=?", (nid,))
+    assert row["session_id"] == "w1"
+    assert row["kind"] == "directive"
+    assert row["body"] == "steer left"
+    assert row["task_id"] == 7
+    assert row["question_id"] is None
+    assert row["relayed_at"] is None
+    assert row["ack_at"] is None
+    assert abs(row["created_at"] - time.time()) < 5
+
+    # a relay pass that dies after the scan leaves the row unrelayed;
+    # the retry pass picks the same row up - nothing is lost
+    assert [r["id"] for r in db.unrelayed_notifications(path=db_path)] == [nid]
+    assert [r["id"] for r in db.unrelayed_notifications(path=db_path)] == [nid]
+    assert db.mark_relayed(nid, path=db_path) is True
+    assert db.unrelayed_notifications(path=db_path) == []
+
+
+def test_item13b3_gwt2_mark_relayed_idempotent_no_duplicate_signal(db_path):
+    nid = db.notify("w1", "heartbeat_tick", "ping", path=db_path)
+    assert db.mark_relayed(nid, path=db_path) is True
+    relayed = _one(db_path, "SELECT relayed_at FROM notifications WHERE id=?", (nid,))["relayed_at"]
+    assert relayed is not None
+
+    # a replayed mark loses the CAS: False and relayed_at untouched, so
+    # the caller cannot take it as a fresh write-the-mailbox signal
+    assert db.mark_relayed(nid, path=db_path) is False
+    row = _one(db_path, "SELECT relayed_at FROM notifications WHERE id=?", (nid,))
+    assert row["relayed_at"] == relayed
+
+    # two racing relays: exactly one wins the mark
+    nid2 = db.notify("w1", "heartbeat_tick", "ping2", path=db_path)
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        results = list(ex.map(lambda _: db.mark_relayed(nid2, path=db_path), range(8)))
+    assert results.count(True) == 1
+
+
+def test_item13b3_gwt3_restart_redelivers_unacked(db_path):
+    n1 = db.notify("w1", "task_dispatch", "run task", task_id=1, path=db_path)
+    n2 = db.notify("w1", "directive", "steer", path=db_path)
+    n3 = db.notify("w2", "disarm", "teardown", path=db_path)
+
+    # w1 consumes n1 and advances its ack watermark past it
+    assert db.ack_notifications("w1", up_to_id=n1, path=db_path) == 1
+    row = _one(db_path, "SELECT ack_at FROM notifications WHERE id=?", (n1,))
+    assert row["ack_at"] is not None
+
+    # restart: level-triggered - w1 sees exactly the rows it has not
+    # acked, ordered for reprocessing; w2's rows are not its business
+    assert [r["id"] for r in db.unacked_notifications("w1", path=db_path)] == [n2]
+    assert [r["id"] for r in db.unacked_notifications("w2", path=db_path)] == [n3]
+
+    # re-acking the same watermark is a no-op on already-acked rows
+    assert db.ack_notifications("w1", up_to_id=n1, path=db_path) == 0
+    # a full ack clears the restart view; other recipients untouched
+    assert db.ack_notifications("w1", path=db_path) == 1
+    assert db.unacked_notifications("w1", path=db_path) == []
+    assert [r["id"] for r in db.unacked_notifications("w2", path=db_path)] == [n3]
+
+
+def test_item13b3_notify_validates_kind_and_session(db_path):
+    # enum and plain string kinds are both accepted
+    nid = db.notify("w1", NotificationKind.QUESTION_ANSWER, "use main", question_id=3, path=db_path)
+    row = _one(db_path, "SELECT kind, question_id FROM notifications WHERE id=?", (nid,))
+    assert row["kind"] == "question_answer"
+    assert row["question_id"] == 3
+    nid2 = db.notify("w1", "disarm", "x", path=db_path)
+    assert nid2 == nid + 1
+
+    with pytest.raises(ValueError):
+        db.notify("w1", "bogus-kind", "x", path=db_path)
+    with pytest.raises(ValueError):
+        db.notify("", "directive", "x", path=db_path)
+    with pytest.raises(ValueError):
+        db.notify("   ", "directive", "x", path=db_path)
+    with pytest.raises(ValueError):
+        db.notify("w1", "directive", "", path=db_path)
+    # nothing was written by the refused calls
+    assert _one(db_path, "SELECT COUNT(*) AS c FROM notifications")["c"] == 2
+
+
+def test_item13b3_unrelayed_scan_uses_partial_index(db_path):
+    # the index the relay scan relies on exists with the declared shape
+    idx = _one(
+        db_path,
+        "SELECT sql FROM sqlite_master WHERE name='ix_notifications_unrelayed'",
+    )
+    assert idx is not None
+    assert "WHERE relayed_at IS NULL" in idx["sql"]
+    # and the planner actually picks it for the relay scan
+    plan = _one(
+        db_path,
+        "EXPLAIN QUERY PLAN SELECT * FROM notifications WHERE relayed_at IS NULL",
+    )
+    assert "ix_notifications_unrelayed" in plan["detail"]
+
+
+def test_item13b3_unrelayed_per_session_filtering(db_path):
+    n1 = db.notify("w1", "directive", "for w1", path=db_path)
+    n2 = db.notify("w2", "directive", "for w2", path=db_path)
+    n3 = db.notify("w1", "disarm", "w1 again", path=db_path)
+
+    # the full scan is oldest-first; the session filter narrows it
+    assert [r["id"] for r in db.unrelayed_notifications(path=db_path)] == [n1, n2, n3]
+    assert [r["id"] for r in db.unrelayed_notifications("w1", path=db_path)] == [n1, n3]
+    assert [r["id"] for r in db.unrelayed_notifications("w2", path=db_path)] == [n2]
+    assert db.unrelayed_notifications("nobody", path=db_path) == []
+
+    # a marked row leaves every unrelayed view
+    assert db.mark_relayed(n1, path=db_path) is True
+    assert [r["id"] for r in db.unrelayed_notifications("w1", path=db_path)] == [n3]
+    assert [r["id"] for r in db.unrelayed_notifications(path=db_path)] == [n2, n3]

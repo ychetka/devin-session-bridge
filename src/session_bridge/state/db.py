@@ -23,6 +23,13 @@ channel (``questions``, one pending per task enforced by a partial
 unique index) and the append-only ``audit_events`` journal. Both are
 plain CREATE TABLE IF NOT EXISTS additions - an existing state.db
 picks them up on the next init() with no migration.
+
+Bus slice 3 (item_13b3) adds the ``notifications`` outbox
+(orchestrator>worker and system notices): rows commit with
+``relayed_at`` NULL, the daemon relay marks them after the fs mailbox
+write (at-least-once delivery, idempotent consume by id), and the
+recipient's ``ack_at`` watermark drives level-triggered restart
+recovery.
 """
 
 import json
@@ -43,6 +50,7 @@ from .contract import (
     MAX_QUESTIONS_PER_TASK,
     WRITER_RETRIES,
     AuditEventKind,
+    NotificationKind,
     QuestionState,
     SessionRole,
     SessionStatus,
@@ -181,6 +189,28 @@ CREATE TABLE IF NOT EXISTS audit_events (
   answered_at INTEGER,
   created_at INTEGER NOT NULL
 );
+
+-- Notifications outbox (orchestrator > worker and system notices).
+-- ``session_id`` is the recipient. ``relayed_at`` stays NULL until the
+-- daemon relay writes the fs mailbox file; ``ack_at`` is the consuming
+-- session's restart watermark. ``task_id``/``question_id`` are optional
+-- routing refs the consumer correlates deliveries on.
+CREATE TABLE IF NOT EXISTS notifications (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  body TEXT NOT NULL,
+  task_id INTEGER,
+  question_id INTEGER,
+  relayed_at INTEGER,
+  ack_at INTEGER,
+  created_at INTEGER NOT NULL
+);
+
+-- Backs the relay loop's unrelayed scan; rows leave the index the
+-- moment relayed_at is marked.
+CREATE INDEX IF NOT EXISTS ix_notifications_unrelayed
+  ON notifications(relayed_at) WHERE relayed_at IS NULL;
 
 PRAGMA user_version=1;
 """
@@ -1519,6 +1549,153 @@ def audit(
                 ),
             )
             return cur.lastrowid
+        finally:
+            con.close()
+
+    return _retry(op)
+
+
+# --- message bus: notifications outbox ----------------------------------------
+
+_NOTIFICATION_KINDS = frozenset(k.value for k in NotificationKind)
+
+
+def notify(
+    session_id: str,
+    kind,
+    body: str,
+    task_id: int | None = None,
+    question_id: int | None = None,
+    *,
+    path=None,
+) -> int:
+    """Append one row to the notifications outbox; returns its id.
+
+    The row commits with ``relayed_at``/``ack_at`` NULL: the daemon
+    relay loop picks it up via the ``ix_notifications_unrelayed``
+    partial index, writes the fs mailbox file and then marks
+    ``relayed_at``. ``kind`` accepts the contract enum or its string
+    value; ``task_id``/``question_id`` are optional routing refs the
+    consumer correlates deliveries on.
+    """
+    if not session_id or not session_id.strip():
+        raise ValueError("notify requires a session_id")
+    kind_v = _val(kind)
+    if kind_v not in _NOTIFICATION_KINDS:
+        raise ValueError(f"unknown notification kind: {kind_v!r}")
+    if not body:
+        raise ValueError("notify requires a body")
+    ts = _now()
+
+    def op():
+        con = connect(path)
+        try:
+            cur = con.execute(
+                "INSERT INTO notifications"
+                "(session_id,kind,body,task_id,question_id,created_at)"
+                " VALUES(?,?,?,?,?,?)",
+                (session_id, kind_v, body, task_id, question_id, ts),
+            )
+            return cur.lastrowid
+        finally:
+            con.close()
+
+    return _retry(op)
+
+
+def unrelayed_notifications(session_id: str | None = None, *, path=None) -> list:
+    """Outbox rows still waiting for the relay, oldest first.
+
+    ``WHERE relayed_at IS NULL`` is backed by the
+    ``ix_notifications_unrelayed`` partial index - this is the scan the
+    daemon relay loop runs, so a row committed but never marked (relay
+    killed between the two steps) is always picked up on the next
+    pass. ``session_id`` narrows the scan to one recipient.
+    """
+
+    def op():
+        con = connect(path)
+        try:
+            if session_id is not None:
+                return con.execute(
+                    "SELECT * FROM notifications WHERE relayed_at IS NULL"
+                    " AND session_id=? ORDER BY id",
+                    (session_id,),
+                ).fetchall()
+            return con.execute(
+                "SELECT * FROM notifications WHERE relayed_at IS NULL ORDER BY id"
+            ).fetchall()
+        finally:
+            con.close()
+
+    return _retry(op)
+
+
+def mark_relayed(notification_id: int, *, path=None) -> bool:
+    """CAS ``relayed_at NULL > now`` after the fs mailbox write.
+
+    A single guarded UPDATE: exactly one caller wins the mark, so a
+    relay crash between the fs write and the mark re-delivers the row
+    on the next pass (at-least-once) while a replayed mark loses the
+    CAS and changes nothing - no duplicate relay signal.
+    """
+    ts = _now()
+
+    def op():
+        con = connect(path)
+        try:
+            cur = con.execute(
+                "UPDATE notifications SET relayed_at=? WHERE id=? AND relayed_at IS NULL",
+                (ts, notification_id),
+            )
+            return cur.rowcount == 1
+        finally:
+            con.close()
+
+    return _retry(op)
+
+
+def unacked_notifications(session_id: str, *, path=None) -> list:
+    """Notifications the recipient has not acked yet, oldest first.
+
+    This is the restart-recovery read: the ack watermark is
+    level-triggered, so a restarted session sees exactly the rows it
+    still must process - the watcher dedups by ``id`` on consumption.
+    """
+
+    def op():
+        con = connect(path)
+        try:
+            return con.execute(
+                "SELECT * FROM notifications WHERE session_id=? AND ack_at IS NULL ORDER BY id",
+                (session_id,),
+            ).fetchall()
+        finally:
+            con.close()
+
+    return _retry(op)
+
+
+def ack_notifications(session_id: str, up_to_id: int | None = None, *, path=None) -> int:
+    """Advance the recipient's ack watermark; returns rows acked.
+
+    Sets ``ack_at`` on every unacked row for ``session_id`` (or only up
+    to ``up_to_id``). The ``ack_at IS NULL`` guard keeps it idempotent:
+    rows already acked are never touched again, so a repeated call
+    only moves the watermark forward over newly arrived rows.
+    """
+    ts = _now()
+
+    def op():
+        con = connect(path)
+        try:
+            sql = "UPDATE notifications SET ack_at=? WHERE session_id=? AND ack_at IS NULL"
+            args: list = [ts, session_id]
+            if up_to_id is not None:
+                sql += " AND id<=?"
+                args.append(up_to_id)
+            cur = con.execute(sql, args)
+            return cur.rowcount
         finally:
             con.close()
 
