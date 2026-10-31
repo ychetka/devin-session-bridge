@@ -10,9 +10,10 @@ status lifecycle, the lease fields and the retry boundary:
   ``failed``: it moves the task back to ``queued`` and resets ``attempt``.
 
 Message bus schema v2 (item_13a) extends the contract with the
-orchestration protocol tables: session roles/modes and heartbeat
-generations, the question claim protocol, the notifications outbox,
-worker heartbeats and the append-only audit log.
+orchestration protocol tables: session roles/modes, the question
+claim protocol, the notifications outbox, worker heartbeats (the
+authoritative liveness/generation rows) and the append-only audit
+log.
 """
 
 from enum import Enum
@@ -281,7 +282,13 @@ class SessionStatus(str, Enum):
 
 
 class Session(BaseModel):
-    """Row model for the ``sessions`` table."""
+    """Row model for the ``sessions`` table.
+
+    Liveness and the heartbeat generation counter live in
+    ``WorkerHeartbeat`` rows (table ``worker_heartbeats``), which are
+    the single source of truth - the sessions row is not denormalized
+    with them.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
@@ -293,9 +300,6 @@ class Session(BaseModel):
     role: SessionRole = SessionRole.WORKER
     mode: SessionMode = SessionMode.UNMANAGED
     status: SessionStatus = SessionStatus.ACTIVE
-    # Bumped by every (re-)register; a writer holding a stale
-    # generation knows it has been superseded.
-    heartbeat_generation: int = Field(default=0, ge=0)
     note: str | None = None
     updated_at: int
 
@@ -415,6 +419,41 @@ class Question(BaseModel):
     claimed_at: int | None = None
     answered_at: int | None = None
 
+    @model_validator(mode="after")
+    def _state_fields_coherent(self) -> "Question":
+        """Keep the state column and its phase fields in lockstep.
+
+        PENDING carries no claim/answer fields; CLAIMED requires
+        ``claimed_by`` + ``claimed_at`` and still has no answer fields;
+        ANSWERED requires ``answer`` + ``answered_at`` and keeps the
+        claim fields (the row passed through claimed). The janitor
+        path stays expressible: ``release_claim`` clears the claim
+        fields when it returns a stale CLAIMED row to PENDING.
+        """
+        if self.state is QuestionState.PENDING:
+            leftovers = [
+                name
+                for name in ("claimed_by", "claimed_at", "answer", "answered_at")
+                if getattr(self, name) is not None
+            ]
+            if leftovers:
+                raise ValueError(f"pending question must not carry {', '.join(leftovers)}")
+        elif self.state is QuestionState.CLAIMED:
+            if self.claimed_by is None or self.claimed_at is None:
+                raise ValueError("claimed question requires claimed_by and claimed_at")
+            if self.answer is not None or self.answered_at is not None:
+                raise ValueError("claimed question must not carry answer/answered_at")
+        elif (
+            self.claimed_by is None
+            or self.claimed_at is None
+            or self.answer is None
+            or self.answered_at is None
+        ):
+            raise ValueError(
+                "answered question requires claimed_by, claimed_at, answer and answered_at"
+            )
+        return self
+
     def transition_to(
         self,
         to_state: QuestionState,
@@ -449,6 +488,23 @@ class Question(BaseModel):
         )
 
 
+class NotificationKind(str, Enum):
+    """What a ``notifications`` row delivers to its recipient.
+
+    Consumers route mailbox deliveries by kind plus the correlation
+    refs ``task_id``/``question_id``: TASK_DISPATCH hands the worker a
+    task, QUESTION_ANSWER carries the orchestrator's answer to a
+    pending question, DIRECTIVE is a steering instruction, DISARM
+    orders a watcher/turn teardown, HEARTBEAT_TICK is a liveness poke.
+    """
+
+    TASK_DISPATCH = "task_dispatch"
+    QUESTION_ANSWER = "question_answer"
+    DIRECTIVE = "directive"
+    DISARM = "disarm"
+    HEARTBEAT_TICK = "heartbeat_tick"
+
+
 class Notification(BaseModel):
     """Row model for the ``notifications`` outbox table.
 
@@ -456,24 +512,35 @@ class Notification(BaseModel):
     ``relayed_at`` NULL; the daemon relay loop writes the fs mailbox
     file, then marks ``relayed_at``. Delivery is at-least-once - a
     relay crash between the fs write and the mark re-delivers the same
-    row, so consumers must deduplicate by ``id`` (idempotent
-    consumption). ``ack_at`` is the restart watermark: the orchestrator
-    records what it has consumed, so a restart resumes from the
-    watermark without double-processing.
+    row, so consumers deduplicate by ``id`` (idempotent consumption)
+    and route by ``kind`` plus the correlation refs
+    ``task_id``/``question_id`` (e.g. a QUESTION_ANSWER delivery is
+    matched to the pending question it resolves). ``ack_at`` is the
+    consuming session's restart watermark: the recipient records what
+    it has processed, so a restart resumes from the watermark without
+    double-processing.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     id: int | None = Field(default=None, ge=1)  # SQLite AUTOINCREMENT
     session_id: str = Field(min_length=1)  # recipient session
+    kind: NotificationKind
     body: str = Field(min_length=1)
+    # Optional correlation refs the consumer routes on.
+    task_id: int | None = Field(default=None, ge=1)
+    question_id: int | None = Field(default=None, ge=1)
     relayed_at: int | None = None  # NULL until the daemon relay marks it
-    ack_at: int | None = None  # orchestrator restart watermark
+    ack_at: int | None = None  # recipient session restart watermark
     created_at: int
 
 
 class WorkerHeartbeat(BaseModel):
-    """Row model for the ``worker_heartbeat`` table.
+    """Row model for the ``worker_heartbeats`` table (plural, per the
+    repo table-naming convention; the model name stays singular).
+
+    This row is authoritative for liveness and the generation counter -
+    the ``sessions`` row is not denormalized with either.
 
     ``register`` inserts the row; every re-register and heartbeat bumps
     ``generation``, so a caller holding a stale generation detects it
@@ -508,10 +575,12 @@ class AuditEventKind(str, Enum):
 class AuditEvent(BaseModel):
     """Row model for the ``audit_events`` table (append-only log).
 
-    A DELIBERATION row stores the worker question verbatim, both
-    partner outputs verbatim, the orchestrator synthesis and the
-    directive sent back, plus the phase timestamps of the underlying
-    question (``asked_at``/``claimed_at``/``answered_at``).
+    A DELIBERATION row stores the worker question verbatim, the partner
+    outputs verbatim (``partner_outputs`` keyed by partner name, so
+    partner rotation changes dict keys, not the schema), the
+    orchestrator synthesis and the directive sent back, plus the phase
+    timestamps of the underlying question
+    (``asked_at``/``claimed_at``/``answered_at``).
     ``doa_trigger`` names the delegation-of-authority whitelist rule
     that fired; NULL when the committee answered autonomously.
     """
@@ -524,8 +593,8 @@ class AuditEvent(BaseModel):
     task_id: int | None = Field(default=None, ge=1)
     question_id: int | None = Field(default=None, ge=1)
     question_text: str | None = None
-    gemini_output: str | None = None
-    copilot_output: str | None = None
+    # Partner outputs verbatim, keyed by partner name - rotation-proof.
+    partner_outputs: dict[str, str] = Field(default_factory=dict)
     synthesis: str | None = None
     directive: str | None = None
     doa_trigger: str | None = None

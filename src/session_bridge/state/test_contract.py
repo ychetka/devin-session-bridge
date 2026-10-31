@@ -20,6 +20,7 @@ from session_bridge.state.contract import (
     AuditEvent,
     AuditEventKind,
     Notification,
+    NotificationKind,
     Question,
     QuestionState,
     Session,
@@ -279,8 +280,9 @@ def test_item13a_gwt2_question_invalid_edges_rejected() -> None:
             validate_question_transition(src, dst)
     # the janitor edge is not on the regular path
     assert not is_valid_question_transition(QuestionState.CLAIMED, QuestionState.PENDING)
+    claimed = _question(state=QuestionState.CLAIMED, claimed_by="o", claimed_at=50)
     with pytest.raises(ValidationError):
-        _question(state=QuestionState.CLAIMED).transition_to(QuestionState.PENDING)
+        claimed.transition_to(QuestionState.PENDING)
 
 
 def test_item13a_gwt2_janitor_release_preserves_question_id() -> None:
@@ -295,6 +297,45 @@ def test_item13a_gwt2_janitor_release_preserves_question_id() -> None:
     assert QuestionState.PENDING in QUESTION_JANITOR_TRANSITIONS[QuestionState.CLAIMED]
     assert QuestionState.PENDING not in QUESTION_TRANSITIONS[QuestionState.CLAIMED]
     assert is_valid_question_transition(QuestionState.CLAIMED, QuestionState.PENDING, janitor=True)
+
+
+def test_item13a_gwt2_question_state_field_coherence() -> None:
+    # claimed requires the claim fields
+    with pytest.raises(ValidationError):
+        _question(state=QuestionState.CLAIMED)
+    with pytest.raises(ValidationError):
+        _question(state=QuestionState.CLAIMED, claimed_by="o")
+    # claimed must not carry answer fields yet
+    with pytest.raises(ValidationError):
+        _question(
+            state=QuestionState.CLAIMED,
+            claimed_by="o",
+            claimed_at=50,
+            answer="x",
+        )
+    # answered requires the answer fields and keeps the claim fields
+    with pytest.raises(ValidationError):
+        _question(state=QuestionState.ANSWERED, answer="x", answered_at=60)
+    with pytest.raises(ValidationError):
+        _question(
+            state=QuestionState.ANSWERED,
+            claimed_by="o",
+            claimed_at=50,
+            answer="x",
+        )
+    ok = _question(
+        state=QuestionState.ANSWERED,
+        claimed_by="o",
+        claimed_at=50,
+        answer="x",
+        answered_at=60,
+    )
+    assert ok.state is QuestionState.ANSWERED
+    # pending carries no claim/answer leftovers
+    with pytest.raises(ValidationError):
+        _question(claimed_by="o")
+    with pytest.raises(ValidationError):
+        _question(answered_at=60)
 
 
 def test_item13a_gwt1_unique_pending_per_task_is_db_level() -> None:
@@ -312,22 +353,44 @@ def test_item13a_gwt1_unique_pending_per_task_is_db_level() -> None:
 
 def test_item13a_gwt3_notification_outbox_semantics() -> None:
     # writer commits with relayed_at NULL; the daemon relay marks it
-    n = Notification(session_id="w1", body="task #1 assigned", created_at=100)
+    n = Notification(
+        session_id="w1",
+        kind=NotificationKind.TASK_DISPATCH,
+        task_id=1,
+        body="task #1 assigned",
+        created_at=100,
+    )
     assert n.relayed_at is None
     assert n.ack_at is None
     r = Notification(
         id=5,
         session_id="w1",
-        body="task #1 assigned",
+        kind=NotificationKind.QUESTION_ANSWER,
+        task_id=1,
+        question_id=9,
+        body="answer to question #9",
         relayed_at=110,
         ack_at=120,
         created_at=100,
     )
     assert Notification.model_validate_json(r.model_dump_json()) == r
     # at-least-once delivery: a relay retry re-delivers the same row id,
-    # which is the consumer's idempotent-dedup key
+    # which is the consumer's idempotent-dedup key; the kind + refs are
+    # the routing key to the pending question
     redelivery = r.model_copy()
     assert redelivery.id == r.id
+    assert r.kind is NotificationKind.QUESTION_ANSWER
+    assert r.question_id == 9
+    # kind is required for correlation; the refs stay optional
+    with pytest.raises(ValidationError):
+        Notification(session_id="w1", body="b", created_at=100)
+    assert {k.value for k in NotificationKind} == {
+        "task_dispatch",
+        "question_answer",
+        "directive",
+        "disarm",
+        "heartbeat_tick",
+    }
 
 
 def test_item13a_worker_heartbeat_generation() -> None:
@@ -346,8 +409,10 @@ def test_item13a_audit_event_verbatim_and_rotation_kinds() -> None:
         task_id=3,
         question_id=9,
         question_text="which endpoint?",
-        gemini_output="verbatim gemini",
-        copilot_output="verbatim copilot",
+        partner_outputs={
+            "gemini": "verbatim gemini",
+            "copilot": "verbatim copilot",
+        },
         synthesis="use /v2",
         directive="call /v2/items",
         asked_at=100,
@@ -373,13 +438,13 @@ def test_item13a_session_orchestration_fields() -> None:
     assert s.role is SessionRole.WORKER
     assert s.mode is SessionMode.UNMANAGED
     assert s.status is SessionStatus.ACTIVE
-    assert s.heartbeat_generation == 0
+    # liveness/generation live in WorkerHeartbeat, not on the session
+    assert "heartbeat_generation" not in Session.model_fields
     o = Session(
         session_id="o1",
         role=SessionRole.ORCHESTRATOR,
         mode=SessionMode.MANAGED,
         status=SessionStatus.DEAD,
-        heartbeat_generation=7,
         updated_at=1,
     )
     assert Session.model_validate_json(o.model_dump_json()) == o
@@ -397,7 +462,15 @@ def test_item13a_task_accepts_run_after() -> None:
 def test_item13a_models_reject_extra_fields() -> None:
     cases = [
         (Question, {"task_id": 1, "session_id": "w1", "text": "t", "asked_at": 1}),
-        (Notification, {"session_id": "w1", "body": "b", "created_at": 1}),
+        (
+            Notification,
+            {
+                "session_id": "w1",
+                "kind": NotificationKind.DIRECTIVE,
+                "body": "b",
+                "created_at": 1,
+            },
+        ),
         (WorkerHeartbeat, {"session_id": "w1", "last_seen_at": 1}),
         (AuditEvent, {"kind": AuditEventKind.DELIBERATION, "created_at": 1}),
         (Session, {"session_id": "s1", "updated_at": 1}),
