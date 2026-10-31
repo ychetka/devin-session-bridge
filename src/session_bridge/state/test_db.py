@@ -21,6 +21,8 @@ from session_bridge.state.contract import (
     NotificationKind,
     SessionMode,
     SessionRole,
+    SessionStatus,
+    TaskStatus,
     Transport,
 )
 
@@ -1381,3 +1383,63 @@ def test_item13c_set_session_mode_validates(db_path):
     # and mode stays unreachable through the plain upsert whitelist
     with pytest.raises(ValueError):
         db.upsert_session("s-x", mode="managed", path=db_path)
+
+
+# --- item_13d: supervisor writers (set_session_status + requeue_dead_worker) -----
+
+
+def test_item13d_set_session_status_transition_dedup(db_path):
+    sid = "s-st"
+    db.upsert_session(sid, cwd="/repo", path=db_path)
+    # first flip wins, the repeat loses - this is what dedups the
+    # daemon's per-cycle dead-marking
+    assert db.set_session_status(sid, "dead", path=db_path) is True
+    assert db.set_session_status(sid, "dead", path=db_path) is False
+    assert db.get_session(sid, path=db_path)["status"] == "dead"
+    # revival flip works the same way
+    assert db.set_session_status(sid, SessionStatus.ACTIVE, path=db_path) is True
+    assert db.get_session(sid, path=db_path)["status"] == "active"
+
+
+def test_item13d_set_session_status_validates(db_path):
+    with pytest.raises(ValueError):
+        db.set_session_status("s-x", "bogus", path=db_path)
+    with pytest.raises(ValueError):
+        db.set_session_status(" ", "dead", path=db_path)
+    # a missing sessions row is not created (no upsert)
+    assert db.set_session_status("ghost", "dead", path=db_path) is False
+    assert db.get_session("ghost", path=db_path) is None
+
+
+def test_item13d_requeue_dead_worker_running_to_queued(db_path):
+    tid = _enqueue_running(db_path, "s-dead")
+    note = "requeued-dead-worker: reset"
+    assert db.requeue_dead_worker(tid, note=note, path=db_path) is TaskStatus.QUEUED
+    row = db.get_task(tid, path=db_path)
+    assert row["status"] == "queued"
+    assert row["attempt"] == 1
+    assert row["lease_owner"] is None
+    assert row["lease_expires_at"] is None
+    assert row["note"] == note
+
+
+def test_item13d_requeue_dead_worker_covers_all_live_statuses(db_path):
+    # queued
+    t1 = db.enqueue("s-a", "t1", path=db_path)
+    assert db.requeue_dead_worker(t1, path=db_path) is TaskStatus.QUEUED
+    # awaiting_user
+    t2 = _enqueue_running(db_path, "s-b")
+    assert db.set_awaiting_user(t2, "w1", path=db_path)
+    assert db.requeue_dead_worker(t2, path=db_path) is TaskStatus.QUEUED
+    # dispatch_decided (claimed, transport not yet run)
+    t3 = db.enqueue("s-c", "t3", path=db_path)
+    assert db.claim_queued(t3, "w3", Transport.ACP_PUSH, path=db_path)
+    assert db.requeue_dead_worker(t3, path=db_path) is TaskStatus.QUEUED
+
+
+def test_item13d_requeue_dead_worker_fails_at_attempt_budget(db_path):
+    tid = _enqueue_running(db_path, "s-poison")
+    _exec(db_path, "UPDATE tasks SET attempt=? WHERE id=?", (MAX_ATTEMPTS - 1, tid))
+    assert db.requeue_dead_worker(tid, path=db_path) is TaskStatus.FAILED
+    # terminal row is out of the live set - the CAS loses on replay
+    assert db.requeue_dead_worker(tid, path=db_path) is None

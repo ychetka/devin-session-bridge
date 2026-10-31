@@ -40,6 +40,7 @@ import argparse
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -55,6 +56,7 @@ from session_bridge.cli.contract import (
     ExitCode,
     JsonResponse,
 )
+from session_bridge.daemon import core as daemon
 from session_bridge.state import db
 from session_bridge.state.contract import (
     LEASE_SECONDS,
@@ -1276,6 +1278,175 @@ def _cmd_disarm(args) -> int:
     return _emit(args, resp, ExitCode.OK, human)
 
 
+# --- daemon: external supervisor (item_13d) --------------------------------------
+
+#: grace period for SIGTERM before ``daemon stop`` reports a wedged daemon
+DAEMON_STOP_TIMEOUT_SECONDS = 5.0
+
+
+def _state_dir(args) -> str:
+    base = args.db if args.db else db.DB_PATH
+    return os.path.dirname(os.path.abspath(base))
+
+
+def _spawn_daemon(args) -> subprocess.Popen:
+    """Detach the supervisor child (``bridge daemon run``).
+
+    Mirrors ``_spawn_worker``: PYTHONPATH carries a source checkout,
+    stderr lands in ``<state_dir>/logs/daemon.log`` so the detached
+    process stays diagnosable. The child itself takes daemon.lock.
+    """
+    argv = [sys.executable, "-m", "session_bridge.cli.bridge"]
+    if args.db:
+        argv += ["--db", args.db]
+    if args.queue_dir:
+        argv += ["--queue-dir", args.queue_dir]
+    argv += ["daemon", "run"]
+    if getattr(args, "interval", None):
+        argv += ["--interval", str(args.interval)]
+    env = dict(os.environ)
+    src = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    prev = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = f"{src}{os.pathsep}{prev}" if prev else src
+    stderr: object = subprocess.DEVNULL
+    log_fh = None
+    try:
+        os.makedirs(_logs_dir(args), exist_ok=True)
+        log_fh = open(os.path.join(_logs_dir(args), "daemon.log"), "ab")
+        stderr = log_fh
+    except OSError as e:
+        _log(f"cannot open daemon log: {e}")
+    try:
+        proc = subprocess.Popen(
+            argv,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=stderr,
+            start_new_session=True,
+            close_fds=True,
+            env=env,
+        )
+    finally:
+        if log_fh is not None:
+            log_fh.close()  # the child keeps its own dup of the fd
+    return proc
+
+
+def _daemon_start(args) -> int:
+    sdir = _state_dir(args)
+    if daemon.daemon_running(sdir):
+        resp = JsonResponse(
+            status="running",
+            error="daemon already running (daemon.lock held)",
+            agent_instruction="do not retry: a daemon already holds daemon.lock",
+            data={"pid": daemon.daemon_pid(sdir), "state_dir": sdir},
+        )
+        return _emit(args, resp, ExitCode.CONFLICT, "daemon already running")
+    try:
+        proc = _spawn_daemon(args)
+    except OSError as e:
+        resp = JsonResponse(status="internal", error=f"daemon spawn failed: {e}")
+        return _emit(args, resp, ExitCode.INTERNAL, f"error: daemon spawn failed: {e}")
+    resp = JsonResponse(
+        status="started",
+        queue_depth=_queue_depth(args),
+        data={"pid": proc.pid, "state_dir": sdir},
+    )
+    return _emit(args, resp, ExitCode.OK, f"daemon started (pid {proc.pid})")
+
+
+def _daemon_stop(args) -> int:
+    sdir = _state_dir(args)
+    if not daemon.daemon_running(sdir):
+        resp = JsonResponse(status="not_running", data={"state_dir": sdir})
+        return _emit(args, resp, ExitCode.OK, "daemon not running")
+    pid = daemon.daemon_pid(sdir)
+    if pid is None:
+        resp = JsonResponse(
+            status="running",
+            error="daemon running but its pid is unreadable in daemon.lock",
+        )
+        return _emit(args, resp, ExitCode.INTERNAL, "error: daemon running but pid unreadable")
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass  # already gone; the lock release check below reports it
+    except OSError as e:
+        resp = JsonResponse(status="running", error=f"SIGTERM to pid {pid} failed: {e}")
+        return _emit(args, resp, ExitCode.INTERNAL, f"error: SIGTERM failed: {e}")
+    deadline = time.time() + DAEMON_STOP_TIMEOUT_SECONDS
+    while time.time() < deadline:
+        if not daemon.daemon_running(sdir):
+            resp = JsonResponse(status="stopped", data={"pid": pid, "state_dir": sdir})
+            return _emit(args, resp, ExitCode.OK, f"daemon stopped (pid {pid})")
+        time.sleep(0.1)
+    resp = JsonResponse(
+        status="running",
+        error=f"daemon pid {pid} did not exit within {DAEMON_STOP_TIMEOUT_SECONDS}s",
+    )
+    return _emit(args, resp, ExitCode.INTERNAL, "error: daemon did not stop")
+
+
+def _daemon_status(args) -> int:
+    sdir = _state_dir(args)
+    running = daemon.daemon_running(sdir)
+    pid = daemon.daemon_pid(sdir)
+    age = daemon.heartbeat_age(sdir)
+    resp = JsonResponse(
+        status="running" if running else "stopped",
+        data={
+            "pid": pid,
+            "heartbeat_age_seconds": age,
+            "state_dir": sdir,
+        },
+    )
+    human = (
+        f"daemon {'running' if running else 'stopped'}"
+        f" (pid {pid if pid is not None else '-'},"
+        f" heartbeat age {age if age is not None else '-'}s)"
+    )
+    return _emit(args, resp, ExitCode.OK, human)
+
+
+def _daemon_once(args) -> int:
+    rc = daemon.run(args.db, args.queue_dir, once=True)
+    if rc == daemon.RUN_LOCK_HELD:
+        resp = JsonResponse(
+            status="conflict",
+            error="daemon.lock is held; a daemon is already running",
+        )
+        return _emit(args, resp, ExitCode.CONFLICT, "conflict: daemon already running")
+    resp = JsonResponse(status="ok", queue_depth=_queue_depth(args))
+    return _emit(args, resp, ExitCode.OK, "daemon pass complete")
+
+
+def _daemon_run(args) -> int:
+    rc = daemon.run(args.db, args.queue_dir, once=False, interval=args.interval)
+    if rc == daemon.RUN_LOCK_HELD:
+        resp = JsonResponse(
+            status="conflict",
+            error="daemon.lock is held; a daemon is already running",
+        )
+        return _emit(args, resp, ExitCode.CONFLICT, "conflict: daemon already running")
+    return _emit(args, JsonResponse(status="stopped"), ExitCode.OK, "daemon stopped")
+
+
+def _cmd_daemon(args) -> int:
+    action = args.daemon_action
+    if action == "start":
+        return _daemon_start(args)
+    if action == "stop":
+        return _daemon_stop(args)
+    if action == "status":
+        return _daemon_status(args)
+    if action == "once":
+        return _daemon_once(args)
+    if action == "run":
+        return _daemon_run(args)
+    resp = JsonResponse(status="usage", error=f"unknown daemon action: {action}")
+    return _emit(args, resp, ExitCode.USAGE, f"usage: unknown daemon action {action}")
+
+
 # --- entry point -----------------------------------------------------------------
 
 
@@ -1343,6 +1514,35 @@ def _parse_args(argv) -> argparse.Namespace:
     )
     _add_json(sp)
 
+    # supervisor daemon (item_13d); literal command name like
+    # arm/disarm - the Command enum in cli/contract.py is frozen
+    sp = sub.add_parser(
+        "daemon",
+        help="supervisor daemon: outbox relay + liveness sweep",
+    )
+    dsub = sp.add_subparsers(dest="daemon_action", required=True)
+    sp_start = dsub.add_parser("start", help="spawn the detached daemon")
+    sp_start.add_argument(
+        "--interval",
+        type=float,
+        default=None,
+        help="seconds between passes (default: env or 5)",
+    )
+    _add_json(sp_start)
+    sp_stop = dsub.add_parser("stop", help="SIGTERM the running daemon")
+    _add_json(sp_stop)
+    sp_status = dsub.add_parser("status", help="daemon liveness + heartbeat age")
+    _add_json(sp_status)
+    sp_once = dsub.add_parser("once", help="one relay+sweep pass, then exit")
+    _add_json(sp_once)
+    sp_run = dsub.add_parser(
+        "run",
+        help="internal: foreground supervisor loop (used by 'daemon start')",
+    )
+    sp_run.add_argument("--interval", type=float, default=None)
+    _add_json(sp_run)
+    _add_json(sp)
+
     sp = sub.add_parser(
         Command.WORK.value,
         help=argparse.SUPPRESS,  # internal worker
@@ -1365,6 +1565,7 @@ _HANDLERS = {
     Command.WORK.value: _cmd_work,
     "arm": _cmd_arm,
     "disarm": _cmd_disarm,
+    "daemon": _cmd_daemon,
 }
 
 
