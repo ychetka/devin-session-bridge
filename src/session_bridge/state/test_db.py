@@ -14,6 +14,7 @@ from session_bridge.state.contract import (
     BUSY_TIMEOUT_MS,
     LEASE_SECONDS,
     MAX_ATTEMPTS,
+    SessionRole,
     Transport,
 )
 
@@ -754,3 +755,162 @@ def test_item04_trigger_filename_sanitized():
         assert "/" not in name and "\\" not in name
         assert not name.startswith(".")
     assert db.trigger_filename("") == "sid.json"
+
+
+def test_item13b1_gwt1_orchestrator_cas_singleton(db_path):
+    res = db.register("orc1", "/repo", role="orchestrator", path=db_path)
+    assert res.accepted is True
+    assert res.role == "orchestrator"
+    assert res.generation == 1
+    assert res.holder is None
+
+    # a second orchestrator is refused while orc1's heartbeat is fresh:
+    # no state is written for the rejected aspirant
+    res = db.register("orc2", "/repo2", role="orchestrator", path=db_path)
+    assert res.accepted is False
+    assert res.holder == "orc1"
+    assert res.heartbeat_age is not None
+    assert 0 <= res.heartbeat_age < db.HEARTBEAT_STALE_SECONDS
+    assert res.generation is None
+    assert db.get_session("orc2", path=db_path) is None
+
+    # the holder re-registering itself never blocks on its own heartbeat
+    res = db.register("orc1", "/repo", role="orchestrator", path=db_path)
+    assert res.accepted is True
+
+    # stale heartbeat -> takeover without force; the old holder is demoted
+    _exec(
+        db_path,
+        "UPDATE worker_heartbeats SET last_seen_at=? WHERE session_id=?",
+        (int(time.time()) - db.HEARTBEAT_STALE_SECONDS - 1, "orc1"),
+    )
+    res = db.register("orc2", "/repo2", role="orchestrator", path=db_path)
+    assert res.accepted is True
+    assert db.get_session("orc2", path=db_path)["role"] == "orchestrator"
+    assert db.get_session("orc1", path=db_path)["role"] == "worker"
+
+    # force overrides a live holder
+    res = db.register("orc3", "/repo3", role="orchestrator", force=True, path=db_path)
+    assert res.accepted is True
+    assert db.get_session("orc3", path=db_path)["role"] == "orchestrator"
+    assert db.get_session("orc2", path=db_path)["role"] == "worker"
+
+    # an orchestrator row with no heartbeat at all never blocks
+    _exec(db_path, "UPDATE sessions SET role='worker' WHERE session_id='orc3'")
+    _exec(
+        db_path,
+        "INSERT INTO sessions(session_id,role,updated_at) VALUES('ghost','orchestrator',1)",
+    )
+    res = db.register("orc4", "/repo4", role="orchestrator", path=db_path)
+    assert res.accepted is True
+    assert db.get_session("ghost", path=db_path)["role"] == "worker"
+
+    # worker registration is independent of the orchestrator slot
+    res = db.register("w1", "/repo", path=db_path)
+    assert res.accepted is True and res.role == "worker"
+    assert db.get_session("orc4", path=db_path)["role"] == "orchestrator"
+
+
+def test_item13b1_gwt2_reregister_bumps_generation(db_path):
+    r1 = db.register("w1", "/repo", path=db_path)
+    assert r1.generation == 1
+    r2 = db.register("w1", "/repo", path=db_path)
+    assert r2.generation == 2
+    # a caller still holding generation 1 detects it has been superseded
+    current = _one(
+        db_path,
+        "SELECT generation FROM worker_heartbeats WHERE session_id='w1'",
+    )["generation"]
+    assert current == r2.generation
+    assert r1.generation < current
+
+
+def test_item13b1_worker_register_upsert(db_path):
+    res = db.register("w1", "/repo", path=db_path)
+    assert res.accepted is True
+    assert res.role == "worker"
+    row = db.get_session("w1", path=db_path)
+    assert row["role"] == "worker"
+    assert row["mode"] == "unmanaged"
+    assert row["status"] == "active"
+    # the contract workspace maps onto the cwd column
+    assert row["cwd"] == "/repo"
+    hb = _one(db_path, "SELECT * FROM worker_heartbeats WHERE session_id='w1'")
+    assert hb["generation"] == 1
+    assert abs(hb["last_seen_at"] - time.time()) < 5
+
+    # re-register updates cwd and preserves fields written by other paths
+    db.upsert_session("w1", title="t", path=db_path)
+    res = db.register("w1", "/repo2", path=db_path)
+    assert res.generation == 2
+    row = db.get_session("w1", path=db_path)
+    assert row["cwd"] == "/repo2"
+    assert row["title"] == "t"
+
+    # contract enums are accepted alongside plain strings
+    res = db.register("w2", "/repo", role=SessionRole.ORCHESTRATOR, path=db_path)
+    assert res.accepted and res.role == "orchestrator"
+    with pytest.raises(ValueError):
+        db.register("w3", "/repo", role="bogus", path=db_path)
+
+
+def test_item13b1_heartbeat_refresh(db_path):
+    # heartbeat on an unknown session creates the row at generation 1
+    assert db.heartbeat("w1", path=db_path) == 1
+    hb = _one(db_path, "SELECT * FROM worker_heartbeats WHERE session_id='w1'")
+    assert abs(hb["last_seen_at"] - time.time()) < 5
+
+    # a later heartbeat refreshes last_seen_at and bumps the generation
+    stale = int(time.time()) - db.HEARTBEAT_STALE_SECONDS - 10
+    _exec(
+        db_path,
+        "UPDATE worker_heartbeats SET last_seen_at=? WHERE session_id='w1'",
+        (stale,),
+    )
+    assert db.heartbeat("w1", path=db_path) == 2
+    hb = _one(db_path, "SELECT * FROM worker_heartbeats WHERE session_id='w1'")
+    assert hb["last_seen_at"] > stale
+
+
+def test_item13b1_migration_old_schema_db(tmp_path):
+    # a populated pre-v2 state.db: sessions without role/mode/status,
+    # no worker_heartbeats table
+    path = str(tmp_path / "state.db")
+    con = sqlite3.connect(path)
+    con.executescript(
+        """
+        CREATE TABLE sessions(
+          session_id TEXT PRIMARY KEY,
+          cwd TEXT,
+          title TEXT,
+          queue_paused INTEGER NOT NULL DEFAULT 0,
+          park_cycles_left INTEGER NOT NULL DEFAULT 5,
+          note TEXT,
+          updated_at INTEGER NOT NULL
+        );
+        INSERT INTO sessions(session_id,cwd,title,updated_at)
+          VALUES('s1','/old','t',1);
+        """
+    )
+    con.commit()
+    con.close()
+
+    db.init(path)
+    row = db.get_session("s1", path=path)
+    # existing rows survive; new columns carry the contract defaults
+    assert row["cwd"] == "/old"
+    assert row["title"] == "t"
+    assert row["role"] == "worker"
+    assert row["mode"] == "unmanaged"
+    assert row["status"] == "active"
+    assert _one(path, "SELECT COUNT(*) AS c FROM worker_heartbeats")["c"] == 0
+
+    # the migration is idempotent
+    db.init(path)
+
+    # the migrated file serves the full bus flow
+    res = db.register("s1", "/new", path=path)
+    assert res.accepted is True and res.generation == 1
+    assert db.get_session("s1", path=path)["cwd"] == "/new"
+    res = db.register("orc", "/repo", role="orchestrator", path=path)
+    assert res.accepted is True
