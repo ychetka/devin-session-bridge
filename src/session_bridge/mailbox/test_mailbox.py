@@ -230,8 +230,8 @@ def test_item13c_gwt2_duty_text_required_instructions(qdir):
     assert "before your turn ends" in text
     assert str(TURN_TTL_CYCLES) in text
     assert "SessionStart" in text
-    # ack + disarm exit
-    assert f"bridge ack {SID}" in text
+    # ack + disarm exit (item_13g: argparse requires --session)
+    assert f"bridge ack --session {SID}" in text
     assert "disarm" in text
 
 

@@ -1164,17 +1164,18 @@ def _status_snapshot(args) -> dict:
     ]
     # the orchestrator counts as dead when the supervisor marked it or
     # its heartbeat already slipped past the bounded stale window - the
-    # banner must not wait for the next daemon pass to fire
+    # banner must not wait for the next daemon pass to fire; the
+    # ``>=`` boundary mirrors the daemon sweep (age == STALE is dead)
     if orchestrator is not None and (
         orchestrator["session_status"] == SessionStatus.DEAD.value
         or orchestrator["heartbeat_age_seconds"] is None
-        or orchestrator["heartbeat_age_seconds"] > db.HEARTBEAT_STALE_SECONDS
+        or orchestrator["heartbeat_age_seconds"] >= db.HEARTBEAT_STALE_SECONDS
     ):
         attention.append(
             {
                 "kind": "orchestrator_dead",
                 "session_id": orchestrator["session_id"],
-                "hint": ("reopen session, bridge register --role orchestrator [--force]"),
+                "hint": ("reopen session, bridge register <new-sid> --role orchestrator [--force]"),
             }
         )
 
@@ -1214,7 +1215,8 @@ def _attention_lines(snap) -> list[str]:
         lines.append(f"+{hidden} more open escalation(s) - bridge escalate show")
     if any(a["kind"] == "orchestrator_dead" for a in snap["attention"]):
         lines.append(
-            "ORCHESTRATOR DEAD: reopen session, bridge register --role orchestrator [--force]"
+            "ORCHESTRATOR DEAD: reopen session, bridge register <new-sid>"
+            " --role orchestrator [--force]"
         )
     return lines
 
@@ -1691,6 +1693,140 @@ def _cmd_ack(args) -> int:
     if args.up_to is not None:
         human += f" up to {args.up_to}"
     return _emit(args, resp, ExitCode.OK, human)
+
+
+def _cmd_heartbeat(args) -> int:
+    """``bridge heartbeat <sid>``: the liveness metronome (item_13g).
+
+    Deliberately lighter than ``register``: it touches only the
+    ``worker_heartbeats`` row - no sessions upsert, no role change, no
+    orchestrator CAS - so a watcher cycle can keep its own session
+    alive without ever taking the orchestrator role over or reviving
+    a dead row (``register`` remains the ownership transition). The
+    bumped generation is returned so a holder detects supersession.
+    """
+    generation = db.heartbeat(args.session_id, path=args.db)
+    resp = JsonResponse(
+        session=args.session_id,
+        status="ok",
+        data={"generation": generation},
+    )
+    human = f"{args.session_id} heartbeat ok (generation {generation})"
+    return _emit(args, resp, ExitCode.OK, human)
+
+
+# --- orchestrator question queue: list / claim / answer (item_13g) ---------------
+
+
+def _question_view(q) -> dict:
+    """One question row folded into the CLI payload."""
+    return {
+        "id": q["id"],
+        "task_id": q["task_id"],
+        "session_id": q["session_id"],
+        "state": q["state"],
+        "text": q["text"],
+        "claimed_by": q["claimed_by"],
+        "answer": q["answer"],
+    }
+
+
+def _questions_list(args) -> int:
+    rows = db.list_pending_questions(task_id=args.task, path=args.db)
+    if args.session:
+        rows = [q for q in rows if q["session_id"] == args.session]
+    items = [_question_view(q) for q in rows]
+    resp = JsonResponse(status="ok", data={"questions": items})
+    if not items:
+        return _emit(args, resp, ExitCode.OK, "(no pending questions)")
+    lines = [
+        f"question {i['id']} (task {i['task_id']}, session {i['session_id']}): {i['text']}"
+        for i in items
+    ]
+    return _emit(args, resp, ExitCode.OK, "\n".join(lines))
+
+
+def _claim_refusal(args, qid: int, action: str) -> int:
+    """Shared CONFLICT/NOT_FOUND response for a lost claim/answer CAS."""
+    q = db.get_question(qid, path=args.db)
+    if q is None:
+        resp = JsonResponse(status="not_found", error=f"question {qid} not found")
+        return _emit(args, resp, ExitCode.NOT_FOUND, f"not found: question {qid}")
+    detail = f"question {qid} is {q['state']}"
+    if q["claimed_by"]:
+        detail += f" (claimed by {q['claimed_by']})"
+    resp = JsonResponse(
+        status=q["state"],
+        error=f"cannot {action}: {detail}",
+        agent_instruction=(
+            "do not retry: the claim was lost - a stale claim returns to"
+            " pending via the daemon janitor, then it can be claimed again"
+        ),
+        data=_question_view(q),
+    )
+    return _emit(args, resp, ExitCode.CONFLICT, f"conflict: {detail}")
+
+
+def _questions_claim(args) -> int:
+    qid = args.question_id
+    if not db.claim_question(qid, args.claimant, path=args.db):
+        return _claim_refusal(args, qid, "claim")
+    resp = JsonResponse(
+        status=QuestionState.CLAIMED.value,
+        data={"question_id": qid, "claimed_by": args.claimant},
+    )
+    return _emit(args, resp, ExitCode.OK, f"question {qid} claimed by {args.claimant}")
+
+
+def _questions_answer(args) -> int:
+    """Answer a claimed question; the claimant binding is the CAS guard.
+
+    On success the asking session gets a QUESTION_ANSWER outbox row so
+    the daemon relay delivers the answer into its mailbox - the same
+    path the orchestrator playbook documents for the Python API.
+    """
+    qid = args.question_id
+    if not args.text.strip():
+        resp = JsonResponse(status="usage", error="answer requires non-empty text")
+        return _emit(
+            args,
+            resp,
+            ExitCode.USAGE,
+            "usage: bridge questions answer <qid> --claimant SID <text>",
+        )
+    if not db.answer_question(qid, args.text, claimant=args.claimant, path=args.db):
+        return _claim_refusal(args, qid, "answer")
+    q = db.get_question(qid, path=args.db)
+    db.notify(
+        q["session_id"],
+        NotificationKind.QUESTION_ANSWER,
+        args.text,
+        task_id=q["task_id"],
+        question_id=qid,
+        path=args.db,
+    )
+    resp = JsonResponse(
+        session=q["session_id"],
+        status=QuestionState.ANSWERED.value,
+        data={
+            "question_id": qid,
+            "task_id": q["task_id"],
+            "notified": True,
+        },
+    )
+    return _emit(args, resp, ExitCode.OK, f"question {qid} answered")
+
+
+def _cmd_questions(args) -> int:
+    action = args.questions_action
+    if action == "list":
+        return _questions_list(args)
+    if action == "claim":
+        return _questions_claim(args)
+    if action == "answer":
+        return _questions_answer(args)
+    resp = JsonResponse(status="usage", error=f"unknown questions action: {action}")
+    return _emit(args, resp, ExitCode.USAGE, f"usage: unknown questions action {action}")
 
 
 # --- escalations: show / reply ----------------------------------------------------
@@ -2193,6 +2329,38 @@ def _parse_args(argv) -> argparse.Namespace:
     )
     _add_json(sp)
 
+    # liveness metronome + orchestrator question queue (item_13g);
+    # literal names like arm/disarm - the Command enum is frozen
+    sp = sub.add_parser(
+        "heartbeat",
+        help="refresh the session heartbeat (light metronome, no register CAS)",
+    )
+    sp.add_argument("session_id")
+    _add_json(sp)
+
+    sp = sub.add_parser(
+        "questions",
+        help="orchestrator question queue: list / claim / answer",
+    )
+    qsub = sp.add_subparsers(dest="questions_action", required=True)
+    sp_list = qsub.add_parser("list", help="list pending questions")
+    sp_list.add_argument("--session", default=None, help="filter to one asking session")
+    sp_list.add_argument("--task", type=int, default=None, help="filter to one task id")
+    _add_json(sp_list)
+    sp_claim = qsub.add_parser("claim", help="claim a pending question")
+    sp_claim.add_argument("question_id", type=int)
+    sp_claim.add_argument("--claimant", required=True, help="claiming session id")
+    _add_json(sp_claim)
+    sp_answer = qsub.add_parser(
+        "answer",
+        help="answer a claimed question (claimant-bound CAS)",
+    )
+    sp_answer.add_argument("question_id", type=int)
+    sp_answer.add_argument("--claimant", required=True, help="claimant binding for the answer CAS")
+    sp_answer.add_argument("text", help="answer text")
+    _add_json(sp_answer)
+    _add_json(sp)
+
     sp = sub.add_parser(
         "escalate",
         help="human escalation queue: show / reply",
@@ -2235,6 +2403,8 @@ _HANDLERS = {
     "register": _cmd_register,
     "ask": _cmd_ask,
     "ack": _cmd_ack,
+    "heartbeat": _cmd_heartbeat,
+    "questions": _cmd_questions,
     "escalate": _cmd_escalate,
 }
 

@@ -27,6 +27,7 @@ from session_bridge.cli.contract import (
     JsonResponse,
 )
 from session_bridge.daemon import core as daemon
+from session_bridge.mailbox import mailbox_duty_text
 from session_bridge.state import db
 from session_bridge.state.contract import (
     AuditEventKind,
@@ -1152,7 +1153,7 @@ def test_item13e2_orchestrator_dead_banner_and_hint(env, capsys):
     lines = _status_human(capsys)
     assert len(lines) < 25
     assert (
-        "ORCHESTRATOR DEAD: reopen session, bridge register --role orchestrator [--force]"
+        "ORCHESTRATOR DEAD: reopen session, bridge register <new-sid> --role orchestrator [--force]"
     ) in lines
     assert any(line.startswith("orchestrator: orc1") for line in lines)
     # a live heartbeat clears the banner
@@ -1232,3 +1233,169 @@ def test_item13e2_status_json_carries_fleet_detail(env, capsys):
     assert fleet["w1"]["attempt"] == 0
     assert fleet["w1"]["heartbeat_age_seconds"] is not None
     assert data["digest_24h"] == {"done": 0, "auto_decisions": 0, "escalations": 1}
+
+
+# --- item_13g: protocol wiring gaps ------------------------------------------
+
+
+def _heartbeat_seen(path, sid):
+    """The raw worker_heartbeats.last_seen_at for a session."""
+    con = db.connect(path)
+    try:
+        row = con.execute(
+            "SELECT last_seen_at FROM worker_heartbeats WHERE session_id=?",
+            (sid,),
+        ).fetchone()
+        return row["last_seen_at"] if row is not None else None
+    finally:
+        con.close()
+
+
+def test_item13g_gwt1_heartbeat_refreshes_last_seen(env, capsys):
+    _run(["register", "w1", "--json"], capsys)
+    _stale_heartbeat(env.db, "w1")
+    rc, out = _run(["heartbeat", "w1", "--json"], capsys)
+    assert rc == ExitCode.OK
+    assert out["session"] == "w1"
+    # register stamped generation 1; the heartbeat bumps it, not resets it
+    assert out["data"]["generation"] == 2
+    assert abs(_heartbeat_seen(env.db, "w1") - int(time.time())) < 5
+
+
+def test_item13g_gwt1_heartbeat_is_not_a_takeover(env, capsys):
+    _run(["register", "orc1", "--role", "orchestrator", "--json"], capsys)
+    rc, out = _run(["heartbeat", "w9", "--json"], capsys)
+    assert rc == ExitCode.OK
+    # heartbeat touches only worker_heartbeats: no sessions row, and the
+    # orchestrator keeps its role
+    assert db.get_session("w9", path=env.db) is None
+    assert db.get_session("orc1", path=env.db)["role"] == "orchestrator"
+    # the register CAS still guards the singleton: a fresh holder
+    # refuses a challenger, --force takes over
+    rc, out = _run(["register", "orc2", "--role", "orchestrator", "--json"], capsys)
+    assert rc == ExitCode.CONFLICT
+    assert out["data"]["holder"] == "orc1"
+    rc, out = _run(["register", "orc2", "--role", "orchestrator", "--force", "--json"], capsys)
+    assert rc == ExitCode.OK
+
+
+def test_item13g_gwt2_questions_claim_and_answer_binding(env, capsys):
+    tid = _task(env)
+    qid = db.ask(SID, tid, "which branch?", path=env.db).question_id
+    # claim binds the claimant
+    rc, out = _run(["questions", "claim", str(qid), "--claimant", "orc1", "--json"], capsys)
+    assert rc == ExitCode.OK
+    assert out["status"] == "claimed"
+    assert out["data"]["claimed_by"] == "orc1"
+    # a second claim loses the CAS
+    rc, out = _run(["questions", "claim", str(qid), "--claimant", "orc2", "--json"], capsys)
+    assert rc == ExitCode.CONFLICT
+    assert "orc1" in out["error"]
+    # an answer bound to the wrong claimant is refused (13e1 binding)
+    rc, out = _run(
+        ["questions", "answer", str(qid), "--claimant", "orc2", "use dev", "--json"],
+        capsys,
+    )
+    assert rc == ExitCode.CONFLICT
+    q = db.get_question(qid, path=env.db)
+    assert q["state"] == "claimed"
+    assert q["claimed_by"] == "orc1"
+    assert q["answer"] is None
+    # the right claimant answers; the asker gets a QUESTION_ANSWER
+    # outbox row for the daemon relay -> fs mailbox path
+    rc, out = _run(
+        ["questions", "answer", str(qid), "--claimant", "orc1", "use main", "--json"],
+        capsys,
+    )
+    assert rc == ExitCode.OK
+    assert out["status"] == "answered"
+    assert out["data"]["notified"] is True
+    q = db.get_question(qid, path=env.db)
+    assert q["state"] == "answered"
+    assert q["answer"] == "use main"
+    rows = db.unrelayed_notifications(SID, path=env.db)
+    assert len(rows) == 1
+    assert rows[0]["kind"] == NotificationKind.QUESTION_ANSWER.value
+    assert rows[0]["question_id"] == qid
+    assert rows[0]["task_id"] == tid
+
+
+def test_item13g_questions_list_filters_and_pending_only(env, capsys):
+    t1 = _task(env, sid="w1")
+    t2 = _task(env, sid="w2")
+    q1 = db.ask("w1", t1, "q one", path=env.db).question_id
+    q2 = db.ask("w2", t2, "q two", path=env.db).question_id
+    rc, out = _run(["questions", "list", "--json"], capsys)
+    assert rc == ExitCode.OK
+    assert [i["id"] for i in out["data"]["questions"]] == [q1, q2]
+    rc, out = _run(["questions", "list", "--session", "w1", "--json"], capsys)
+    assert [i["id"] for i in out["data"]["questions"]] == [q1]
+    rc, out = _run(["questions", "list", "--task", str(t2), "--json"], capsys)
+    assert [i["id"] for i in out["data"]["questions"]] == [q2]
+    # a claimed question leaves the pending queue the list reads
+    assert db.claim_question(q1, "orc1", path=env.db)
+    rc, out = _run(["questions", "list", "--json"], capsys)
+    assert [i["id"] for i in out["data"]["questions"]] == [q2]
+
+
+def test_item13g_questions_answer_pending_and_unknown(env, capsys):
+    tid = _task(env)
+    qid = db.ask(SID, tid, "q?", path=env.db).question_id
+    # a pending question cannot be answered - claim comes first
+    rc, _out = _run(
+        ["questions", "answer", str(qid), "--claimant", "orc1", "a", "--json"],
+        capsys,
+    )
+    assert rc == ExitCode.CONFLICT
+    rc, _out = _run(["questions", "claim", "999", "--claimant", "orc1", "--json"], capsys)
+    assert rc == ExitCode.NOT_FOUND
+    rc, _out = _run(
+        ["questions", "answer", "999", "--claimant", "orc1", "a", "--json"],
+        capsys,
+    )
+    assert rc == ExitCode.NOT_FOUND
+
+
+def test_item13g_gwt3_duty_text_ack_command_runs(env, capsys):
+    # the duty text instructs the exact argparse surface
+    text = mailbox_duty_text(SID, queue_dir=str(env.qdir))
+    assert f"bridge ack --session {SID}" in text
+    assert f"bridge ack {SID}" not in text
+    # and the documented command runs end-to-end
+    db.notify(SID, NotificationKind.DIRECTIVE, "steer", path=env.db)
+    rc, out = _run(["ack", "--session", SID, "--json"], capsys)
+    assert rc == ExitCode.OK
+    assert out["data"]["acked"] == 1
+
+
+def test_item13g_orchestrator_dead_banner_sid_placeholder(env, capsys):
+    _run(["register", "orc1", "--role", "orchestrator", "--json"], capsys)
+    _stale_heartbeat(env.db, "orc1")
+    lines = _status_human(capsys)
+    assert (
+        "ORCHESTRATOR DEAD: reopen session, bridge register <new-sid> --role orchestrator [--force]"
+    ) in lines
+    _rc, out = _run(["status", "--json"], capsys)
+    dead = [a for a in out["data"]["attention"] if a["kind"] == "orchestrator_dead"]
+    assert dead[0]["session_id"] == "orc1"
+    assert "<new-sid>" in dead[0]["hint"]
+    # the hinted command is complete and runnable: the dead holder's
+    # own re-register wins the CAS without --force
+    rc, out = _run(["register", "orc1", "--role", "orchestrator", "--json"], capsys)
+    assert rc == ExitCode.OK
+
+
+def test_item13g_stale_boundary_matches_daemon(env, capsys):
+    # age == HEARTBEAT_STALE_SECONDS is dead for the daemon sweep
+    # (last_seen_at <= cutoff); status must agree on the same boundary
+    _run(["register", "orc1", "--role", "orchestrator", "--json"], capsys)
+    con = db.connect(env.db)
+    try:
+        con.execute(
+            "UPDATE worker_heartbeats SET last_seen_at=? WHERE session_id=?",
+            (int(time.time()) - db.HEARTBEAT_STALE_SECONDS, "orc1"),
+        )
+    finally:
+        con.close()
+    lines = _status_human(capsys)
+    assert any(line.startswith("ORCHESTRATOR DEAD") for line in lines)

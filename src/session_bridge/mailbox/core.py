@@ -274,8 +274,8 @@ a background watcher keeps your turn open and wakes you on delivery.
    - heartbeat_tick: liveness poke - no work needed.
    - disarm: managed mode is off - do NOT re-arm a watcher; resume
      normal unmanaged operation.
-4. If `bridge ack` is available, run `bridge ack {session_id}` after
-   processing to advance your restart-ack watermark.
+4. If `bridge ack` is available, run `bridge ack --session {session_id}`
+   after processing to advance your restart-ack watermark.
 5. ALWAYS re-arm: before your turn ends, spawn a NEW watcher subagent
    for the next cycle. Never end a managed turn without a live
    watcher unless a disarm arrived.

@@ -53,11 +53,11 @@ Registration and heartbeats:
   Refused while another holder's heartbeat is younger than
   `HEARTBEAT_STALE_SECONDS` (120s); `--force` takes over and demotes
   the old holder to worker.
-- Your heartbeat (`worker_heartbeats.last_seen_at`) is stamped only by
-  `bridge register` - there is no `bridge heartbeat` command. Re-run
-  `bridge register <sid> --role orchestrator` on every watcher cycle
-  (it always succeeds for the current holder and bumps the
-  generation); otherwise the daemon marks you dead after 120s.
+- Your heartbeat (`worker_heartbeats.last_seen_at`) is stamped by
+  `bridge heartbeat <sid>` - run it on every watcher cycle (it bumps
+  the generation without touching the orchestrator CAS); otherwise
+  the daemon marks you dead after 120s. `bridge register` also
+  re-stamps as a side effect.
 - `bridge status` - fleet re-grounding (attention banner, vitals,
   fleet table, 24h digest). `--json` for the uncapped payload.
 
@@ -225,9 +225,8 @@ Your inbox is the same fs mailbox as a worker's:
   turn cleanly - the `SessionStart` hook re-injects the mailbox duty
   and re-arms automatically. This bounds context growth (~11k
   tokens/cycle).
-- On every watcher cycle also re-run `bridge register <sid> --role
-  orchestrator` - it is the heartbeat write that keeps you inside the
-  120s stale window.
+- On every watcher cycle also run `bridge heartbeat <sid>` - it is
+  the heartbeat write that keeps you inside the 120s stale window.
 - Between watcher completions, work the question queue: claim,
   committee, directive, audit. Deliveries meanwhile are also how
   worker `bridge ask` results and task completions reach you - the

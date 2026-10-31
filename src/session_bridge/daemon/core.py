@@ -14,7 +14,11 @@ session. A single instance per state dir is enforced by
    instruction for the next worker, a silent orchestrator raises one
    deduped ``notify-send`` (both deduped by the ``active > dead``
    transition-CAS in ``set_session_status``);
-3. stamps ``daemon_heartbeat.txt`` so an external watchdog
+3. janitors stale question claims: ``db.janitor_questions`` returns
+   every claim older than ``CLAIM_TIMEOUT_SECONDS`` to ``pending``,
+   so a claim whose orchestrator died mid-deliberation never wedges
+   the question (one released ids line per pass in the decision log);
+4. stamps ``daemon_heartbeat.txt`` so an external watchdog
    (cron/systemd timer) can detect a dead or hung daemon.
 
 Every decision is appended to ``daemon_decisions.jsonl`` under the
@@ -379,6 +383,23 @@ def _sweep_pass(db_path, state_directory, notify_send, now: int) -> None:
         )
 
 
+def _question_janitor_pass(db_path, state_directory) -> None:
+    """Release question claims that outlived CLAIM_TIMEOUT_SECONDS.
+
+    Runs every pass - it is a single guarded UPDATE, cheap when idle.
+    A question claimed by an orchestrator that died mid-deliberation
+    returns to ``pending`` (same id, no re-ask) instead of hanging
+    forever; released ids land in the decision log.
+    """
+    released = db.janitor_questions(path=db_path)
+    if released:
+        _decision(
+            state_directory,
+            "question_claims_released",
+            detail=f"released={len(released)} ids={released}",
+        )
+
+
 # --- main loop -------------------------------------------------------------------------
 
 
@@ -449,6 +470,7 @@ def run(
             try:
                 _relay_pass(db_path, queue_dir, state_directory)
                 _sweep_pass(db_path, state_directory, notify, int(time.time()))
+                _question_janitor_pass(db_path, state_directory)
             except Exception as e:
                 if once:
                     raise

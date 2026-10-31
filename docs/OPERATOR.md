@@ -455,6 +455,10 @@ Global flags: `--db PATH` (`SESSIONS_BRIDGE_DB`), `--queue-dir DIR`
 | `bridge register <sid> [--role worker\|orchestrator] [--workspace DIR] [--force]` | join the bus and stamp the heartbeat; orchestrator is a CAS singleton. |
 | `bridge ask --session SID --task ID "text"` | post a worker question; refused when another question is pending (`pending_exists`) or the task hit the 3-question budget (`question_limit`). |
 | `bridge ack --session SID [--up-to N]` | advance the session's mailbox ack watermark. |
+| `bridge heartbeat <sid>` | refresh the session's liveness record (bumps the heartbeat generation; no takeover semantics). |
+| `bridge questions list [--session SID] [--task ID]` | list pending worker questions. |
+| `bridge questions claim <qid> --claimant SID` | atomically claim a question for answering. |
+| `bridge questions answer <qid> --claimant SID "text"` | answer a claimed question and notify the asker. |
 | `bridge escalate show` | list open escalations. |
 | `bridge escalate reply <id> A\|B\|defer\|abort\|override:<text>` | resolve an escalation (see Playbook 3). |
 | `bridge daemon start\|stop\|status\|once\|run` | supervisor lifecycle (see above). |
@@ -462,14 +466,13 @@ Global flags: `--db PATH` (`SESSIONS_BRIDGE_DB`), `--queue-dir DIR`
 ## Session heartbeats
 
 `worker_heartbeats.last_seen_at` is the liveness record the daemon
-sweeps and `bridge status` reports. In the current CLI the only
-command that refreshes it is `bridge register` - every register call
-re-stamps the heartbeat and bumps the generation counter, so a
+sweeps and `bridge status` reports. Two commands refresh it:
+`bridge heartbeat <sid>` (lightweight, heartbeat only) and
+`bridge register` (which also re-stamps + bumps the generation), so a
 session that must stay "alive" for longer than the 120s stale window
-should re-run `bridge register` with its usual arguments (the
-orchestrator does this on every mailbox-watcher cycle; see
-docs/orchestrator/PLAYBOOK.md). There is no separate `bridge
-heartbeat` command.
+should run `bridge heartbeat` on every mailbox-watcher cycle (the
+orchestrator does this per its watcher loop; see
+docs/orchestrator/PLAYBOOK.md).
 
 ## DoA matrix (summary)
 
