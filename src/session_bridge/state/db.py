@@ -655,6 +655,61 @@ def recover_stale(*, path=None) -> list[int]:
     return recovered
 
 
+def requeue_dead_worker(task_id: int, note: str | None = None, *, path=None):
+    """Supervisor requeue for a live task whose session went dead.
+
+    ``requeue_or_fail`` is triggered by an expired lease; this writer's
+    trigger is the daemon's dead-session verdict (item_13d): any live
+    status folds to ``queued`` inside the attempt budget, otherwise to
+    terminal ``failed`` - the attempt counter is incremented and the
+    lease fields are cleared either way. A single CAS guarded on the
+    live-status set keeps a racing ``finish_task`` or claim consistent:
+    exactly one side wins. Returns the new ``TaskStatus`` or ``None``
+    when the task already left the live set.
+    """
+    ts = _now()
+    guard = f" WHERE id=? AND status IN ({_LIVE_SQL})"
+
+    def op():
+        con = connect(path)
+        try:
+            cur = con.execute(
+                "UPDATE tasks SET status=?, attempt=attempt+1,"
+                " lease_owner=NULL, lease_expires_at=NULL,"
+                " lease_renewed_at=NULL,"
+                " note=COALESCE(?,note), updated_at=?" + guard + " AND attempt+1<?",
+                (
+                    TaskStatus.QUEUED.value,
+                    note,
+                    ts,
+                    task_id,
+                    MAX_ATTEMPTS,
+                ),
+            )
+            if cur.rowcount == 1:
+                return TaskStatus.QUEUED
+            cur = con.execute(
+                "UPDATE tasks SET status=?, attempt=attempt+1,"
+                " lease_owner=NULL, lease_expires_at=NULL,"
+                " lease_renewed_at=NULL,"
+                " note=COALESCE(?,note), updated_at=?" + guard + " AND attempt+1>=?",
+                (
+                    TaskStatus.FAILED.value,
+                    note,
+                    ts,
+                    task_id,
+                    MAX_ATTEMPTS,
+                ),
+            )
+            if cur.rowcount == 1:
+                return TaskStatus.FAILED
+            return None
+        finally:
+            con.close()
+
+    return _retry(op)
+
+
 def finish_task(
     task_id: int,
     owner: str,
@@ -1141,6 +1196,42 @@ def set_session_mode(session_id: str, mode, *, path=None) -> None:
             con.close()
 
     _retry(op)
+
+
+_SESSION_STATUSES = frozenset(s.value for s in SessionStatus)
+
+
+def set_session_status(session_id: str, status, *, path=None) -> bool:
+    """Set ``sessions.status`` (active|dead); True only on a real flip.
+
+    Supervisor writer (item_13d): like ``mode``, ``status`` stays out
+    of the ``_SESSION_FIELDS`` upsert whitelist so the liveness verdict
+    goes through this dedicated writer only. The ``status<>target``
+    guard makes the write a transition-CAS: only the caller that
+    actually flips the bit returns True, which is what dedups the
+    daemon's per-cycle dead-marking - the side effects (task requeue,
+    orchestrator notify-send) fire once per ``active > dead`` edge,
+    and ``register`` revives the row back to ``active``.
+    """
+    status_v = _val(status)
+    if status_v not in _SESSION_STATUSES:
+        raise ValueError(f"unknown session status: {status_v!r}")
+    if not session_id or not session_id.strip():
+        raise ValueError("set_session_status requires a session_id")
+    ts = _now()
+
+    def op():
+        con = connect(path)
+        try:
+            cur = con.execute(
+                "UPDATE sessions SET status=?, updated_at=? WHERE session_id=? AND status<>?",
+                (status_v, ts, session_id, status_v),
+            )
+            return cur.rowcount == 1
+        finally:
+            con.close()
+
+    return _retry(op)
 
 
 # --- message bus: register + heartbeat ----------------------------------------
