@@ -1,5 +1,6 @@
 """Persistence and concurrency tests for the state.db layer (item_04)."""
 
+import json
 import multiprocessing
 import shutil
 import sqlite3
@@ -12,8 +13,11 @@ import pytest
 from session_bridge.state import db
 from session_bridge.state.contract import (
     BUSY_TIMEOUT_MS,
+    CLAIM_TIMEOUT_SECONDS,
     LEASE_SECONDS,
     MAX_ATTEMPTS,
+    MAX_QUESTIONS_PER_TASK,
+    AuditEventKind,
     SessionRole,
     Transport,
 )
@@ -955,3 +959,262 @@ def test_item13b1_migration_concurrent_init(tmp_path):
     # an already-migrated file: further init() stays a no-op
     db.init(path)
     assert db.get_session("s1", path=path)["cwd"] == "/old"
+
+
+def _ask(db_path, session_id="w1", task_id=1, text="which branch?"):
+    res = db.ask(session_id, task_id, text, path=db_path)
+    assert res.accepted is True
+    assert res.question_id is not None
+    assert res.reason is None
+    return res.question_id
+
+
+def test_item13b2_gwt1_concurrent_claims_single_winner(db_path):
+    qid = _ask(db_path)
+    claimants = [f"orc{i}" for i in range(8)]
+    with ThreadPoolExecutor(max_workers=len(claimants)) as ex:
+        results = list(
+            ex.map(
+                lambda c: db.claim_question(qid, c, path=db_path),
+                claimants,
+            )
+        )
+    assert results.count(True) == 1
+    row = db.get_question(qid, path=db_path)
+    assert row["state"] == "claimed"
+    assert row["claimed_by"] == claimants[results.index(True)]
+    assert row["claimed_at"] is not None
+    # a late claim on an already-claimed question always loses
+    assert db.claim_question(qid, "late", path=db_path) is False
+
+
+def test_item13b2_gwt2_second_ask_on_task_with_pending_rejected(db_path):
+    qid = _ask(db_path, task_id=7)
+    # a second ask while the first is pending is refused, structured
+    res = db.ask("w1", 7, "and another?", path=db_path)
+    assert res.accepted is False
+    assert res.reason == "pending_exists"
+    assert res.question_id is None
+    # the unique pending index backs the refusal at the storage level
+    with pytest.raises(sqlite3.IntegrityError):
+        _exec(
+            db_path,
+            "INSERT INTO questions(task_id,session_id,text,state,asked_at)"
+            " VALUES(7,'w1','x','pending',1)",
+        )
+    # a different task is unaffected
+    other = _ask(db_path, task_id=8)
+    assert other != qid
+    # once the first question leaves pending the slot frees up
+    assert db.claim_question(qid, "orc", path=db_path) is True
+    res = db.ask("w1", 7, "now it fits", path=db_path)
+    assert res.accepted is True
+
+
+def test_item13b2_gwt3_stale_claim_janitor_returns_pending_same_id(db_path):
+    qid = _ask(db_path, task_id=3)
+    assert db.claim_question(qid, "orc1", path=db_path) is True
+    # a fresh claim is not the janitor's business
+    assert db.janitor_questions(path=db_path) == []
+    row = db.get_question(qid, path=db_path)
+    assert row["state"] == "claimed"
+
+    # age the claim past CLAIM_TIMEOUT_SECONDS
+    stale = int(time.time()) - CLAIM_TIMEOUT_SECONDS - 1
+    _exec(
+        db_path,
+        "UPDATE questions SET claimed_at=? WHERE id=?",
+        (stale, qid),
+    )
+    assert db.janitor_questions(path=db_path) == [qid]
+    row = db.get_question(qid, path=db_path)
+    assert row["id"] == qid
+    assert row["state"] == "pending"
+    assert row["claimed_by"] is None
+    assert row["claimed_at"] is None
+    # second pass is a no-op
+    assert db.janitor_questions(path=db_path) == []
+    # the released question is claimable again under the same id
+    assert db.claim_question(qid, "orc2", path=db_path) is True
+
+
+def test_item13b2_janitor_skips_task_with_newer_pending(db_path):
+    # stale claim on q1 while q2 already holds the task's pending slot:
+    # releasing q1 would trip the unique pending index, so the janitor
+    # leaves it claimed for the next pass instead of crashing
+    q1 = _ask(db_path, task_id=5)
+    assert db.claim_question(q1, "orc1", path=db_path) is True
+    _ask(db_path, task_id=5, text="second")
+    stale = int(time.time()) - CLAIM_TIMEOUT_SECONDS - 1
+    _exec(
+        db_path,
+        "UPDATE questions SET claimed_at=? WHERE id=?",
+        (stale, q1),
+    )
+    assert db.janitor_questions(path=db_path) == []
+    assert db.get_question(q1, path=db_path)["state"] == "claimed"
+
+
+def test_item13b2_janitor_one_stale_claim_per_task_per_pass(db_path):
+    # two stale claims on one task used to abort the whole UPDATE on
+    # the unique pending index (both rows pass the pending guard
+    # against the same pre-update snapshot), wedging the janitor for
+    # every task forever. Now a pass releases at most the min stale
+    # id per task; the rest catch up once the pending slot frees.
+    q1 = _ask(db_path, task_id=5)
+    assert db.claim_question(q1, "orc1", path=db_path) is True
+    q2 = _ask(db_path, task_id=5, text="second")
+    assert db.claim_question(q2, "orc2", path=db_path) is True
+    # a stale claim on another task must not be collateral damage
+    q3 = _ask(db_path, task_id=6, text="other task")
+    assert db.claim_question(q3, "orc3", path=db_path) is True
+
+    stale = int(time.time()) - CLAIM_TIMEOUT_SECONDS - 1
+    _exec(
+        db_path,
+        "UPDATE questions SET claimed_at=? WHERE state='claimed'",
+        (stale,),
+    )
+
+    # first pass: the min stale id on the wedged task plus the other
+    # task's stale claim - the sweep completes instead of raising
+    assert db.janitor_questions(path=db_path) == [q1, q3]
+    assert db.get_question(q1, path=db_path)["state"] == "pending"
+    assert db.get_question(q2, path=db_path)["state"] == "claimed"
+    assert db.get_question(q3, path=db_path)["state"] == "pending"
+
+    # q1 now holds the task's pending slot, so q2 stays claimed
+    assert db.janitor_questions(path=db_path) == []
+    # once the slot frees the next pass releases q2 under the same id
+    assert db.claim_question(q1, "orc1b", path=db_path) is True
+    assert db.janitor_questions(path=db_path) == [q2]
+    assert db.get_question(q2, path=db_path)["state"] == "pending"
+    assert db.get_question(q2, path=db_path)["claimed_by"] is None
+
+
+def test_item13b2_claim_question_rejects_blank_claimant(db_path):
+    qid = _ask(db_path)
+    with pytest.raises(ValueError):
+        db.claim_question(qid, "", path=db_path)
+    with pytest.raises(ValueError):
+        db.claim_question(qid, "   ", path=db_path)
+    assert db.get_question(qid, path=db_path)["state"] == "pending"
+
+
+def test_item13b2_answer_question_claimed_to_answered(db_path):
+    qid = _ask(db_path)
+    # pending cannot be answered - the claim must land first
+    assert db.answer_question(qid, "too early", path=db_path) is False
+    row = db.get_question(qid, path=db_path)
+    assert row["state"] == "pending"
+    assert row["answer"] is None
+
+    assert db.claim_question(qid, "orc", path=db_path) is True
+    assert db.answer_question(qid, "use main", path=db_path) is True
+    row = db.get_question(qid, path=db_path)
+    assert row["state"] == "answered"
+    assert row["answer"] == "use main"
+    assert row["answered_at"] is not None
+    # claim fields survive - the row passed through claimed
+    assert row["claimed_by"] == "orc"
+    assert row["claimed_at"] is not None
+    # answered is terminal
+    assert db.answer_question(qid, "again", path=db_path) is False
+    assert db.claim_question(qid, "orc2", path=db_path) is False
+    assert db.janitor_questions(path=db_path) == []
+
+    with pytest.raises(ValueError):
+        db.answer_question(qid, None, path=db_path)
+
+
+def test_item13b2_max_questions_per_task_refusal(db_path):
+    # MAX_QUESTIONS_PER_TASK counts every state, so fill the budget by
+    # cycling questions through the whole lifecycle
+    for i in range(MAX_QUESTIONS_PER_TASK):
+        qid = _ask(db_path, task_id=9, text=f"q{i}")
+        assert db.claim_question(qid, "orc", path=db_path) is True
+        assert db.answer_question(qid, f"a{i}", path=db_path) is True
+    res = db.ask("w1", 9, "one too many", path=db_path)
+    assert res.accepted is False
+    assert res.reason == "question_limit"
+    assert res.question_id is None
+    # the limit is per task
+    assert db.ask("w1", 10, "fine here", path=db_path).accepted is True
+
+
+def test_item13b2_pending_helpers_and_get(db_path):
+    q1 = _ask(db_path, session_id="w1", task_id=1, text="first")
+    q2 = _ask(db_path, session_id="w2", task_id=2, text="second")
+    assert db.pending_questions_count(1, path=db_path) == 1
+    assert db.pending_questions_count(42, path=db_path) == 0
+
+    rows = db.list_pending_questions(path=db_path)
+    assert [r["id"] for r in rows] == [q1, q2]
+    rows = db.list_pending_questions(task_id=2, path=db_path)
+    assert [r["id"] for r in rows] == [q2]
+
+    row = db.get_question(q1, path=db_path)
+    assert row["task_id"] == 1
+    assert row["session_id"] == "w1"
+    assert row["text"] == "first"
+    assert row["state"] == "pending"
+    assert row["asked_at"] is not None
+    assert db.get_question(999, path=db_path) is None
+
+    # claimed questions leave the pending scan
+    assert db.claim_question(q1, "orc", path=db_path) is True
+    assert [r["id"] for r in db.list_pending_questions(path=db_path)] == [q2]
+    assert db.pending_questions_count(1, path=db_path) == 0
+
+    with pytest.raises(ValueError):
+        db.ask("w1", 3, "", path=db_path)
+
+
+def test_item13b2_audit_insert_append_only(db_path):
+    qid = _ask(db_path, task_id=11)
+    assert db.claim_question(qid, "orc", path=db_path) is True
+    assert db.answer_question(qid, "ans", path=db_path) is True
+    q = db.get_question(qid, path=db_path)
+
+    outputs = {"gh-copilot": "verdict A", "gemini": "verdict B"}
+    eid = db.audit(
+        AuditEventKind.DELIBERATION,
+        session_id="w1",
+        task_id=11,
+        question_id=qid,
+        question_text="which branch?",
+        partner_outputs=outputs,
+        synthesis="merged view",
+        directive="use main",
+        asked_at=q["asked_at"],
+        claimed_at=q["claimed_at"],
+        answered_at=q["answered_at"],
+        path=db_path,
+    )
+    assert eid is not None
+    row = _one(db_path, "SELECT * FROM audit_events WHERE id=?", (eid,))
+    assert row["kind"] == "deliberation"
+    assert row["session_id"] == "w1"
+    assert row["task_id"] == 11
+    assert row["question_id"] == qid
+    assert row["question_text"] == "which branch?"
+    # partner outputs stored verbatim as JSON text
+    assert json.loads(row["partner_outputs"]) == outputs
+    assert row["synthesis"] == "merged view"
+    assert row["directive"] == "use main"
+    assert row["doa_trigger"] is None
+    assert row["asked_at"] == q["asked_at"]
+    assert row["claimed_at"] == q["claimed_at"]
+    assert row["answered_at"] == q["answered_at"]
+    assert abs(row["created_at"] - time.time()) < 5
+
+    # string kinds and minimal events are accepted; ids only grow
+    eid2 = db.audit("escalation", doa_trigger="budget_exceeded", path=db_path)
+    assert eid2 > eid
+    row = _one(db_path, "SELECT * FROM audit_events WHERE id=?", (eid2,))
+    assert row["kind"] == "escalation"
+    assert row["doa_trigger"] == "budget_exceeded"
+    assert json.loads(row["partner_outputs"]) == {}
+
+    with pytest.raises(ValueError):
+        db.audit("bogus-kind", path=db_path)
