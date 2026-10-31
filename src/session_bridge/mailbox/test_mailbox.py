@@ -150,7 +150,9 @@ def test_item13c_watcher_loop_template_renders(qdir):
     assert "msg_*.txt" in loop
     assert "sleep 2" in loop
     assert "SECONDS + 30" in loop
-    # level-triggered head-of-line consume: ls | head -1; cat; rm
+    # level-triggered head-of-line consume: ls -v | head -1; cat; rm
+    # (-v = numeric head-of-queue: msg_2 must beat msg_10)
+    assert "ls -v " in loop
     assert "head -n 1" in loop
     assert "cat " in loop and "rm -f " in loop
     assert "WATCHER_TTL_EXPIRED" in loop
@@ -174,6 +176,24 @@ def test_item13c_gwt1_watcher_loop_delivers_and_exits(qdir):
     assert "=== mailbox message msg_1.txt ===" in res.stdout
     assert "hello managed" in res.stdout
     # the delivery was consumed level-triggered (cat + rm)
+    assert next_message(SID, queue_dir=qdir) is None
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash required")
+def test_item13c_watcher_loop_numeric_head_order(qdir):
+    """Run the rendered loop for real: msg_2 drains before msg_10."""
+    write_message(SID, 10, "ten", queue_dir=qdir)
+    write_message(SID, 2, "two", queue_dir=qdir)
+    loop = watcher_loop_text(mailbox_dir(SID, queue_dir=qdir), ttl_seconds=15, poll_seconds=1)
+    res = subprocess.run(
+        ["bash", "-c", loop], capture_output=True, text=True, timeout=20, check=False
+    )
+    assert res.returncode == 0
+    i2 = res.stdout.index("=== mailbox message msg_2.txt ===")
+    i10 = res.stdout.index("=== mailbox message msg_10.txt ===")
+    # numeric head-of-queue, not lexical: two is drained first
+    assert i2 < i10
+    # drain-all: every pending message was consumed in one pass
     assert next_message(SID, queue_dir=qdir) is None
 
 

@@ -66,25 +66,28 @@ _NAME_SAFE = re.compile(r"[^A-Za-z0-9._-]")
 # ``watcher_loop_text`` - placeholders are ``{mailbox_dir}``,
 # ``{poll_seconds}`` and ``{ttl_seconds}``; the bash body itself
 # contains no braces. Level-triggered head-of-line consume:
-# ``ls | head -1; cat; rm`` drains every pending message, prints each
+# ``ls -v | head -1; cat; rm`` drains every pending message, prints each
 # with a MESSAGE_HEADER banner, then exits so the completion lands
-# inside the parent's open turn.
+# inside the parent's open turn. ``ls -v`` (GNU version sort) keeps the
+# head-of-queue numeric like ``next_message`` - msg_2 beats msg_10.
 WATCHER_LOOP = """\
 # sessions-bridge mailbox watcher: poll {mailbox_dir} for msg_*.txt
 # every {poll_seconds}s, for up to {ttl_seconds}s. Level-triggered
 # head-of-line consume: each pending message is printed and removed,
 # then the watcher exits - its completion lands inside the parent turn.
+# ls -v = GNU version sort so the lowest numeric id is head-of-queue
+# (msg_2 before msg_10), matching next_message's numeric sort.
 mailbox_dir="{mailbox_dir}"
 deadline=$((SECONDS + {ttl_seconds}))
 found=0
 while [ "$SECONDS" -lt "$deadline" ]; do
-    msg=$(ls "$mailbox_dir"/msg_*.txt 2>/dev/null | head -n 1)
+    msg=$(ls -v "$mailbox_dir"/msg_*.txt 2>/dev/null | head -n 1)
     while [ -n "$msg" ]; do
         found=1
         echo "=== mailbox message $(basename "$msg") ==="
         cat "$msg"
         rm -f "$msg"
-        msg=$(ls "$mailbox_dir"/msg_*.txt 2>/dev/null | head -n 1)
+        msg=$(ls -v "$mailbox_dir"/msg_*.txt 2>/dev/null | head -n 1)
     done
     if [ "$found" -eq 1 ]; then
         exit 0
