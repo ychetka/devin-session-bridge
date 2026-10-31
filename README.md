@@ -88,6 +88,20 @@ to it).
 - Transitions to `NEEDS-KICK` / `FAILED` emit a deduped
   `notify-send -u critical` notification when the binary exists.
 
+## Operating the bridge
+
+Beyond single-session dispatch, the bridge runs a managed fleet:
+`bridge arm`/`disarm` enroll sessions into mailbox delivery, the
+`bridge daemon` supervisor relays the notifications outbox and marks
+dead sessions, `bridge register`/`ask`/`ack`/`escalate` form the
+orchestration bus, and `bridge status` renders the fleet view.
+
+Operator runbook (mental model, playbooks, daemon lifecycle,
+watchdog): [docs/OPERATOR.md](docs/OPERATOR.md)
+
+Orchestrator session contract template:
+[docs/orchestrator/PLAYBOOK.md](docs/orchestrator/PLAYBOOK.md)
+
 ## Safety invariants
 
 - Desktop-open sessions are never force-closed; delivery to them goes
