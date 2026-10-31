@@ -52,6 +52,7 @@ from .contract import (
     AuditEventKind,
     NotificationKind,
     QuestionState,
+    SessionMode,
     SessionRole,
     SessionStatus,
     TaskStatus,
@@ -1104,6 +1105,42 @@ def decrement_park_cycles(session_id: str, fresh_budget: int, *, path=None) -> i
             con.close()
 
     return _retry(op)
+
+
+_SESSION_MODES = frozenset(m.value for m in SessionMode)
+
+
+def set_session_mode(session_id: str, mode, *, path=None) -> None:
+    """Set ``sessions.mode`` (managed|unmanaged) for a session.
+
+    ``mode`` is deliberately not in the ``_SESSION_FIELDS`` upsert
+    whitelist (item_13b1): arming/disarming managed mode goes through
+    this dedicated writer only, so the transition stays explicit. A
+    single INSERT ... ON CONFLICT statement - atomic like every other
+    writer, and it creates the sessions row when absent (pre-arming a
+    session the bridge has not seen yet is valid).
+    """
+    mode_v = _val(mode)
+    if mode_v not in _SESSION_MODES:
+        raise ValueError(f"unknown session mode: {mode_v!r}")
+    if not session_id or not session_id.strip():
+        raise ValueError("set_session_mode requires a session_id")
+    ts = _now()
+
+    def op():
+        con = connect(path)
+        try:
+            con.execute(
+                "INSERT INTO sessions(session_id,mode,updated_at)"
+                " VALUES(?,?,?) ON CONFLICT(session_id)"
+                " DO UPDATE SET mode=excluded.mode,"
+                " updated_at=excluded.updated_at",
+                (session_id, mode_v, ts),
+            )
+        finally:
+            con.close()
+
+    _retry(op)
 
 
 # --- message bus: register + heartbeat ----------------------------------------

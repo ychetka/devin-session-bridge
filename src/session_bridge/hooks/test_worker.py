@@ -18,7 +18,7 @@ import pytest
 
 from session_bridge.hooks import worker
 from session_bridge.state import db
-from session_bridge.state.contract import Transport
+from session_bridge.state.contract import SessionMode, Transport
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 INSTALL_SH = REPO_ROOT / "install_hooks.sh"
@@ -416,6 +416,105 @@ def test_item06_garbage_payload_never_blocks(env, monkeypatch, capsys):
     rc = worker.main(env["argv"])
     assert rc == 0
     assert capsys.readouterr().out.strip() == ""
+
+
+# --- item_13c: managed mode (mailbox duty) -------------------------------------
+
+
+def _arm(env, sid=SID):
+    db.set_session_mode(sid, SessionMode.MANAGED, path=env["db"])
+
+
+def test_item13c_managed_session_start_injects_duty(env, monkeypatch, capsys):
+    _arm(env)
+    payload = {
+        "hook_event_name": "SessionStart",
+        "session_id": SID,
+        "source": "startup",
+    }
+    rc, out = _run(env, payload, monkeypatch, capsys)
+    assert rc == 0
+    inner = out["hookSpecificOutput"]
+    assert inner["hookEventName"] == "SessionStart"
+    text = inner["additionalContext"]
+    assert "MANAGED MODE" in text
+    assert "mailbox" in text
+    # the watcher loop inside the duty watches the session mailbox dir
+    assert str(env["qdir"]) in text
+
+
+def test_item13c_managed_session_start_still_records_session(env, monkeypatch, capsys):
+    _arm(env)
+    payload = {
+        "hook_event_name": "SessionStart",
+        "session_id": SID,
+        "source": "startup",
+        "cwd": "/repo/x",
+    }
+    rc, out = _run(env, payload, monkeypatch, capsys)
+    assert rc == 0
+    assert out is not None
+    row = db.get_session(SID, path=env["db"])
+    assert row["cwd"] == "/repo/x"
+    assert row["park_cycles_left"] == 2  # bookkeeping still ran
+    assert row["mode"] == "managed"  # mode survived the upsert
+
+
+def test_item13c_managed_kick_injects_duty_not_task(env, monkeypatch, capsys):
+    _arm(env)
+    tid = _task(env)
+    payload = {
+        "hook_event_name": "UserPromptSubmit",
+        "session_id": SID,
+        "prompt": ".",
+    }
+    rc, out = _run(env, payload, monkeypatch, capsys)
+    assert rc == 0
+    inner = out["hookSpecificOutput"]
+    assert inner["hookEventName"] == "UserPromptSubmit"
+    assert "MANAGED MODE" in inner["additionalContext"]
+    # the queued task is NOT claimed through the smart-kick path - a
+    # managed session takes it via the mailbox only
+    row = _get_task(env, tid)
+    assert row["status"] == "queued"
+    assert row["lease_owner"] is None
+    # and the unmanaged pause flag was not touched
+    assert db.get_session(SID, path=env["db"])["queue_paused"] == 0
+
+
+def test_item13c_managed_long_prompt_injects_nothing(env, monkeypatch, capsys):
+    _arm(env)
+    tid = _task(env)
+    payload = {
+        "hook_event_name": "UserPromptSubmit",
+        "session_id": SID,
+        "prompt": "please refactor the parser module",
+    }
+    rc, out = _run(env, payload, monkeypatch, capsys)
+    assert rc == 0
+    assert out is None
+    assert _get_task(env, tid)["status"] == "queued"
+    assert db.get_session(SID, path=env["db"])["queue_paused"] == 0
+
+
+def test_item13c_managed_stop_allows_and_never_claims(env, monkeypatch, capsys):
+    _arm(env)
+    tid = _task(env)
+    rc, out = _run(env, _stop(), monkeypatch, capsys)
+    assert rc == 0
+    assert out is None  # no park block, no task block delivery
+    row = _get_task(env, tid)
+    assert row["status"] == "queued"
+    assert row["lease_owner"] is None
+
+
+def test_item13c_managed_stop_empty_queue_allows_immediately(env, monkeypatch, capsys):
+    # a managed Stop must not burn a park cycle waiting on a trigger
+    _arm(env)
+    rc, out = _run(env, _stop(), monkeypatch, capsys)
+    assert rc == 0
+    assert out is None
+    assert db.get_session(SID, path=env["db"])["park_cycles_left"] == 5
 
 
 # --- GWT-6: install_hooks.sh --------------------------------------------------

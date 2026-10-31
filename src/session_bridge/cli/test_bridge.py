@@ -27,7 +27,12 @@ from session_bridge.cli.contract import (
     JsonResponse,
 )
 from session_bridge.state import db
-from session_bridge.state.contract import TaskStatus, Transport
+from session_bridge.state.contract import (
+    NotificationKind,
+    SessionMode,
+    TaskStatus,
+    Transport,
+)
 
 SID = "s1"
 
@@ -697,3 +702,116 @@ def test_item10_gwt4_log_sweep_never_unlinks_fresh_logs(tmp_path):
     assert not old[0].exists()
     assert not old[1].exists()
     assert all(p.exists() for p in old[2:])
+
+
+# --- item_13c: managed mode - arm / disarm / managed dispatch ----------------
+
+
+def test_item13c_arm_sets_managed_mode(env, capsys):
+    rc, out = _run(["arm", SID, "--json"], capsys)
+    assert rc == ExitCode.OK
+    assert out["status"] == SessionMode.MANAGED.value
+    assert out["session"] == SID
+    row = db.get_session(SID, path=env.db)
+    assert row["mode"] == SessionMode.MANAGED.value
+
+
+def test_item13c_disarm_clears_mode_and_notifies(env, capsys):
+    db.set_session_mode(SID, SessionMode.MANAGED, path=env.db)
+    rc, out = _run(["disarm", SID, "--json"], capsys)
+    assert rc == ExitCode.OK
+    assert out["status"] == SessionMode.UNMANAGED.value
+    assert out["data"]["disarmed"] == [SID]
+    assert db.get_session(SID, path=env.db)["mode"] == SessionMode.UNMANAGED.value
+    # a DISARM outbox row tells the live watcher to exit
+    rows = db.unrelayed_notifications(SID, path=env.db)
+    assert len(rows) == 1
+    assert rows[0]["kind"] == NotificationKind.DISARM.value
+    assert rows[0]["relayed_at"] is None
+
+
+def test_item13c_gwt3_disarm_all_disarms_every_managed(env, capsys):
+    for sid in ("m1", "m2"):
+        db.set_session_mode(sid, SessionMode.MANAGED, path=env.db)
+    db.set_session_mode("w1", SessionMode.UNMANAGED, path=env.db)
+    rc, out = _run(["disarm", "--all", "--json"], capsys)
+    assert rc == ExitCode.OK
+    assert sorted(out["data"]["disarmed"]) == ["m1", "m2"]
+    for sid in ("m1", "m2"):
+        row = db.get_session(sid, path=env.db)
+        assert row["mode"] == SessionMode.UNMANAGED.value
+        rows = db.unrelayed_notifications(sid, path=env.db)
+        assert [r["kind"] for r in rows] == [NotificationKind.DISARM.value]
+    # the unmanaged session got no DISARM notice
+    assert db.unrelayed_notifications("w1", path=env.db) == []
+
+
+def test_item13c_disarm_all_empty_fleet(env, capsys):
+    rc, out = _run(["disarm", "--all", "--json"], capsys)
+    assert rc == ExitCode.OK
+    assert out["data"]["disarmed"] == []
+
+
+def test_item13c_disarm_without_ref_is_usage_error(env, capsys):
+    rc, out = _run(["disarm", "--json"], capsys)
+    assert rc == ExitCode.USAGE
+    assert out["error"]
+
+
+def test_item13c_push_managed_goes_to_outbox(env, capsys):
+    db.set_session_mode(SID, SessionMode.MANAGED, path=env.db)
+    rc, out = _run(["push", SID, "--task", "do it", "--json"], capsys)
+    assert rc == ExitCode.OK
+    tid = out["data"]["task_id"]
+    row = db.get_task(tid, path=env.db)
+    # the task stays queued as the durable record; no transport runs
+    assert row["status"] == TaskStatus.QUEUED.value
+    assert row["transport"] is None
+    assert row["lease_owner"] is None
+    assert env.spawned == []
+    assert not _trigger(env).exists()  # no unmanaged queue trigger
+    # the durable delivery is a TASK_DISPATCH outbox row (the daemon
+    # relay turns it into the fs mailbox file)
+    rows = db.unrelayed_notifications(SID, path=env.db)
+    assert len(rows) == 1
+    assert rows[0]["kind"] == NotificationKind.TASK_DISPATCH.value
+    assert rows[0]["task_id"] == tid
+    assert "do it" in rows[0]["body"]
+    assert "do not retry" in out["agent_instruction"]
+
+
+def test_item13c_managed_dispatch_is_deduped(env, capsys):
+    # repeated pump passes must not spam the mailbox while the task
+    # still has an open (unacked) dispatch notification
+    db.set_session_mode(SID, SessionMode.MANAGED, path=env.db)
+    _run(["push", SID, "--task", "do it", "--json"], capsys)
+    _run(["status", "--json"], capsys)
+    _run(["status", "--json"], capsys)
+    rows = db.unrelayed_notifications(SID, path=env.db)
+    assert len(rows) == 1
+
+
+def test_item13c_managed_session_never_takes_acp_or_hook(env, capsys):
+    # even a locked/known managed session bypasses both transports
+    env.locks[SID] = (True, 1234)
+    env.devin[SID] = {"working_directory": "/repo"}
+    db.set_session_mode(SID, SessionMode.MANAGED, path=env.db)
+    rc, out = _run(["push", SID, "--task", "do it", "--json"], capsys)
+    assert rc == ExitCode.OK
+    row = db.get_task(out["data"]["task_id"], path=env.db)
+    assert row["status"] == TaskStatus.QUEUED.value
+    assert row["transport"] is None
+    assert env.spawned == []
+    assert not _trigger(env).exists()
+
+
+def test_item13c_unmanaged_push_unchanged(env, capsys):
+    # an unmanaged session still gets the hook transport + trigger
+    env.locks[SID] = (True, 1234)
+    db.set_session_mode(SID, SessionMode.UNMANAGED, path=env.db)
+    rc, out = _run(["push", SID, "--task", "do it", "--json"], capsys)
+    assert rc == ExitCode.OK
+    row = db.get_task(out["data"]["task_id"], path=env.db)
+    assert row["transport"] == Transport.HOOK_QUEUE.value
+    assert _trigger(env).exists()
+    assert db.unrelayed_notifications(SID, path=env.db) == []

@@ -58,6 +58,8 @@ from session_bridge.cli.contract import (
 from session_bridge.state import db
 from session_bridge.state.contract import (
     LEASE_SECONDS,
+    NotificationKind,
+    SessionMode,
     TaskStatus,
     Transport,
 )
@@ -318,6 +320,33 @@ def _session_known(session_id: str, args) -> bool:
     return db.get_session(session_id, path=args.db) is not None
 
 
+def _session_mode(session_id: str, args) -> str:
+    """sessions.mode for a session (unmanaged when the row is absent)."""
+    row = db.get_session(session_id, path=args.db)
+    if row is None:
+        return SessionMode.UNMANAGED.value
+    return row["mode"]
+
+
+def _has_open_dispatch(task_id: int, args) -> bool:
+    """True when the task already has an unacked TASK_DISPATCH row.
+
+    The dedup guard for managed dispatch: one queued task maps to at
+    most one open outbox notification, so pump passes do not spam the
+    mailbox while the task waits for the daemon relay (item_13d) and
+    the recipient's ack watermark (``ack_at``) marks delivery closed.
+    """
+    con = db.connect(args.db)
+    try:
+        row = con.execute(
+            "SELECT 1 FROM notifications WHERE task_id=? AND kind=? AND ack_at IS NULL LIMIT 1",
+            (task_id, NotificationKind.TASK_DISPATCH.value),
+        ).fetchone()
+        return row is not None
+    finally:
+        con.close()
+
+
 # --- dispatch ------------------------------------------------------------------
 
 
@@ -385,17 +414,18 @@ def _task_to_hook_queue(task_id: int, owner: str, args) -> bool:
 def pump(args) -> dict:
     """Lazy recovery + one dispatch pass over queued tasks.
 
-    Returns ``{"events", "hooked", "spawned", "unknown", "saturated"}``
-    for the calling command's response. The queue is scanned in capped
-    batches paginated by task id, so every queued task is visited even
-    beyond the ``list_tasks`` limit; hook-folded tasks land back in
-    ``queued`` keeping the same id - already below ``last_id``, so
-    they are never revisited in the same pass.
+    Returns ``{"events", "hooked", "spawned", "unknown", "managed",
+    "saturated"}`` for the calling command's response. The queue is
+    scanned in capped batches paginated by task id, so every queued
+    task is visited even beyond the ``list_tasks`` limit; hook-folded
+    tasks land back in ``queued`` keeping the same id - already below
+    ``last_id``, so they are never revisited in the same pass.
     """
     events: list[Event] = []
     hooked: list[int] = []
     spawned: list[int] = []
     unknown: list[str] = []
+    managed: list[int] = []
     saturated = False
 
     _sweep_worker_logs(args)
@@ -434,6 +464,21 @@ def pump(args) -> dict:
             last_id = task["id"]
             tid = task["id"]
             sid = task["session_id"]
+            if _session_mode(sid, args) == SessionMode.MANAGED.value:
+                # managed sessions take deliveries only through the
+                # notifications outbox -> fs mailbox (the daemon relay
+                # writes the msg file in item_13d); the task stays
+                # queued as the durable record, no transport is run
+                if not _has_open_dispatch(tid, args):
+                    db.notify(
+                        sid,
+                        NotificationKind.TASK_DISPATCH,
+                        task["task_text"] or f"execute spec file {task['task_file']}",
+                        task_id=tid,
+                        path=args.db,
+                    )
+                managed.append(tid)
+                continue
             locked, _pid = db.is_locked(sid)
             if locked:
                 # transport decision: the session is open in devin, so
@@ -505,6 +550,7 @@ def pump(args) -> dict:
         "hooked": hooked,
         "spawned": spawned,
         "unknown": unknown,
+        "managed": managed,
         "saturated": saturated,
     }
 
@@ -790,6 +836,11 @@ def _cmd_push(args) -> int:
         )
         instruction = (
             "task is preserved in the queue; verify the session id or open the session once"
+        )
+    elif tid in result["managed"]:
+        instruction = (
+            "do not retry: managed session - task dispatched via the"
+            " notifications outbox (mailbox delivery)"
         )
     elif task["transport"] == Transport.HOOK_QUEUE.value:
         instruction = "do not retry: task queued for hook delivery inside the open session"
@@ -1161,6 +1212,70 @@ def _cmd_retry(args) -> int:
     return _emit(args, resp, ExitCode.OK, f"task {task['id']} requeued")
 
 
+# --- managed mode: arm / disarm ----------------------------------------------------
+
+_DISARM_BODY = "managed mode disarmed: stop re-arming the mailbox watcher"
+
+
+def _cmd_arm(args) -> int:
+    """``bridge arm <sid>``: enroll a session into managed mode."""
+    db.set_session_mode(args.session_id, SessionMode.MANAGED, path=args.db)
+    resp = JsonResponse(
+        session=args.session_id,
+        status=SessionMode.MANAGED.value,
+        queue_depth=_queue_depth(args),
+        agent_instruction=(
+            "session armed: deliveries go through the mailbox watcher"
+            " (SessionStart/kick injects the mailbox duty)"
+        ),
+    )
+    return _emit(args, resp, ExitCode.OK, f"session {args.session_id} armed (managed)")
+
+
+def _cmd_disarm(args) -> int:
+    """``bridge disarm <sid>|--all``: leave managed mode + DISARM notify.
+
+    The durable outbox DISARM row is what a live watcher receives once
+    the daemon relays it - mode is cleared first so a restarted or
+    re-arming session sees unmanaged immediately.
+    """
+    if args.all:
+        sids = [
+            r["session_id"]
+            for r in _all_session_rows(args)
+            if r["mode"] == SessionMode.MANAGED.value
+        ]
+    elif args.session_id:
+        sids = [args.session_id]
+    else:
+        resp = JsonResponse(
+            status="usage",
+            error="disarm requires a session id or --all",
+        )
+        return _emit(
+            args,
+            resp,
+            ExitCode.USAGE,
+            "usage: bridge disarm <session_id> | bridge disarm --all",
+        )
+    for sid in sids:
+        db.set_session_mode(sid, SessionMode.UNMANAGED, path=args.db)
+        db.notify(sid, NotificationKind.DISARM, _DISARM_BODY, path=args.db)
+    resp = JsonResponse(
+        session=None if args.all else args.session_id,
+        status=SessionMode.UNMANAGED.value,
+        queue_depth=_queue_depth(args),
+        data={"disarmed": sids},
+    )
+    if args.all:
+        human = f"disarmed {len(sids)} managed session(s)"
+        if sids:
+            human += f": {', '.join(sids)}"
+    else:
+        human = f"session {args.session_id} disarmed (unmanaged)"
+    return _emit(args, resp, ExitCode.OK, human)
+
+
 # --- entry point -----------------------------------------------------------------
 
 
@@ -1213,6 +1328,21 @@ def _parse_args(argv) -> argparse.Namespace:
     sp.add_argument("ref", help="session id or task id")
     _add_json(sp)
 
+    # managed mode (item_13c); the Command enum in cli/contract.py is
+    # frozen, so the subcommand names are literals here
+    sp = sub.add_parser("arm", help="enroll a session into managed mode")
+    sp.add_argument("session_id")
+    _add_json(sp)
+
+    sp = sub.add_parser("disarm", help="leave managed mode (--all for the fleet)")
+    sp.add_argument("session_id", nargs="?", default=None)
+    sp.add_argument(
+        "--all",
+        action="store_true",
+        help="disarm every managed session (big red button)",
+    )
+    _add_json(sp)
+
     sp = sub.add_parser(
         Command.WORK.value,
         help=argparse.SUPPRESS,  # internal worker
@@ -1233,6 +1363,8 @@ _HANDLERS = {
     Command.UNPARK.value: _cmd_unpark,
     Command.RETRY.value: _cmd_retry,
     Command.WORK.value: _cmd_work,
+    "arm": _cmd_arm,
+    "disarm": _cmd_disarm,
 }
 
 
