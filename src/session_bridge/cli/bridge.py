@@ -60,11 +60,14 @@ from session_bridge.daemon import core as daemon
 from session_bridge.state import db
 from session_bridge.state.contract import (
     LEASE_SECONDS,
+    MAX_ATTEMPTS,
     MAX_QUESTIONS_PER_TASK,
     AuditEventKind,
     NotificationKind,
     QuestionState,
     SessionMode,
+    SessionRole,
+    SessionStatus,
     TaskStatus,
     Transport,
 )
@@ -970,12 +973,327 @@ def _session_views(args) -> tuple[list[dict], list[Event], int]:
     return views, events, queue_shown
 
 
+# --- fleet status view (item_13e2) ---------------------------------------------
+
+#: hard ceiling on human ``status`` lines - the contract is <25.
+STATUS_MAX_LINES = 24
+
+#: open-escalation banner rows before the banner collapses to "+N more".
+STATUS_BANNER_MAX = 5
+
+#: rolling window of the footer digest counts.
+STATUS_DIGEST_SECONDS = 24 * 3600
+
+#: task statuses that never make a session row "idle" - the fleet row
+#: resolves its task cell on the latest task regardless of status, but
+#: the state column only inherits non-terminal ones (done -> idle is
+#: misleading: the worker finished, it is idle carrying a done task).
+_IDLE_TASK_STATUSES = frozenset({TaskStatus.DONE.value})
+
+#: display aliases for statuses longer than the STATE column.
+_FLEET_STATE_ALIAS = {
+    TaskStatus.DISPATCH_DECIDED.value: "dispatch",
+    TaskStatus.AWAITING_USER.value: "awaiting",
+}
+
+
+def _age(now: int, ts):
+    """Whole seconds between ``ts`` and ``now``; None when unknown."""
+    if ts is None:
+        return None
+    return max(0, now - int(ts))
+
+
+def _fmt_age(age) -> str:
+    return "-" if age is None else f"{age}s"
+
+
+def _cut(text, width: int) -> str:
+    """Fit ``text`` into ``width`` chars, "~" marking the truncation."""
+    s = "-" if text is None else str(text)
+    if len(s) <= width:
+        return s
+    return s[: max(1, width - 1)] + "~"
+
+
+def _repo_name(row) -> str:
+    """Compact repo cell: basename of the session cwd, else its title."""
+    cwd = row["cwd"]
+    if cwd:
+        return os.path.basename(cwd.rstrip("/")) or cwd
+    return row["title"] or "-"
+
+
+def _fleet_state(session_status, task) -> str:
+    """The one-word state cell for a fleet row.
+
+    Dead sessions show ``dead`` (the compact marker - a dead row stays
+    visible so the operator sees which sid to reopen); otherwise the
+    row inherits its latest task status unless that task is done - a
+    finished task means the session is simply idle.
+    """
+    if session_status == SessionStatus.DEAD.value:
+        return "dead"
+    if task is None or task["status"] in _IDLE_TASK_STATUSES:
+        return "idle"
+    return _FLEET_STATE_ALIAS.get(task["status"], task["status"])
+
+
+def _status_snapshot(args) -> dict:
+    """One read-only pass over state.db + the daemon state dir.
+
+    Everything here is a read (pump already ran the recovery and
+    dispatch side effects). The fleet row joins sessions to their
+    latest task and the authoritative ``worker_heartbeats`` row;
+    sessions that exist only through a pushed task (never registered)
+    are folded in too - an unregistered sid is still fleet activity
+    the operator must see.
+    """
+    now = int(time.time())
+    cutoff = now - STATUS_DIGEST_SECONDS
+    con = db.connect(args.db)
+    try:
+        srows = con.execute(
+            "SELECT s.session_id AS sid, s.cwd AS cwd, s.title AS title,"
+            " s.role AS role, s.mode AS mode, s.status AS status,"
+            " wh.last_seen_at AS seen"
+            " FROM sessions s"
+            " LEFT JOIN worker_heartbeats wh"
+            "   ON wh.session_id=s.session_id"
+            " ORDER BY s.session_id"
+        ).fetchall()
+        latest = {
+            r["session_id"]: r
+            for r in con.execute(
+                "SELECT t.* FROM tasks t"
+                " JOIN (SELECT MAX(id) AS id FROM tasks GROUP BY session_id) m"
+                "  ON m.id=t.id"
+            ).fetchall()
+        }
+        qcounts = {
+            r["task_id"]: int(r["c"])
+            for r in con.execute(
+                "SELECT task_id, COUNT(*) AS c FROM questions GROUP BY task_id"
+            ).fetchall()
+        }
+        escalations = con.execute(
+            "SELECT id, session_id, task_id, doa_trigger, question_text"
+            " FROM audit_events WHERE kind=? AND directive IS NULL ORDER BY id",
+            (AuditEventKind.ESCALATION.value,),
+        ).fetchall()
+        digest = {
+            "done": int(
+                con.execute(
+                    "SELECT COUNT(*) AS c FROM tasks WHERE status=? AND updated_at>=?",
+                    (TaskStatus.DONE.value, cutoff),
+                ).fetchone()["c"]
+            ),
+            "auto_decisions": int(
+                con.execute(
+                    "SELECT COUNT(*) AS c FROM audit_events WHERE kind=? AND created_at>=?",
+                    (AuditEventKind.DELIBERATION.value, cutoff),
+                ).fetchone()["c"]
+            ),
+            "escalations": int(
+                con.execute(
+                    "SELECT COUNT(*) AS c FROM audit_events WHERE kind=? AND created_at>=?",
+                    (AuditEventKind.ESCALATION.value, cutoff),
+                ).fetchone()["c"]
+            ),
+        }
+    finally:
+        con.close()
+
+    fleet = []
+    orchestrator = None
+    for r in srows:
+        t = latest.pop(r["sid"], None)
+        row = {
+            "session_id": r["sid"],
+            "registered": True,
+            "role": r["role"],
+            "mode": r["mode"],
+            "repo": _repo_name(r),
+            "session_status": r["status"],
+            "task_id": t["id"] if t is not None else None,
+            "task_label": (t["task_text"] or t["task_file"] or "") if t is not None else None,
+            "task_status": t["status"] if t is not None else None,
+            "attempt": t["attempt"] if t is not None else None,
+            "questions": qcounts.get(t["id"], 0) if t is not None else None,
+            "heartbeat_age_seconds": _age(now, r["seen"]),
+        }
+        row["state"] = _fleet_state(r["status"], t)
+        fleet.append(row)
+        if r["role"] == SessionRole.ORCHESTRATOR.value:
+            # the register CAS keeps at most one orchestrator holder
+            orchestrator = row
+    for sid, t in sorted(latest.items()):
+        row = {
+            "session_id": sid,
+            "registered": False,
+            "role": None,
+            "mode": None,
+            "repo": "-",
+            "session_status": None,
+            "task_id": t["id"],
+            "task_label": t["task_text"] or t["task_file"] or "",
+            "task_status": t["status"],
+            "attempt": t["attempt"],
+            "questions": qcounts.get(t["id"], 0),
+            "heartbeat_age_seconds": None,
+            "state": _fleet_state(None, t),
+        }
+        fleet.append(row)
+    fleet.sort(
+        key=lambda r: (
+            0 if r["role"] == SessionRole.ORCHESTRATOR.value else 1 if r["registered"] else 2,
+            r["session_id"],
+        )
+    )
+
+    attention = [
+        {
+            "kind": "escalation",
+            "audit_id": r["id"],
+            "session_id": r["session_id"],
+            "task_id": r["task_id"],
+            "doa_trigger": r["doa_trigger"],
+            "reply_command": (f"bridge escalate reply {r['id']} A|B|defer|abort|override:<text>"),
+        }
+        for r in escalations
+    ]
+    # the orchestrator counts as dead when the supervisor marked it or
+    # its heartbeat already slipped past the bounded stale window - the
+    # banner must not wait for the next daemon pass to fire
+    if orchestrator is not None and (
+        orchestrator["session_status"] == SessionStatus.DEAD.value
+        or orchestrator["heartbeat_age_seconds"] is None
+        or orchestrator["heartbeat_age_seconds"] > db.HEARTBEAT_STALE_SECONDS
+    ):
+        attention.append(
+            {
+                "kind": "orchestrator_dead",
+                "session_id": orchestrator["session_id"],
+                "hint": ("reopen session, bridge register --role orchestrator [--force]"),
+            }
+        )
+
+    sdir = _state_dir(args)
+    return {
+        "attention": attention,
+        "vitals": {
+            "daemon": {
+                "running": daemon.daemon_running(sdir),
+                "pid": daemon.daemon_pid(sdir),
+                "heartbeat_age_seconds": daemon.heartbeat_age(sdir),
+                "state_dir": sdir,
+            },
+            "orchestrator": {
+                "session_id": orchestrator["session_id"] if orchestrator else None,
+                "status": orchestrator["session_status"] if orchestrator else None,
+                "heartbeat_age_seconds": (
+                    orchestrator["heartbeat_age_seconds"] if orchestrator else None
+                ),
+            },
+        },
+        "fleet": fleet,
+        "digest": digest,
+    }
+
+
+def _attention_lines(snap) -> list[str]:
+    lines = []
+    esc = [a for a in snap["attention"] if a["kind"] == "escalation"]
+    for a in esc[:STATUS_BANNER_MAX]:
+        lines.append(
+            f"ESCALATED #{a['audit_id']}: {a['doa_trigger'] or 'escalation'}"
+            f" - reply: {a['reply_command']}"
+        )
+    if len(esc) > STATUS_BANNER_MAX:
+        hidden = len(esc) - STATUS_BANNER_MAX
+        lines.append(f"+{hidden} more open escalation(s) - bridge escalate show")
+    if any(a["kind"] == "orchestrator_dead" for a in snap["attention"]):
+        lines.append(
+            "ORCHESTRATOR DEAD: reopen session, bridge register --role orchestrator [--force]"
+        )
+    return lines
+
+
+def _fleet_row_line(r) -> str:
+    # a leading "*" marks a session that never registered on the bus
+    # (seen only through a pushed task)
+    sid = r["session_id"] if r["registered"] else f"*{r['session_id']}"
+    if r["task_id"] is not None:
+        task = f"#{r['task_id']} {r['task_label'] or ''}".strip()
+    else:
+        task = "-"
+    q = "-" if r["questions"] is None else f"{r['questions']}/{MAX_QUESTIONS_PER_TASK}"
+    fail = "-" if r["attempt"] is None else f"{r['attempt']}/{MAX_ATTEMPTS}"
+    return (
+        f"{_cut(sid, 16):<16} {_cut(r['repo'], 16):<16} {_cut(task, 20):<20}"
+        f" {_cut(r['state'], 8):<8} {q:>4} {fail:>4}"
+        f" {_fmt_age(r['heartbeat_age_seconds']):>5}"
+    )
+
+
+def _render_status(snap) -> str:
+    """Human status view, strictly below 25 lines.
+
+    Layout: attention banner (open escalations with their exact reply
+    command, then a dead orchestrator), daemon + orchestrator vitals,
+    one-row-per-session fleet table, and the 24h digest footer. The
+    line budget is enforced by construction - capped banner, two vital
+    lines, header plus rows bounded by what is left, a "+N more" fold
+    for the overflow - and by a final defensive slice.
+    """
+    lines = _attention_lines(snap)
+    d = snap["vitals"]["daemon"]
+    if d["running"]:
+        pid = d["pid"] if d["pid"] is not None else "-"
+        lines.append(f"daemon: running (pid {pid}, hb {_fmt_age(d['heartbeat_age_seconds'])})")
+    else:
+        lines.append("daemon: stopped")
+    o = snap["vitals"]["orchestrator"]
+    if o["session_id"] is None:
+        lines.append("orchestrator: none")
+    else:
+        lines.append(
+            f"orchestrator: {o['session_id']} {o['status']}"
+            f" (hb {_fmt_age(o['heartbeat_age_seconds'])})"
+        )
+    fleet = snap["fleet"]
+    if not fleet:
+        lines.append("(no active sessions)")
+    else:
+        lines.append(
+            f"{'SID':<16} {'REPO':<16} {'TASK':<20} {'STATE':<8} {'Q':>4} {'FAIL':>4} {'HB':>5}"
+        )
+        # rows get what the budget leaves after banner + vitals +
+        # header + the digest footer
+        avail = STATUS_MAX_LINES - len(lines) - 1
+        shown = fleet[:avail]
+        if len(fleet) > avail:
+            shown = fleet[: max(1, avail - 1)]
+            hidden = len(fleet) - len(shown)
+            lines.extend(_fleet_row_line(r) for r in shown)
+            lines.append(f"+{hidden} more session(s) - see --json")
+        else:
+            lines.extend(_fleet_row_line(r) for r in shown)
+    g = snap["digest"]
+    lines.append(
+        f"24h: done {g['done']} | auto-decisions {g['auto_decisions']}"
+        f" | escalations {g['escalations']}"
+    )
+    return "\n".join(lines[:STATUS_MAX_LINES])
+
+
 def _cmd_status(args) -> int:
     result = pump(args)
     views, events, queue_shown = _session_views(args)
     seen = {(e.kind, e.task_id) for e in result["events"]}
     events = result["events"] + [e for e in events if (e.kind, e.task_id) not in seen]
     queue_depth = _queue_depth(args)
+    snap = _status_snapshot(args)
     data = {
         "sessions": views,
         # queue_depth is the true COUNT(*); queue_shown is what the
@@ -991,6 +1309,12 @@ def _cmd_status(args) -> int:
             ),
             "max": SEMAPHOR,
         },
+        # item_13e2 fleet view: the human render below reads only
+        # these keys; --json carries the uncapped structures
+        "attention": snap["attention"],
+        "vitals": snap["vitals"],
+        "fleet": snap["fleet"],
+        "digest_24h": snap["digest"],
     }
     if result["saturated"]:
         data["saturation_reason"] = "MAX_CONCURRENT_REACHED"
@@ -1000,19 +1324,7 @@ def _cmd_status(args) -> int:
         events=events,
         data=data,
     )
-    lines = ["SESSION | REPO | TRANSPORT | STATE | QUEUE | ACTION"]
-    for v in views:
-        lines.append(
-            f"{v['session']} | {v['repo']} | {v['transport'] or '-'}"
-            f" | {v['state']} | {v['queue']} | {v['action']}"
-        )
-        if v["stderr_tail"]:
-            lines.append(f"    log: {v['log_path']}")
-            for tail_line in v["stderr_tail"].splitlines():
-                lines.append(f"    stderr: {tail_line}")
-    if len(lines) == 1:
-        lines.append("(no sessions)")
-    return _emit(args, resp, ExitCode.OK, "\n".join(lines))
+    return _emit(args, resp, ExitCode.OK, _render_status(snap))
 
 
 def _resolve_ref(ref: str, args):

@@ -26,11 +26,13 @@ from session_bridge.cli.contract import (
     ExitCode,
     JsonResponse,
 )
+from session_bridge.daemon import core as daemon
 from session_bridge.state import db
 from session_bridge.state.contract import (
     AuditEventKind,
     NotificationKind,
     SessionMode,
+    SessionStatus,
     TaskStatus,
     Transport,
 )
@@ -293,9 +295,11 @@ def test_item07_gwt5_status_human_table(env, capsys):
     rc = bridge.main(["status"])
     assert rc == ExitCode.OK
     table = capsys.readouterr().out
-    header = table.splitlines()[0]
-    for col in ("SESSION", "REPO", "TRANSPORT", "STATE", "QUEUE", "ACTION"):
+    header = next(line for line in table.splitlines() if "STATE" in line)
+    for col in ("SID", "REPO", "TASK", "STATE", "Q", "FAIL", "HB"):
         assert col in header
+    # the pushed-but-never-registered session shows as a fleet row
+    assert any(line.startswith("*s1") for line in table.splitlines())
 
 
 # --- GWT-6: push on an unknown session -> not_found, task preserved -----------
@@ -1039,3 +1043,192 @@ def test_item13e1_reply_answers_pending_question(env, capsys):
     assert q["state"] == "answered"
     assert q["answer"] == "A"
     assert q["claimed_by"] == bridge._ESCALATE_CLAIMANT
+
+
+# --- item_13e2: bridge status fleet view --------------------------------------
+
+
+def _status_human(capsys):
+    """``bridge status`` human render; returns the output line list."""
+    rc = bridge.main(["status"])
+    assert rc == ExitCode.OK
+    return capsys.readouterr().out.strip().splitlines()
+
+
+def _stale_heartbeat(path, sid):
+    """Age a session's heartbeat past the bounded stale window."""
+    con = db.connect(path)
+    try:
+        con.execute(
+            "UPDATE worker_heartbeats SET last_seen_at=? WHERE session_id=?",
+            (int(time.time()) - db.HEARTBEAT_STALE_SECONDS - 5, sid),
+        )
+    finally:
+        con.close()
+
+
+def _age_row(path, sql, params, seconds=25 * 3600):
+    """Push a row's timestamp outside the 24h digest window."""
+    con = db.connect(path)
+    try:
+        con.execute(sql, (int(time.time()) - seconds, *params))
+    finally:
+        con.close()
+
+
+def test_item13e2_gwt1_escalation_banner_shows_exact_reply_command(env, capsys):
+    eid = _escalation(env)
+    lines = _status_human(capsys)
+    assert len(lines) < 25
+    banner = lines[0]
+    assert banner.startswith(f"ESCALATED #{eid}: question_limit")
+    assert f"reply: bridge escalate reply {eid} A|B|defer|abort|override:<text>" in banner
+    # --json carries the same escalation, structured
+    _rc, out = _run(["status", "--json"], capsys)
+    esc = [a for a in out["data"]["attention"] if a["kind"] == "escalation"]
+    assert esc[0]["audit_id"] == eid
+    assert esc[0]["reply_command"] == (
+        f"bridge escalate reply {eid} A|B|defer|abort|override:<text>"
+    )
+    # resolving the escalation drops the banner
+    assert db.resolve_escalation(eid, "A", path=env.db)
+    lines = _status_human(capsys)
+    assert not any(line.startswith("ESCALATED") for line in lines)
+
+
+def test_item13e2_gwt2_healthy_fleet_compact_view(env, capsys):
+    _run(
+        ["register", "orc1", "--role", "orchestrator", "--workspace", "/repos/ctl", "--json"],
+        capsys,
+    )
+    _run(["register", "w1", "--workspace", "/repos/alpha", "--json"], capsys)
+    tid = _task(env, sid="w1", text="implement login")
+    res = db.ask("w1", tid, "which branch?", path=env.db)
+    assert res.accepted
+    # daemon vitals: a held flock + a fresh heartbeat stamp
+    sdir = str(Path(env.db).parent)
+    lock_fd = daemon._acquire_lock(sdir)
+    daemon._write_heartbeat(sdir)
+    try:
+        lines = _status_human(capsys)
+    finally:
+        os.close(lock_fd)
+    assert len(lines) < 25
+    text = "\n".join(lines)
+    assert "daemon: running (pid " in text
+    assert "orchestrator: orc1 active (hb " in text
+    header = next(line for line in lines if "STATE" in line)
+    for col in ("SID", "REPO", "TASK", "STATE", "Q", "FAIL", "HB"):
+        assert col in header
+    # orchestrator sorts first, worker row carries task + budgets
+    assert lines[lines.index(header) + 1].startswith("orc1")
+    w1 = next(line for line in lines if line.startswith("w1"))
+    assert "alpha" in w1
+    assert f"#{tid} implement login" in w1
+    # a registered unmanaged session is "known": pump dispatched the
+    # task to an acp worker, so the row shows running
+    assert "running" in w1
+    assert "1/3" in w1
+    assert "0/2" in w1
+    assert env.spawned == [(tid, db.get_task(tid, path=env.db)["lease_owner"])]
+    assert lines[-1].startswith("24h: done ")
+
+
+def test_item13e2_gwt3_empty_db_minimal_view_no_crash(env, capsys):
+    lines = _status_human(capsys)
+    assert len(lines) < 25
+    text = "\n".join(lines)
+    assert "daemon: stopped" in text
+    assert "orchestrator: none" in text
+    assert "(no active sessions)" in text
+    assert "24h: done 0 | auto-decisions 0 | escalations 0" in text
+
+
+def test_item13e2_orchestrator_dead_banner_and_hint(env, capsys):
+    _run(["register", "orc1", "--role", "orchestrator", "--json"], capsys)
+    # a heartbeat past the stale window flags the banner even before
+    # the daemon's next sweep marks the row dead
+    _stale_heartbeat(env.db, "orc1")
+    lines = _status_human(capsys)
+    assert len(lines) < 25
+    assert (
+        "ORCHESTRATOR DEAD: reopen session, bridge register --role orchestrator [--force]"
+    ) in lines
+    assert any(line.startswith("orchestrator: orc1") for line in lines)
+    # a live heartbeat clears the banner
+    db.heartbeat("orc1", path=env.db)
+    lines = _status_human(capsys)
+    assert not any(line.startswith("ORCHESTRATOR DEAD") for line in lines)
+
+
+def test_item13e2_dead_session_compact_marker(env, capsys):
+    _run(["register", "w1", "--json"], capsys)
+    assert db.set_session_status("w1", SessionStatus.DEAD, path=env.db)
+    lines = _status_human(capsys)
+    row = next(line for line in lines if line.startswith("w1"))
+    # the dead marker is the state column, not a dropped row
+    assert "dead" in row.split()
+
+
+def test_item13e2_digest_counts_24h_window(env, capsys):
+    tid = _task(env)
+    owner = _claim_acp(env, tid)
+    assert db.finish_task(tid, owner, ok=True, path=env.db)
+    old = _task(env, sid="s2")
+    o2 = _claim_acp(env, old, owner="acp-2-2")
+    assert db.finish_task(old, o2, ok=True, path=env.db)
+    _age_row(env.db, "UPDATE tasks SET updated_at=? WHERE id=?", (old,))
+    db.audit(AuditEventKind.DELIBERATION, session_id="w1", question_text="q1", path=env.db)
+    stale_delib = db.audit(
+        AuditEventKind.DELIBERATION, session_id="w1", question_text="q2", path=env.db
+    )
+    _age_row(env.db, "UPDATE audit_events SET created_at=? WHERE id=?", (stale_delib,))
+    _escalation(env)
+    lines = _status_human(capsys)
+    assert lines[-1] == "24h: done 1 | auto-decisions 1 | escalations 1"
+
+
+def test_item13e2_line_cap_under_fleet_and_banner_overflow(env, capsys):
+    for i in range(40):
+        _run(["register", f"w{i:02d}", "--json"], capsys)
+    for _ in range(8):
+        _escalation(env)
+    lines = _status_human(capsys)
+    assert len(lines) <= bridge.STATUS_MAX_LINES
+    assert len(lines) < 25
+    text = "\n".join(lines)
+    # the banner folds past its own cap, the fleet folds into "+N more"
+    assert "+3 more open escalation(s) - bridge escalate show" in text
+    assert "more session(s) - see --json" in text
+    # vitals, table header and the digest footer still render
+    assert any(line.startswith("daemon:") for line in lines)
+    assert any(line.startswith("orchestrator:") for line in lines)
+    assert "STATE" in text
+    assert lines[-1].startswith("24h: done ")
+
+
+def test_item13e2_status_json_carries_fleet_detail(env, capsys):
+    _run(["register", "orc1", "--role", "orchestrator", "--json"], capsys)
+    _run(["register", "w1", "--workspace", "/tmp/alpha", "--json"], capsys)
+    tid = _task(env, sid="w1")
+    assert db.ask("w1", tid, "q?", path=env.db).accepted
+    _escalation(env)
+    rc, out = _run(["status", "--json"], capsys)
+    assert rc == ExitCode.OK
+    resp = JsonResponse.model_validate(out)
+    data = resp.data
+    assert data["vitals"]["daemon"]["running"] is False
+    assert data["vitals"]["orchestrator"]["session_id"] == "orc1"
+    fleet = {r["session_id"]: r for r in data["fleet"]}
+    assert fleet["orc1"]["role"] == "orchestrator"
+    assert fleet["orc1"]["state"] == "idle"
+    assert fleet["w1"]["registered"] is True
+    assert fleet["w1"]["task_id"] == tid
+    # pump dispatched the queued task to an acp worker (w1 is a known,
+    # unmanaged, unlocked session)
+    assert fleet["w1"]["task_status"] == TaskStatus.RUNNING.value
+    assert fleet["w1"]["state"] == "running"
+    assert fleet["w1"]["questions"] == 1
+    assert fleet["w1"]["attempt"] == 0
+    assert fleet["w1"]["heartbeat_age_seconds"] is not None
+    assert data["digest_24h"] == {"done": 0, "auto_decisions": 0, "escalations": 1}
