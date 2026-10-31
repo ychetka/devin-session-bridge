@@ -131,7 +131,8 @@ PRAGMA user_version=1;
 
 # Columns the v2 schema adds to sessions. CREATE TABLE IF NOT EXISTS
 # cannot extend a pre-v2 sessions table, so init() applies these
-# ALTERs idempotently (guarded on PRAGMA table_info).
+# ALTERs idempotently (guarded on PRAGMA table_info inside one
+# BEGIN IMMEDIATE transaction).
 _SESSION_COLUMN_MIGRATIONS = (
     ("role", "TEXT NOT NULL DEFAULT 'worker'"),
     ("mode", "TEXT NOT NULL DEFAULT 'unmanaged'"),
@@ -196,7 +197,18 @@ def connect(path=None) -> sqlite3.Connection:
 
 
 def init(path=None) -> None:
-    """Create the schema (idempotent) and set user_version=1."""
+    """Create the schema (idempotent) and stamp user_version=2.
+
+    The v2 sessions-column migration is a check-then-ALTER sequence:
+    it must run inside one BEGIN IMMEDIATE transaction so concurrent
+    init() calls on a pre-v2 file serialize on the writer lock. Outside
+    a transaction both racers could pass the table_info check and the
+    loser would die on a "duplicate column name" error, which is not a
+    retryable SQLITE_BUSY. A busy BEGIN IMMEDIATE IS retryable, so the
+    loser waits out the winner's migration and then finds every column
+    already present. user_version=2 commits atomically with the ALTERs,
+    so it only ever stamps a file that actually has the v2 columns.
+    """
     target = _path(path)
     parent = os.path.dirname(target)
     if parent:
@@ -206,10 +218,18 @@ def init(path=None) -> None:
         con = connect(target)
         try:
             con.executescript(_SCHEMA)
-            existing = {r["name"] for r in con.execute("PRAGMA table_info(sessions)")}
-            for col, decl in _SESSION_COLUMN_MIGRATIONS:
-                if col not in existing:
-                    con.execute(f"ALTER TABLE sessions ADD COLUMN {col} {decl}")
+            con.execute("BEGIN IMMEDIATE")
+            try:
+                existing = {r["name"] for r in con.execute("PRAGMA table_info(sessions)")}
+                for col, decl in _SESSION_COLUMN_MIGRATIONS:
+                    if col not in existing:
+                        con.execute(f"ALTER TABLE sessions ADD COLUMN {col} {decl}")
+                con.execute("PRAGMA user_version=2")
+                con.execute("COMMIT")
+            except BaseException:
+                if con.in_transaction:
+                    con.execute("ROLLBACK")
+                raise
         finally:
             con.close()
 

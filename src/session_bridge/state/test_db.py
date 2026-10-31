@@ -207,7 +207,7 @@ def test_item04_gwt6_missing_db_initialized_corrupt_rejected(tmp_path):
     path = str(tmp_path / "sub" / "state.db")
     db.init(path)
     version = _one(path, "PRAGMA user_version")[0]
-    assert version == 1
+    assert version == 2
     journal = _one(path, "PRAGMA journal_mode")[0]
     assert journal == "wal"
     busy = _one(path, "PRAGMA busy_timeout")[0]
@@ -914,3 +914,44 @@ def test_item13b1_migration_old_schema_db(tmp_path):
     assert db.get_session("s1", path=path)["cwd"] == "/new"
     res = db.register("orc", "/repo", role="orchestrator", path=path)
     assert res.accepted is True
+
+
+def test_item13b1_migration_concurrent_init(tmp_path):
+    # a pre-v2 state.db raced by several init() calls: the
+    # check-then-ALTER migration runs inside BEGIN IMMEDIATE, so the
+    # losers wait on the writer lock instead of dying on a
+    # "duplicate column name" OperationalError
+    path = str(tmp_path / "state.db")
+    con = sqlite3.connect(path)
+    con.executescript(
+        """
+        CREATE TABLE sessions(
+          session_id TEXT PRIMARY KEY,
+          cwd TEXT,
+          title TEXT,
+          queue_paused INTEGER NOT NULL DEFAULT 0,
+          park_cycles_left INTEGER NOT NULL DEFAULT 5,
+          note TEXT,
+          updated_at INTEGER NOT NULL
+        );
+        INSERT INTO sessions(session_id,cwd,title,updated_at)
+          VALUES('s1','/old','t',1);
+        """
+    )
+    con.commit()
+    con.close()
+
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        list(ex.map(lambda _: db.init(path), range(8)))
+
+    row = db.get_session("s1", path=path)
+    assert row["cwd"] == "/old"
+    assert row["role"] == "worker"
+    assert row["mode"] == "unmanaged"
+    assert row["status"] == "active"
+    # user_version=2 commits with the ALTERs, so 2 certifies v2 columns
+    assert _one(path, "PRAGMA user_version")[0] == 2
+
+    # an already-migrated file: further init() stays a no-op
+    db.init(path)
+    assert db.get_session("s1", path=path)["cwd"] == "/old"
