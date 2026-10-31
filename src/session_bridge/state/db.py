@@ -17,8 +17,15 @@ Message bus slice (schema v2, item_13b1): the sessions table gains
 files), ``worker_heartbeats`` holds the authoritative liveness and
 generation rows, and ``register``/``heartbeat`` implement the
 orchestrator CAS singleton and the liveness protocol.
+
+Bus slice 2 (item_13b2) adds the worker>orchestrator question
+channel (``questions``, one pending per task enforced by a partial
+unique index) and the append-only ``audit_events`` journal. Both are
+plain CREATE TABLE IF NOT EXISTS additions - an existing state.db
+picks them up on the next init() with no migration.
 """
 
+import json
 import os
 import re
 import sqlite3
@@ -28,15 +35,20 @@ from enum import Enum
 
 from .contract import (
     BUSY_TIMEOUT_MS,
+    CLAIM_TIMEOUT_SECONDS,
     JOURNAL_MODE,
     LEASE_SECONDS,
     LIVE_STATUSES,
     MAX_ATTEMPTS,
+    MAX_QUESTIONS_PER_TASK,
     WRITER_RETRIES,
+    AuditEventKind,
+    QuestionState,
     SessionRole,
     SessionStatus,
     TaskStatus,
     Transport,
+    validate_question_transition,
 )
 
 
@@ -124,6 +136,50 @@ CREATE TABLE IF NOT EXISTS worker_heartbeats (
   session_id TEXT PRIMARY KEY,
   last_seen_at INTEGER NOT NULL,
   generation INTEGER NOT NULL DEFAULT 0
+);
+
+-- Question channel (worker > orchestrator). ``session_id`` is the
+-- asking worker, ``claimed_by`` the claiming orchestrator.
+CREATE TABLE IF NOT EXISTS questions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  task_id INTEGER NOT NULL,
+  session_id TEXT NOT NULL,
+  text TEXT NOT NULL,
+  state TEXT NOT NULL,
+  answer TEXT,
+  claimed_by TEXT,
+  asked_at INTEGER NOT NULL,
+  claimed_at INTEGER,
+  answered_at INTEGER
+);
+
+-- At most one PENDING question per task; this is what ask() relies on
+-- (a single row cannot see its siblings, so the invariant lives in
+-- the index, mirroring ux_tasks_live_session).
+CREATE UNIQUE INDEX IF NOT EXISTS ux_questions_pending_task
+  ON questions(task_id) WHERE state='pending';
+
+-- Supports the orchestrator's pending-question scan.
+CREATE INDEX IF NOT EXISTS ix_questions_state ON questions(state);
+
+-- Append-only audit log: deliberation pipeline rows (question >
+-- partner outputs > synthesis > directive), escalation doa triggers
+-- and turn/watcher rotations. Written, never updated.
+CREATE TABLE IF NOT EXISTS audit_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  kind TEXT NOT NULL,
+  session_id TEXT,
+  task_id INTEGER,
+  question_id INTEGER,
+  question_text TEXT,
+  partner_outputs TEXT,
+  synthesis TEXT,
+  directive TEXT,
+  doa_trigger TEXT,
+  asked_at INTEGER,
+  claimed_at INTEGER,
+  answered_at INTEGER,
+  created_at INTEGER NOT NULL
 );
 
 PRAGMA user_version=1;
@@ -1162,6 +1218,307 @@ def heartbeat(session_id: str, *, path=None) -> int:
         try:
             row = con.execute(_HEARTBEAT_UPSERT, (session_id, ts)).fetchone()
             return int(row["generation"])
+        finally:
+            con.close()
+
+    return _retry(op)
+
+
+# --- message bus: questions ---------------------------------------------------
+
+
+@dataclass(frozen=True)
+class AskResult:
+    """Outcome of ``ask()``.
+
+    On ``accepted=False`` ``reason`` says why the ask was refused:
+    ``"question_limit"`` when the task already carries
+    MAX_QUESTIONS_PER_TASK questions counting every state (the
+    escalation to the human lives above this layer - here it is only
+    the refusal), ``"pending_exists"`` when another pending question
+    already holds the task's slot.
+    """
+
+    accepted: bool
+    question_id: int | None = None
+    reason: str | None = None
+
+
+def ask(session_id: str, task_id: int, text: str, *, path=None) -> AskResult:
+    """Post a worker question for ``task_id``; returns an ``AskResult``.
+
+    Two refusals, both structured in the result: the per-task question
+    budget (MAX_QUESTIONS_PER_TASK across all states) and a second
+    pending question on the same task. The pending guard is atomic -
+    the ``ux_questions_pending_task`` partial unique index turns a
+    concurrent double-ask into an IntegrityError for the loser, so no
+    SELECT-then-INSERT race can produce two pending rows.
+    """
+    if not text:
+        raise ValueError("ask requires question text")
+    ts = _now()
+
+    def op():
+        con = connect(path)
+        try:
+            count = con.execute(
+                "SELECT COUNT(*) AS c FROM questions WHERE task_id=?",
+                (task_id,),
+            ).fetchone()["c"]
+            if count >= MAX_QUESTIONS_PER_TASK:
+                return AskResult(accepted=False, reason="question_limit")
+            try:
+                cur = con.execute(
+                    "INSERT INTO questions(task_id,session_id,text,state,asked_at)"
+                    " VALUES(?,?,?,?,?)",
+                    (
+                        task_id,
+                        session_id,
+                        text,
+                        QuestionState.PENDING.value,
+                        ts,
+                    ),
+                )
+            except sqlite3.IntegrityError:
+                return AskResult(accepted=False, reason="pending_exists")
+            return AskResult(accepted=True, question_id=cur.lastrowid)
+        finally:
+            con.close()
+
+    return _retry(op)
+
+
+def claim_question(question_id: int, claimant: str, *, path=None) -> bool:
+    """CAS ``pending > claimed`` for ``claimant``; rowcount decides.
+
+    A single atomic UPDATE guarded on ``state='pending'`` - concurrent
+    claims yield exactly one winner, a late claim on a claimed or
+    answered question simply loses.
+    """
+    if not claimant or not claimant.strip():
+        raise ValueError("claim_question requires a claimant")
+    validate_question_transition(QuestionState.PENDING, QuestionState.CLAIMED)
+    ts = _now()
+
+    def op():
+        con = connect(path)
+        try:
+            cur = con.execute(
+                "UPDATE questions SET state=?, claimed_by=?, claimed_at=? WHERE id=? AND state=?",
+                (
+                    QuestionState.CLAIMED.value,
+                    claimant,
+                    ts,
+                    question_id,
+                    QuestionState.PENDING.value,
+                ),
+            )
+            return cur.rowcount == 1
+        finally:
+            con.close()
+
+    return _retry(op)
+
+
+def answer_question(question_id: int, answer_text: str, *, path=None) -> bool:
+    """CAS ``claimed > answered``; stores the answer verbatim.
+
+    Returns False on a pending question (not yet claimed) and on an
+    already answered one - ``answered`` is terminal.
+    """
+    if answer_text is None:
+        raise ValueError("answer_question requires answer text")
+    validate_question_transition(QuestionState.CLAIMED, QuestionState.ANSWERED)
+    ts = _now()
+
+    def op():
+        con = connect(path)
+        try:
+            cur = con.execute(
+                "UPDATE questions SET state=?, answer=?, answered_at=? WHERE id=? AND state=?",
+                (
+                    QuestionState.ANSWERED.value,
+                    answer_text,
+                    ts,
+                    question_id,
+                    QuestionState.CLAIMED.value,
+                ),
+            )
+            return cur.rowcount == 1
+        finally:
+            con.close()
+
+    return _retry(op)
+
+
+def janitor_questions(*, path=None) -> list[int]:
+    """Release claims older than CLAIM_TIMEOUT_SECONDS back to pending.
+
+    Mirrors ``Question.release_claim``: a single UPDATE returns every
+    stale ``claimed`` row to ``pending`` with the claim fields cleared,
+    keeping the row (and its id) so a claim timeout never produces a
+    duplicate re-ask. A stale claim is skipped while a newer pending
+    question already holds the task's slot - releasing it would trip
+    the unique pending index, so it stays claimed for the next pass.
+
+    At most one stale claim per task is released per pass (the lowest
+    id): the pending guard is evaluated against the pre-update
+    snapshot, so two stale claims on one task would both pass it and
+    the second would abort the whole sweep on the unique pending
+    index. Remaining stale claims are caught by the next pass once the
+    slot frees. Returns the ids this call actually released.
+    """
+    validate_question_transition(QuestionState.CLAIMED, QuestionState.PENDING, janitor=True)
+    cutoff = _now() - CLAIM_TIMEOUT_SECONDS
+
+    def op():
+        con = connect(path)
+        try:
+            rows = con.execute(
+                "UPDATE questions SET state=?, claimed_by=NULL,"
+                " claimed_at=NULL"
+                " WHERE state=? AND claimed_at<?"
+                " AND NOT EXISTS ("
+                "  SELECT 1 FROM questions q2"
+                "  WHERE q2.task_id=questions.task_id AND q2.state=?)"
+                " AND id = ("
+                "  SELECT MIN(q3.id) FROM questions q3"
+                "  WHERE q3.task_id=questions.task_id"
+                "  AND q3.state=? AND q3.claimed_at<?)"
+                " RETURNING id",
+                (
+                    QuestionState.PENDING.value,
+                    QuestionState.CLAIMED.value,
+                    cutoff,
+                    QuestionState.PENDING.value,
+                    QuestionState.CLAIMED.value,
+                    cutoff,
+                ),
+            ).fetchall()
+            return [r["id"] for r in rows]
+        finally:
+            con.close()
+
+    return _retry(op)
+
+
+def get_question(question_id: int, *, path=None):
+    def op():
+        con = connect(path)
+        try:
+            return con.execute("SELECT * FROM questions WHERE id=?", (question_id,)).fetchone()
+        finally:
+            con.close()
+
+    return _retry(op)
+
+
+def list_pending_questions(*, task_id=None, path=None):
+    """Pending questions in ask order (``ORDER BY id``), the queue the
+    orchestrator deliberates over. ``task_id`` narrows the scan to a
+    single task."""
+
+    def op():
+        con = connect(path)
+        try:
+            if task_id is not None:
+                return con.execute(
+                    "SELECT * FROM questions WHERE state=? AND task_id=? ORDER BY id",
+                    (QuestionState.PENDING.value, task_id),
+                ).fetchall()
+            return con.execute(
+                "SELECT * FROM questions WHERE state=? ORDER BY id",
+                (QuestionState.PENDING.value,),
+            ).fetchall()
+        finally:
+            con.close()
+
+    return _retry(op)
+
+
+def pending_questions_count(task_id: int, *, path=None) -> int:
+    """COUNT of pending questions for a task (0 or 1 - the partial
+    unique index caps it)."""
+
+    def op():
+        con = connect(path)
+        try:
+            return int(
+                con.execute(
+                    "SELECT COUNT(*) AS c FROM questions WHERE task_id=? AND state=?",
+                    (task_id, QuestionState.PENDING.value),
+                ).fetchone()["c"]
+            )
+        finally:
+            con.close()
+
+    return _retry(op)
+
+
+# --- message bus: audit log ---------------------------------------------------
+
+_AUDIT_KINDS = frozenset(k.value for k in AuditEventKind)
+
+
+def audit(
+    kind,
+    *,
+    session_id: str | None = None,
+    task_id: int | None = None,
+    question_id: int | None = None,
+    question_text: str | None = None,
+    partner_outputs=None,
+    synthesis: str | None = None,
+    directive: str | None = None,
+    doa_trigger: str | None = None,
+    asked_at: int | None = None,
+    claimed_at: int | None = None,
+    answered_at: int | None = None,
+    path=None,
+) -> int:
+    """Append one row to ``audit_events``; returns the event id.
+
+    Append-only: the journal is written, never updated. ``kind``
+    accepts the contract enum or its string value. ``partner_outputs``
+    is a dict keyed by partner name stored verbatim as JSON text (a
+    pre-serialized JSON string is stored as-is); it defaults to the
+    contract's empty dict.
+    """
+    kind_v = _val(kind)
+    if kind_v not in _AUDIT_KINDS:
+        raise ValueError(f"unknown audit event kind: {kind_v!r}")
+    if isinstance(partner_outputs, str):
+        outputs_json = partner_outputs
+    else:
+        outputs_json = json.dumps(partner_outputs or {})
+    ts = _now()
+
+    def op():
+        con = connect(path)
+        try:
+            cur = con.execute(
+                "INSERT INTO audit_events"
+                "(kind,session_id,task_id,question_id,question_text,"
+                " partner_outputs,synthesis,directive,doa_trigger,"
+                " asked_at,claimed_at,answered_at,created_at)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    kind_v,
+                    session_id,
+                    task_id,
+                    question_id,
+                    question_text,
+                    outputs_json,
+                    synthesis,
+                    directive,
+                    doa_trigger,
+                    asked_at,
+                    claimed_at,
+                    answered_at,
+                    ts,
+                ),
+            )
+            return cur.lastrowid
         finally:
             con.close()
 
