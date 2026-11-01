@@ -49,7 +49,8 @@ import time
 
 from session_bridge.mailbox import write_message
 from session_bridge.state import db
-from session_bridge.state.contract import SessionRole, SessionStatus
+from session_bridge.state.contract import SessionMode, SessionRole, SessionStatus
+from session_bridge.wake import WakeError, WakePolicy, find_lockfile, wake_session
 
 __all__ = [
     "DECISION_LOG_FILENAME",
@@ -431,6 +432,82 @@ def _sweep_pass(db_path, state_directory, notify_send, now: int) -> None:
         )
 
 
+# Hard ceiling for one _wake_pass: the poll loop must never stall on
+# wake work - leftovers are retried by the next pass.
+_WAKE_PASS_DEADLINE_SECONDS = 120
+
+
+def _wake_candidates(db_path, now: int):
+    """Managed sessions with stale heartbeat and unacked relayed mail.
+
+    These are the sessions the mailbox alone cannot reach: no turn is
+    open (heartbeat stale, or never heartbeated) while mail waits in
+    the fs queue, so the daemon gives them a nudge prompt through the
+    acp-host (item_16).
+    """
+    cutoff = now - db.HEARTBEAT_STALE_SECONDS
+    con = db.connect(db_path)
+    try:
+        return con.execute(
+            "SELECT DISTINCT s.session_id AS sid, s.cwd AS cwd"
+            " FROM sessions s"
+            " LEFT JOIN worker_heartbeats wh ON wh.session_id=s.session_id"
+            " WHERE s.mode=?"
+            " AND (wh.last_seen_at IS NULL OR wh.last_seen_at<=?)"
+            " AND EXISTS (SELECT 1 FROM notifications n"
+            "             WHERE n.session_id=s.session_id"
+            "               AND n.relayed_at IS NOT NULL"
+            "               AND n.ack_at IS NULL)",
+            (SessionMode.MANAGED.value, cutoff),
+        ).fetchall()
+    finally:
+        con.close()
+
+
+def _wake_pass(db_path, state_directory, now: int, policy: WakePolicy) -> None:
+    """Nudge idle managed sessions that have mail waiting (item_16).
+
+    Runs after the relay pass so the same pass can already wake a
+    recipient of fresh mail. The wake carries no payload - it is a
+    "drain your mailbox" prompt over the acp-host ACP channel; the fs
+    mailbox stays the only data channel, so a lost or double wake is
+    harmless. Pacing (per-session cooldown, per-host circuit breaker)
+    lives in ``policy``; outcome events land in the decision log.
+    """
+    lock_data = find_lockfile()
+    host_key = lock_data["_path"] if lock_data else "none"
+    deadline = time.monotonic() + _WAKE_PASS_DEADLINE_SECONDS
+    for row in _wake_candidates(db_path, now):
+        if time.monotonic() >= deadline:
+            _decision(
+                state_directory,
+                "wake_pass_deadline",
+                detail="remaining candidates deferred to next pass",
+            )
+            break
+        sid = row["sid"]
+        if policy.check(sid, host_key) is not None:
+            continue  # cooldown or open breaker - normal pacing
+        policy.record_attempt(sid)
+        try:
+            outcome = wake_session(sid, row["cwd"], lock_data=lock_data)
+        except WakeError as e:
+            opened = policy.record_result(host_key, False)
+            _decision(state_directory, "wake_failed", sid, f"reason={e.reason} {e}")
+            if opened:
+                _decision(
+                    state_directory,
+                    "wake_breaker_open",
+                    detail=f"host={host_key} suspended",
+                )
+            continue
+        policy.record_result(host_key, True)
+        if outcome == "busy":
+            _decision(state_directory, "wake_skipped_busy", sid)
+            continue
+        _decision(state_directory, "wake_sent", sid, f"outcome={outcome}")
+
+
 def _question_janitor_pass(db_path, state_directory) -> None:
     """Release question claims that outlived CLAIM_TIMEOUT_SECONDS.
 
@@ -492,6 +569,7 @@ def run(
     if jitter is None:
         jitter = STARTUP_JITTER_SECONDS
     notify = notify_send or _notify_send
+    wake_policy = WakePolicy()
     stop = threading.Event()
 
     def _on_term(_signum, _frame):
@@ -519,6 +597,7 @@ def run(
                 now = int(time.time())
                 _schedule_pass(db_path, state_directory, now)
                 _relay_pass(db_path, queue_dir, state_directory)
+                _wake_pass(db_path, state_directory, now, wake_policy)
                 _sweep_pass(db_path, state_directory, notify, now)
                 _question_janitor_pass(db_path, state_directory)
             except Exception as e:

@@ -78,6 +78,7 @@ from session_bridge.state.contract import (
     TaskStatus,
     Transport,
 )
+from session_bridge.wake import WakeError, wake_session
 
 __all__ = ["main", "pump"]
 
@@ -1722,6 +1723,40 @@ def _cmd_heartbeat(args) -> int:
     return _emit(args, resp, ExitCode.OK, human)
 
 
+def _cmd_wake(args) -> int:
+    """``bridge wake <sid>``: manual acp-host wake nudge (item_16).
+
+    Attaches to the local acp-host and injects the fixed drain nudge
+    into the session - the same path the daemon's ``_wake_pass`` uses.
+    Bypasses the daemon cooldown but keeps the busy check: a session
+    mid-turn is never prompted. ``--prompt`` overrides the nudge text.
+    """
+    sid = args.session_id
+    try:
+        outcome = wake_session(
+            sid,
+            _session_cwd(sid, args),
+            nudge=args.prompt or None,
+        )
+    except WakeError as e:
+        resp = JsonResponse(
+            session=sid,
+            status="error",
+            error=f"wake failed ({e.reason}): {e}",
+        )
+        return _emit(args, resp, ExitCode.CONFLICT, f"wake {sid}: {e.reason} - {e}")
+    resp = JsonResponse(session=sid, status=outcome)
+    if outcome == "busy":
+        return _emit(
+            args,
+            resp,
+            ExitCode.CONFLICT,
+            f"wake {sid}: session is mid-turn - not prompted",
+        )
+    human = f"wake {sid}: prompt {outcome}"
+    return _emit(args, resp, ExitCode.OK, human)
+
+
 # --- orchestrator question queue: list / claim / answer (item_13g) ---------------
 
 
@@ -2466,6 +2501,15 @@ def _parse_args(argv) -> argparse.Namespace:
     sp.add_argument("session_id")
     _add_json(sp)
 
+    sp = sub.add_parser(
+        "wake", help="acp-host wake nudge: prompt an idle session to drain its mailbox"
+    )
+    sp.add_argument("session_id")
+    sp.add_argument(
+        "--prompt", help="override the default drain-nudge text", default=None
+    )
+    _add_json(sp)
+
     sp = sub.add_parser("disarm", help="leave managed mode (--all for the fleet)")
     sp.add_argument("session_id", nargs="?", default=None)
     sp.add_argument(
@@ -2665,6 +2709,7 @@ _HANDLERS = {
     Command.RETRY.value: _cmd_retry,
     Command.WORK.value: _cmd_work,
     "arm": _cmd_arm,
+    "wake": _cmd_wake,
     "disarm": _cmd_disarm,
     "daemon": _cmd_daemon,
     "register": _cmd_register,
