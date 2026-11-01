@@ -436,6 +436,12 @@ def _sweep_pass(db_path, state_directory, notify_send, now: int) -> None:
 # wake work - leftovers are retried by the next pass.
 _WAKE_PASS_DEADLINE_SECONDS = 120
 
+# WakeError reasons that blame the SESSION, not the acp-host: a
+# successful attach+list happened before the failure, so they must
+# not count against the host circuit breaker (a fleet of dead tabs
+# would otherwise suspend every wake).
+_SESSION_LEVEL_REASONS = {"no_session", "rpc_error"}
+
 
 def _wake_candidates(db_path, now: int):
     """Managed sessions with stale heartbeat and unacked relayed mail.
@@ -495,7 +501,13 @@ def _wake_pass(db_path, state_directory, now: int, policy: WakePolicy) -> None:
         try:
             outcome = wake_session(sid, row["cwd"], lock_data=lock_data)
         except WakeError as e:
-            opened = policy.record_result(host_key, False)
+            if e.reason in _SESSION_LEVEL_REASONS:
+                # attach+list worked - the host is healthy even
+                # though this session could not be woken
+                policy.record_result(host_key, True)
+                opened = False
+            else:
+                opened = policy.record_result(host_key, False)
             _decision(state_directory, "wake_failed", sid, f"reason={e.reason} {e}")
             if opened:
                 _decision(

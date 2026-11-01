@@ -22,9 +22,11 @@ Wire protocol (verified against the production host):
    ``session/prompt`` with the nudge -> detach.
 
 Every step is bounded - a wake attempt has an overall deadline and
-can never stall the daemon loop. ``ATTACH_LOCK`` serializes all
-attaches process-wide (daemon pass and manual ``bridge wake`` can
-never overlap).
+can never stall the daemon loop. ``ATTACH_LOCK`` serializes attaches
+inside one process (the daemon is the only automatic waker and is
+single-instance via its flock; a manual ``bridge wake`` in another
+process can overlap an attach - the acp-host multiplexes clients, so
+two concurrent attaches degrade to two short nudges at worst).
 
 Security and race notes:
 
@@ -115,14 +117,18 @@ class WakeError(Exception):
 
 
 def find_lockfile(lock_dir: str | None = None):
-    """Newest readable ``acp-host-*.lock`` dict, or ``None``.
+    """Newest readable ``acp-host-*.lock`` with a LIVE pid, or ``None``.
 
     Re-read on every call - the host can restart with a fresh port and
-    token between daemon passes, so nothing is cached.
+    token between daemon passes, so nothing is cached. A stale (dead
+    pid) lockfile must not mask a live older one: candidates are tried
+    newest-first and the first whose pid is running wins; when nothing
+    is alive the newest parseable file is returned so ``_attach`` can
+    still report a distinct ``wake_host_down``.
     """
     base = lock_dir or os.environ.get(_LOCK_DIR_ENV) or DEFAULT_LOCK_DIR
     candidates = glob.glob(os.path.join(os.path.expanduser(base), "acp-host-*.lock"))
-    best = None
+    valid = []  # (mtime, data, path), newest first
     for path in candidates:
         try:
             with open(path) as fh:
@@ -135,12 +141,17 @@ def find_lockfile(lock_dir: str | None = None):
             mtime = os.path.getmtime(path)
         except OSError:
             continue
-        if best is None or mtime > best[0]:
-            best = (mtime, data, path)
-    if best is None:
+        valid.append((mtime, data, path))
+    if not valid:
         return None
-    data = dict(best[1])
-    data["_path"] = best[2]
+    valid.sort(key=lambda item: item[0], reverse=True)
+    for _, data, path in valid:
+        if pid_alive(data.get("pid")):
+            data = dict(data)
+            data["_path"] = path
+            return data
+    data = dict(valid[0][1])
+    data["_path"] = valid[0][2]
     return data
 
 
@@ -274,7 +285,13 @@ def _attach(lock_data: dict, agent_id: str):
             f"stale lockfile {lock_data.get('_path', '?')}: pid {pid} is not running",
         )
     try:
-        sock = socket.create_connection(("127.0.0.1", int(port)), timeout=_CONNECT_TIMEOUT)
+        port = int(port)
+    except (TypeError, ValueError) as e:
+        raise WakeError(
+            "malformed_lockfile", f"lockfile port {port!r} is not an int"
+        ) from e
+    try:
+        sock = socket.create_connection(("127.0.0.1", port), timeout=_CONNECT_TIMEOUT)
     except (ConnectionRefusedError, OSError) as e:
         raise WakeError("wake_host_down", f"cannot reach acp-host at :{port}: {e}") from e
     chan = _SocketChannel(sock)
@@ -372,13 +389,19 @@ def wake_session(
                 {"sessionId": session_id, "cwd": wake_cwd, "mcpServers": []},
             )
             load_id = req
+            load_done = True
             try:
                 _await_response(chan, load_id, replay_timeout, replay_cap)
             except WakeError as e:
                 if e.reason != "timeout":
                     raise
                 # replay overflow: the load response is display data,
-                # so a flooded channel is tolerated - press on
+                # so a flooded channel is tolerated - press on. But
+                # unread replay still queued on the socket can mention
+                # this session_id, so post-prompt session/update frames
+                # no longer prove a live turn - only a matching prompt
+                # response does.
+                load_done = False
 
             nudge = nudge or nudge_text(session_id)
             req += 1
@@ -406,7 +429,7 @@ def wake_session(
                     raise
                 if "method" in msg:
                     params = msg.get("params") or {}
-                    if params.get("sessionId") == session_id:
+                    if params.get("sessionId") == session_id and load_done:
                         return "sent"
                     continue
                 if msg.get("id") == prompt_id:

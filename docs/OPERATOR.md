@@ -342,9 +342,12 @@ notification state):
 
 Pacing: per-session cooldown 300s between wake attempts, shortened
 to 60s after a `sent_unconfirmed` outcome (prompt written but no
-turn evidence) so a silently missed nudge self-heals; all attaches
-are serialized on a process-wide lock so the daemon pass and a
-manual `bridge wake` can never overlap.
+turn evidence, doubling 60/120/240 capped at the cooldown on a
+streak) so a silently missed nudge self-heals; attaches are
+serialized inside each process and the daemon is single-instance
+via its flock - a manual `bridge wake` could overlap a daemon
+attach, and the acp-host arbitrates concurrent clients (two short
+nudges at worst).
 
 Security boundary: the lockfile token is a same-uid bearer
 credential - Devin writes `acp-host-*.lock` mode 0600 inside the

@@ -267,6 +267,44 @@ def test_find_lockfile_skips_garbage(tmp_path):
     assert find_lockfile(str(tmp_path)) is None
 
 
+def test_find_lockfile_prefers_live_pid(tmp_path):
+    """A stale (dead-pid) newest lockfile must not mask a live older
+    channel host."""
+    (tmp_path / "acp-host-old.lock").write_text(
+        json.dumps({"pid": os.getpid(), "port": 1, "token": "live"})
+    )
+    time.sleep(0.01)
+    (tmp_path / "acp-host-new.lock").write_text(
+        json.dumps({"pid": 2**22, "port": 2, "token": "dead"})
+    )
+    found = find_lockfile(str(tmp_path))
+    assert found is not None and found["token"] == "live"
+    # ...but when every pid is dead the newest file is still
+    # returned so _attach reports a distinct wake_host_down
+    found2 = find_lockfile(str(tmp_path))
+    assert found2 is not None
+
+
+def test_find_lockfile_all_dead_returns_newest(tmp_path):
+    (tmp_path / "acp-host-a.lock").write_text(
+        json.dumps({"pid": 2**22, "port": 1, "token": "a"})
+    )
+    time.sleep(0.01)
+    (tmp_path / "acp-host-b.lock").write_text(
+        json.dumps({"pid": 2**22, "port": 2, "token": "b"})
+    )
+    found = find_lockfile(str(tmp_path))
+    assert found is not None and found["token"] == "b"
+
+
+def test_wake_corrupt_port_is_wake_error():
+    with pytest.raises(WakeError) as exc:
+        wake_session(
+            SID, "/tmp", lock_data={"pid": os.getpid(), "port": "x", "token": "t"}
+        )
+    assert exc.value.reason == "malformed_lockfile"
+
+
 def test_pid_alive():
     assert pid_alive(os.getpid())
     assert not pid_alive(2**22)
@@ -546,6 +584,24 @@ def test_item16_bridge_wake_busy_conflict(env, tmp_path, monkeypatch, capsys):
     assert code != 0
     assert "session/prompt" not in host.methods()
     assert "mid-turn" in capsys.readouterr().out
+
+
+def test_item16_no_session_does_not_trip_breaker(env, tmp_path, monkeypatch):
+    """no_session is session-level, not a host failure: a fleet of
+    dead tabs must not open the circuit breaker."""
+    host = FakeAcpHost(sessions=[])  # session absent from list
+    _lockdir(tmp_path, host, monkeypatch)
+    _session(env.db, SID, managed=True)
+    _heartbeat(env.db, SID, age=999)
+    _relayed_mail(env.db, SID)
+    policy = WakePolicy(cooldown_seconds=0, breaker_threshold=2)
+
+    for _ in range(3):
+        daemon._wake_pass(env.db, env.sdir, int(time.time()), policy)
+
+    events = [d["event"] for d in _decisions(env)]
+    assert "wake_breaker_open" not in events
+    assert events.count("wake_failed") == 3
 
 
 def test_item16_lockfile_reread_mid_pass(env, tmp_path, monkeypatch):
