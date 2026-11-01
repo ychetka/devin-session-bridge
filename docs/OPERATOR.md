@@ -17,10 +17,15 @@ bootstrap prompt in Playbook 2 expects it at that path.
   `queue/<sid>/msg_<id>.txt` files next to `state.db`.
 - `bridge daemon` is the supervisor: it relays the outbox to mailboxes
   and marks dead sessions. It never injects anything into a session.
-- Managed watchers are the delivery inside an open turn: a background
+- Managed watchers are the delivery inside an open turn, in one of
+  two modes the session picks by context: `resident` (a background
   watcher subagent polls the mailbox, prints and removes pending
   `msg_*` files and exits; its completion lands inside the parent's
-  open turn, which processes the message and re-arms a new watcher.
+  open turn, which processes the message and re-arms a new watcher)
+  for autonomous sessions, or `drain` (the session itself lists,
+  reads and removes `msg_*` files at turn start and once more before
+  the turn ends) for interactive Desktop sessions - a resident
+  watcher occupies the turn slot and would block the human's input.
 - You are the arbiter: the fleet decides autonomously inside the
   Delegation of Authority (DoA) matrix; only whitelisted triggers
   escalate to you.
@@ -36,8 +41,8 @@ bridge daemon (flock on         = supervisor + relay, ~5s passes
   daemon.lock)                  |
   |  writes queue/<sid>/msg_<id>.txt
   v
-managed watcher subagent        = delivery into the open turn
-  |  prints + removes msg files, exits
+managed watcher (resident or    = delivery into the open turn
+  drain; resident shown)          |  prints + removes msg files, exits
   v
 worker / orchestrator session   = processes, `bridge ack`, re-arms
 ```
@@ -143,10 +148,12 @@ SID              REPO             TASK                 STATE       Q FAIL    HB
       "heartbeat fresh" and you KNOW the old session is closed, rerun
       with --force.
    3. Re-ground: `bridge status`, .devin/SESSION_STATE.md,
-      .devin/roadmap.md.
-   4. Arm your inbox: spawn a background mailbox watcher subagent per
-      PLAYBOOK.md. On its completion: process pending items and re-arm
-      before ending your turn.
+      .devin/roadmap.md. If SESSION_STATE.md does not exist,
+      create it - the orchestrator owns this file.
+   4. Arm your inbox per the Mailbox duty section of PLAYBOOK.md:
+      this session is interactive (the human sits behind it), so
+      use drain mode - drain the mailbox at the start of every
+      turn and once more before the turn ends.
    5. Resume the roadmap. Decide autonomously within the DoA matrix;
       escalate to the human ONLY per the whitelist, in escalation-report
       format.

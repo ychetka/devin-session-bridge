@@ -238,3 +238,65 @@ def test_item13c_gwt2_duty_text_required_instructions(qdir):
 def test_item13c_duty_text_carries_session_id(qdir):
     text = mailbox_duty_text("s-xyz", queue_dir=qdir)
     assert "s-xyz" in text
+
+
+# --- item_15: two watcher modes (resident / drain) ----------------------------
+
+
+def test_item15_gwt1_duty_text_has_two_modes_and_selection_rule(qdir):
+    text = mailbox_duty_text(SID, queue_dir=qdir)
+    # both modes are offered
+    assert "MODE RESIDENT" in text
+    assert "MODE DRAIN" in text
+    # the selection rule: human behind the session (Desktop/GUI) ->
+    # drain; autonomous worker -> resident; the agent decides itself
+    assert "Desktop" in text
+    assert "autonomous" in text
+    assert "the choice is yours" in text
+    # resident caveat: an occupied turn slot blocks human input
+    assert "block" in text and "input" in text
+
+
+def test_item15_gwt2_drain_instructions_complete(qdir):
+    text = mailbox_duty_text(SID, queue_dir=qdir)
+    mdir = mailbox_dir(SID, queue_dir=qdir)
+    # no resident watcher in drain mode
+    assert "do NOT spawn a mailbox subagent" in text
+    # turn-start drain: ls -v, cat, rm in mailbox order
+    assert "Turn start" in text
+    assert f"ls -v {mdir}/msg_*.txt" in text
+    assert "`cat`" in text and "`rm`" in text
+    # one more drain pass before the turn ends
+    assert "Before your turn ends" in text
+    # heartbeat + ack still tick in drain mode
+    assert f"bridge heartbeat {SID}" in text
+    assert f"bridge ack --session {SID}" in text
+    # idempotent by notification id + disarm semantics preserved
+    assert "idempotent" in text
+    assert "disarm" in text
+    # optional exec-shell observer flagged as observation-only; its
+    # poll loop also runs `bridge heartbeat` so the daemon never marks
+    # a live drain-mode session DEAD between turns
+    assert "timeout=0" in text
+    assert "cannot inject into your turn" in text
+    assert (
+        f"while true; do bridge heartbeat {SID}; "
+        f"ls -v {mdir}/msg_*.txt 2>/dev/null; sleep {POLL_SECONDS}; done" in text
+    )
+    assert "keeps your heartbeat alive between turns" in text
+    # latency trade-off is stated explicitly
+    assert "latency" in text.lower()
+
+
+def test_item15_gwt3_resident_path_not_regressed(qdir):
+    text = mailbox_duty_text(SID, queue_dir=qdir)
+    # resident still arms a background subagent with the verbatim loop
+    assert "spawn a background subagent" in text
+    assert watcher_loop_text(mailbox_dir(SID, queue_dir=qdir)) in text
+    assert "WATCHER_TTL_EXPIRED" in text
+    # re-arm before end_turn + TURN_TTL rotation + disarm exit
+    assert "re-arm" in text
+    assert "before your turn ends" in text
+    assert str(TURN_TTL_CYCLES) in text
+    assert "SessionStart" in text
+    assert "disarm" in text
