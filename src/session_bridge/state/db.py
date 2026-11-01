@@ -30,6 +30,13 @@ Bus slice 3 (item_13b3) adds the ``notifications`` outbox
 write (at-least-once delivery, idempotent consume by id), and the
 recipient's ``ack_at`` watermark drives level-triggered restart
 recovery.
+
+Schema v3 (item_14) adds the ``schedules`` table (persistent recurring
+task sources) and the ``tasks.run_after`` column the contract model
+already declared. ``materialize_schedule`` turns one due schedule into
+a queued task plus its ``task_dispatch`` outbox row inside a single
+BEGIN IMMEDIATE transaction, advancing ``next_run_at`` behind a CAS
+guard so concurrent daemon passes can never duplicate the fire.
 """
 
 import json
@@ -115,6 +122,9 @@ CREATE TABLE IF NOT EXISTS tasks (
   last_notified_at INTEGER,
   last_assistant_message TEXT,
   note TEXT,
+  -- dead schema for now: declared for the contract model, not yet
+  -- consumed by claim_queued
+  run_after INTEGER,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
@@ -215,6 +225,28 @@ CREATE TABLE IF NOT EXISTS notifications (
 CREATE INDEX IF NOT EXISTS ix_notifications_unrelayed
   ON notifications(relayed_at) WHERE relayed_at IS NULL;
 
+-- Recurring schedules (schema v3, item_14). Each enabled row is a
+-- persistent task source: the daemon materializes a due row into a
+-- regular queued task + task_dispatch outbox notification, then
+-- advances next_run_at. catchup=0 skips missed grid points on wake;
+-- catchup=1 fires once and re-catches the grid. enabled=0 is the
+-- clear target (rows are kept for history, never deleted).
+CREATE TABLE IF NOT EXISTS schedules (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id TEXT NOT NULL,
+  task_text TEXT NOT NULL,
+  every_seconds INTEGER NOT NULL CHECK(every_seconds>0),
+  next_run_at INTEGER NOT NULL,
+  last_run_at INTEGER,
+  catchup INTEGER NOT NULL DEFAULT 0,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  created_at INTEGER NOT NULL
+);
+
+-- Backs the daemon's due-schedule scan; disabled rows never index.
+CREATE INDEX IF NOT EXISTS ix_schedules_due
+  ON schedules(next_run_at) WHERE enabled=1;
+
 PRAGMA user_version=1;
 """
 
@@ -227,6 +259,11 @@ _SESSION_COLUMN_MIGRATIONS = (
     ("mode", "TEXT NOT NULL DEFAULT 'unmanaged'"),
     ("status", "TEXT NOT NULL DEFAULT 'active'"),
 )
+
+# Columns the v3 schema adds to tasks, applied idempotently for
+# pre-v3 files in the same BEGIN IMMEDIATE migration transaction
+# (CREATE TABLE IF NOT EXISTS cannot extend a live tasks table).
+_TASK_COLUMN_MIGRATIONS = (("run_after", "INTEGER"),)
 
 _SESSION_FIELDS = frozenset({"cwd", "title", "queue_paused", "park_cycles_left", "note"})
 
@@ -286,17 +323,20 @@ def connect(path=None) -> sqlite3.Connection:
 
 
 def init(path=None) -> None:
-    """Create the schema (idempotent) and stamp user_version=2.
+    """Create the schema (idempotent) and stamp user_version=3.
 
-    The v2 sessions-column migration is a check-then-ALTER sequence:
-    it must run inside one BEGIN IMMEDIATE transaction so concurrent
-    init() calls on a pre-v2 file serialize on the writer lock. Outside
-    a transaction both racers could pass the table_info check and the
-    loser would die on a "duplicate column name" error, which is not a
-    retryable SQLITE_BUSY. A busy BEGIN IMMEDIATE IS retryable, so the
-    loser waits out the winner's migration and then finds every column
-    already present. user_version=2 commits atomically with the ALTERs,
-    so it only ever stamps a file that actually has the v2 columns.
+    The column migrations (v2 sessions columns, v3 tasks.run_after)
+    are check-then-ALTER sequences: they must run inside one BEGIN
+    IMMEDIATE transaction so concurrent init() calls on a pre-v3 file
+    serialize on the writer lock. Outside a transaction both racers
+    could pass the table_info check and the loser would die on a
+    "duplicate column name" error, which is not a retryable
+    SQLITE_BUSY. A busy BEGIN IMMEDIATE IS retryable, so the loser
+    waits out the winner's migration and then finds every column
+    already present. user_version=3 commits atomically with the
+    ALTERs, so it only ever stamps a file that actually has the v3
+    columns (``schedules`` itself is a CREATE TABLE IF NOT EXISTS
+    addition the script already applied).
     """
     target = _path(path)
     parent = os.path.dirname(target)
@@ -313,7 +353,11 @@ def init(path=None) -> None:
                 for col, decl in _SESSION_COLUMN_MIGRATIONS:
                     if col not in existing:
                         con.execute(f"ALTER TABLE sessions ADD COLUMN {col} {decl}")
-                con.execute("PRAGMA user_version=2")
+                existing = {r["name"] for r in con.execute("PRAGMA table_info(tasks)")}
+                for col, decl in _TASK_COLUMN_MIGRATIONS:
+                    if col not in existing:
+                        con.execute(f"ALTER TABLE tasks ADD COLUMN {col} {decl}")
+                con.execute("PRAGMA user_version=3")
                 con.execute("COMMIT")
             except BaseException:
                 if con.in_transaction:
@@ -1837,6 +1881,232 @@ def ack_notifications(session_id: str, up_to_id: int | None = None, *, path=None
                 args.append(up_to_id)
             cur = con.execute(sql, args)
             return cur.rowcount
+        finally:
+            con.close()
+
+    return _retry(op)
+
+
+# --- recurring schedules (item_14, schema v3) ----------------------------------
+
+
+def add_schedule(
+    session_id: str,
+    task_text: str,
+    every_seconds: int,
+    next_run_at: int,
+    catchup: bool = False,
+    *,
+    path=None,
+) -> int:
+    """Insert a recurring schedule; returns its id.
+
+    ``next_run_at`` is a unix timestamp - the caller computes the grid
+    anchor (e.g. the CLI normalizes ``--at HH:MM`` to the next local
+    occurrence with ``every_seconds=86400``). The misfire policy is
+    pinned on the row: ``catchup=False`` skips missed grid points on
+    wake, ``catchup=True`` fires once and re-catches the grid.
+    """
+    if not session_id or not session_id.strip():
+        raise ValueError("add_schedule requires a session_id")
+    if not task_text or not task_text.strip():
+        raise ValueError("add_schedule requires task_text")
+    every = int(every_seconds)
+    if every <= 0:
+        raise ValueError("add_schedule requires every_seconds > 0")
+    ts = _now()
+
+    def op():
+        con = connect(path)
+        try:
+            cur = con.execute(
+                "INSERT INTO schedules"
+                "(session_id,task_text,every_seconds,next_run_at,catchup,created_at)"
+                " VALUES(?,?,?,?,?,?)",
+                (session_id, task_text, every, int(next_run_at), int(bool(catchup)), ts),
+            )
+            return cur.lastrowid
+        finally:
+            con.close()
+
+    return _retry(op)
+
+
+def list_schedules(session_id: str | None = None, *, path=None) -> list:
+    """All schedule rows (enabled and disabled) in id order.
+
+    Disabled rows are kept for history - ``schedule clear`` disables
+    instead of deleting - so the listing surfaces ``enabled`` for the
+    caller to render or filter on.
+    """
+
+    def op():
+        con = connect(path)
+        try:
+            if session_id is not None:
+                return con.execute(
+                    "SELECT * FROM schedules WHERE session_id=? ORDER BY id",
+                    (session_id,),
+                ).fetchall()
+            return con.execute("SELECT * FROM schedules ORDER BY id").fetchall()
+        finally:
+            con.close()
+
+    return _retry(op)
+
+
+def disable_schedule(schedule_id: int, *, path=None) -> bool:
+    """CAS ``enabled 1 > 0``; True only on a real flip.
+
+    The row is never deleted - a disabled schedule keeps its fire
+    history (``last_run_at``) for audit. A repeated clear loses the
+    CAS and reports False, so callers can distinguish "cleared" from
+    "already clear / unknown id".
+    """
+
+    def op():
+        con = connect(path)
+        try:
+            cur = con.execute(
+                "UPDATE schedules SET enabled=0 WHERE id=? AND enabled=1",
+                (schedule_id,),
+            )
+            return cur.rowcount == 1
+        finally:
+            con.close()
+
+    return _retry(op)
+
+
+def due_schedules(now: int | None = None, *, path=None) -> list:
+    """Enabled schedules with ``next_run_at <= now``, due-first order.
+
+    This is the daemon's sweep read, backed by the
+    ``ix_schedules_due`` partial index. ``now`` defaults to the
+    current time; tests pass an explicit timestamp.
+    """
+    ts = _now() if now is None else int(now)
+
+    def op():
+        con = connect(path)
+        try:
+            return con.execute(
+                "SELECT * FROM schedules WHERE enabled=1 AND next_run_at<=?"
+                " ORDER BY next_run_at, id",
+                (ts,),
+            ).fetchall()
+        finally:
+            con.close()
+
+    return _retry(op)
+
+
+def _next_grid_run(next_run_at: int, every_seconds: int, now: int, catchup: bool) -> int:
+    """The ``next_run_at`` a fired schedule advances to.
+
+    ``catchup=False`` (skip missed): the fire resets the grid from
+    now, so a schedule that slept through three periods fires once
+    and resumes fresh. ``catchup=True`` (fire once and re-catch): the
+    grid is walked forward by ``every_seconds`` until it lands in the
+    future - still exactly one task this fire, but the next fire is
+    on the original grid, not a drifted one. The walk is closed-form
+    (O(1)): a linear loop over a long-missed grid (``every_seconds=1``
+    after months of downtime iterates billions of times) would hang
+    inside the BEGIN IMMEDIATE write transaction.
+    """
+    if not catchup:
+        return now + every_seconds
+    if next_run_at > now:
+        return next_run_at
+    behind = now - next_run_at
+    return next_run_at + ((behind // every_seconds) + 1) * every_seconds
+
+
+def materialize_schedule(schedule_id: int, now: int | None = None, *, path=None):
+    """Turn one due schedule into a queued task + dispatch notification.
+
+    Returns the new task id; ``None`` when the schedule is not due or
+    the CAS was lost. The whole unit of work runs inside one BEGIN
+    IMMEDIATE transaction:
+
+    1. read the row (missing, disabled or not-yet-due loses early);
+    2. advance ``last_run_at``/``next_run_at`` behind the
+       ``enabled=1 AND next_run_at<=now`` guard - a second daemon or a
+       raced pass loses the CAS on rowcount and creates nothing;
+    3. insert the materialized task (``queued``, ``run_after`` NULL -
+       it is dispatchable immediately);
+    4. append the ``task_dispatch`` outbox row referencing the task.
+
+    All-or-nothing: a task INSERT refused by ``ux_tasks_live_session``
+    (the session already carries a live task) rolls the advance back
+    too, so the schedule stays due and retries on the next pass
+    instead of dropping a fire. ``notify``/``enqueue`` are inlined -
+    they open their own connections and cannot join this transaction.
+    """
+    ts = _now() if now is None else int(now)
+
+    def op():
+        con = connect(path)
+        try:
+            con.execute("BEGIN IMMEDIATE")
+            try:
+                row = con.execute("SELECT * FROM schedules WHERE id=?", (schedule_id,)).fetchone()
+                if row is None or not row["enabled"] or int(row["next_run_at"]) > ts:
+                    con.execute("ROLLBACK")
+                    return None
+                nxt = _next_grid_run(
+                    int(row["next_run_at"]),
+                    int(row["every_seconds"]),
+                    ts,
+                    bool(row["catchup"]),
+                )
+                cur = con.execute(
+                    "UPDATE schedules SET last_run_at=?, next_run_at=?"
+                    " WHERE id=? AND enabled=1 AND next_run_at<=?",
+                    (ts, nxt, schedule_id, ts),
+                )
+                if cur.rowcount != 1:
+                    con.execute("ROLLBACK")
+                    return None
+                try:
+                    cur = con.execute(
+                        "INSERT INTO tasks"
+                        "(session_id,task_text,status,run_after,created_at,updated_at)"
+                        " VALUES(?,?,?,?,?,?)",
+                        (
+                            row["session_id"],
+                            row["task_text"],
+                            TaskStatus.QUEUED.value,
+                            None,
+                            ts,
+                            ts,
+                        ),
+                    )
+                except sqlite3.IntegrityError:
+                    # ux_tasks_live_session: the session already holds
+                    # a live task - roll the advance back so the fire
+                    # retried next pass is not silently dropped
+                    con.execute("ROLLBACK")
+                    return None
+                task_id = cur.lastrowid
+                con.execute(
+                    "INSERT INTO notifications"
+                    "(session_id,kind,body,task_id,created_at)"
+                    " VALUES(?,?,?,?,?)",
+                    (
+                        row["session_id"],
+                        NotificationKind.TASK_DISPATCH.value,
+                        row["task_text"],
+                        task_id,
+                        ts,
+                    ),
+                )
+                con.execute("COMMIT")
+                return task_id
+            except BaseException:
+                if con.in_transaction:
+                    con.execute("ROLLBACK")
+                raise
         finally:
             con.close()
 

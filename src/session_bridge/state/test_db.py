@@ -215,7 +215,7 @@ def test_item04_gwt6_missing_db_initialized_corrupt_rejected(tmp_path):
     path = str(tmp_path / "sub" / "state.db")
     db.init(path)
     version = _one(path, "PRAGMA user_version")[0]
-    assert version == 2
+    assert version == 3
     journal = _one(path, "PRAGMA journal_mode")[0]
     assert journal == "wal"
     busy = _one(path, "PRAGMA busy_timeout")[0]
@@ -957,8 +957,8 @@ def test_item13b1_migration_concurrent_init(tmp_path):
     assert row["role"] == "worker"
     assert row["mode"] == "unmanaged"
     assert row["status"] == "active"
-    # user_version=2 commits with the ALTERs, so 2 certifies v2 columns
-    assert _one(path, "PRAGMA user_version")[0] == 2
+    # user_version commits with the ALTERs, so 3 certifies v2+v3 columns
+    assert _one(path, "PRAGMA user_version")[0] == 3
 
     # an already-migrated file: further init() stays a no-op
     db.init(path)
@@ -1505,3 +1505,223 @@ def test_item13e1_defer_abort_task_block_writers(db_path):
     # terminal rows are out of the live set
     assert db.abort_task(t2, path=db_path) is False
     assert db.defer_task(t2, path=db_path) is False
+
+
+# --- item_14: recurring schedules ----------------------------------------------
+
+
+def test_item14_schema_v3_tables_and_version(db_path):
+    assert _one(db_path, "PRAGMA user_version")[0] == 3
+    con = db.connect(db_path)
+    try:
+        tables = {
+            r["name"] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+        cols = {r["name"] for r in con.execute("PRAGMA table_info(tasks)")}
+    finally:
+        con.close()
+    assert "schedules" in tables
+    assert "run_after" in cols
+
+
+def test_item14_init_migrates_pre_v3_file(tmp_path):
+    # a minimal pre-v3 file: old tasks/sessions layouts, no schedules
+    p = str(tmp_path / "state.db")
+    con = sqlite3.connect(p, isolation_level=None)
+    try:
+        con.execute("CREATE TABLE tasks(id INTEGER PRIMARY KEY, session_id TEXT, status TEXT)")
+        con.execute("CREATE TABLE sessions(session_id TEXT PRIMARY KEY, updated_at INTEGER)")
+    finally:
+        con.close()
+    db.init(p)
+    con = db.connect(p)
+    try:
+        assert con.execute("PRAGMA user_version").fetchone()[0] == 3
+        tasks_cols = {r["name"] for r in con.execute("PRAGMA table_info(tasks)")}
+        sessions_cols = {r["name"] for r in con.execute("PRAGMA table_info(sessions)")}
+        names = {
+            r["name"] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+    finally:
+        con.close()
+    assert "run_after" in tasks_cols
+    assert {"role", "mode", "status"} <= sessions_cols
+    assert "schedules" in names
+
+
+def test_item14_add_schedule_validates(db_path):
+    with pytest.raises(ValueError):
+        db.add_schedule("", "t", 60, 100, path=db_path)
+    with pytest.raises(ValueError):
+        db.add_schedule(" ", "t", 60, 100, path=db_path)
+    with pytest.raises(ValueError):
+        db.add_schedule("s1", "", 60, 100, path=db_path)
+    with pytest.raises(ValueError):
+        db.add_schedule("s1", "t", 0, 100, path=db_path)
+    with pytest.raises(ValueError):
+        db.add_schedule("s1", "t", -60, 100, path=db_path)
+    assert db.list_schedules(path=db_path) == []
+
+
+def test_item14_gwt1_schedule_persists_and_materializes(db_path):
+    now = int(time.time())
+    sid = db.add_schedule("s1", "nightly sweep", 60, now - 1, path=db_path)
+
+    # a "restart" (fresh connection) still sees the schedule
+    con = db.connect(db_path)
+    try:
+        row = con.execute("SELECT * FROM schedules WHERE id=?", (sid,)).fetchone()
+    finally:
+        con.close()
+    assert row["session_id"] == "s1"
+    assert row["task_text"] == "nightly sweep"
+    assert row["every_seconds"] == 60
+    assert row["enabled"] == 1
+    assert row["catchup"] == 0
+    assert row["last_run_at"] is None
+
+    due = db.due_schedules(now, path=db_path)
+    assert [r["id"] for r in due] == [sid]
+
+    task_id = db.materialize_schedule(sid, now, path=db_path)
+    assert task_id is not None
+    task = db.get_task(task_id, path=db_path)
+    assert task["session_id"] == "s1"
+    assert task["task_text"] == "nightly sweep"
+    assert task["status"] == TaskStatus.QUEUED.value
+    assert task["run_after"] is None  # dispatchable immediately
+    # the outbox row carries the dispatch routing refs
+    outbox = db.unrelayed_notifications("s1", path=db_path)
+    assert len(outbox) == 1
+    assert outbox[0]["kind"] == NotificationKind.TASK_DISPATCH.value
+    assert outbox[0]["task_id"] == task_id
+    assert outbox[0]["body"] == "nightly sweep"
+    # the grid advanced: fired at now, next on now+every
+    row = _one(db_path, "SELECT * FROM schedules WHERE id=?", (sid,))
+    assert row["last_run_at"] == now
+    assert row["next_run_at"] == now + 60
+
+
+def test_item14_gwt2_double_materialize_yields_one_task(db_path):
+    now = int(time.time())
+    sid = db.add_schedule("s1", "t", 60, now - 1, path=db_path)
+    assert db.materialize_schedule(sid, now, path=db_path) is not None
+    # a second due-call (or a second daemon pass) loses the CAS: the
+    # advance guard on next_run_at<=now no longer matches
+    assert db.materialize_schedule(sid, now, path=db_path) is None
+    tasks = db.list_tasks(status=TaskStatus.QUEUED, path=db_path)
+    assert len(tasks) == 1
+    assert len(db.unrelayed_notifications(path=db_path)) == 1
+
+
+def test_item14_gwt2_concurrent_materialize_single_winner(db_path):
+    now = int(time.time())
+    sid = db.add_schedule("s1", "t", 60, now - 1, path=db_path)
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        results = list(
+            ex.map(
+                lambda _i: db.materialize_schedule(sid, now, path=db_path),
+                range(8),
+            )
+        )
+    assert sum(r is not None for r in results) == 1
+    assert len(db.list_tasks(status=TaskStatus.QUEUED, path=db_path)) == 1
+    assert len(db.unrelayed_notifications(path=db_path)) == 1
+
+
+def test_item14_gwt3_catchup0_skips_missed_grid(db_path):
+    # three missed periods: catchup=0 fires once and resets from now
+    now = int(time.time())
+    sid = db.add_schedule("s1", "t", 60, now - 3 * 60, path=db_path)
+    assert db.materialize_schedule(sid, now, path=db_path) is not None
+    row = _one(db_path, "SELECT * FROM schedules WHERE id=?", (sid,))
+    assert row["next_run_at"] == now + 60
+    assert len(db.list_tasks(status=TaskStatus.QUEUED, path=db_path)) == 1
+
+
+def test_item14_gwt3_catchup1_recatches_the_grid(db_path):
+    now = int(time.time())
+    anchor = now - 3 * 60 - 17  # missed grid points at -197, -137, -77, -17
+    sid = db.add_schedule("s1", "t", 60, anchor, catchup=True, path=db_path)
+    assert db.materialize_schedule(sid, now, path=db_path) is not None
+    row = _one(db_path, "SELECT * FROM schedules WHERE id=?", (sid,))
+    # one fire, then the original grid resumes: smallest anchor+k*60 > now
+    assert row["next_run_at"] == anchor + 4 * 60
+    assert row["next_run_at"] > now
+    assert len(db.list_tasks(status=TaskStatus.QUEUED, path=db_path)) == 1
+
+
+def test_item14_catchup1_far_missed_grid_realigns_in_o1(db_path):
+    # regression: a linear grid walk over hundreds of millions of
+    # missed every=1 points would hang inside the write txn - the
+    # catchup realign must be closed-form
+    now = int(time.time())
+    anchor = 946684800  # 2000-01-01T00:00:00Z, decades of missed fires
+    sid = db.add_schedule("s1", "t", 1, anchor, catchup=True, path=db_path)
+    started = time.monotonic()
+    task_id = db.materialize_schedule(sid, now, path=db_path)
+    assert task_id is not None
+    assert time.monotonic() - started < 5
+    row = _one(db_path, "SELECT * FROM schedules WHERE id=?", (sid,))
+    # still exactly one task, and the next fire sits on the anchor
+    # grid strictly ahead of now (anchor + k*1 > now)
+    assert len(db.list_tasks(status=TaskStatus.QUEUED, path=db_path)) == 1
+    assert row["next_run_at"] == now + 1
+    assert row["next_run_at"] > now
+    assert (row["next_run_at"] - anchor) % 1 == 0
+
+
+def test_item14_gwt4_disable_stops_the_schedule(db_path):
+    now = int(time.time())
+    sid = db.add_schedule("s1", "t", 60, now - 1, path=db_path)
+    assert db.disable_schedule(sid, path=db_path) is True
+    # a repeated clear loses the CAS
+    assert db.disable_schedule(sid, path=db_path) is False
+    # disabled rows stay listed but are never due
+    assert [r["id"] for r in db.list_schedules(path=db_path)] == [sid]
+    assert db.due_schedules(now + 10_000, path=db_path) == []
+    assert db.materialize_schedule(sid, now + 10_000, path=db_path) is None
+    assert db.list_tasks(status=TaskStatus.QUEUED, path=db_path) == []
+    # the row survives with its history (enabled=0, never fired)
+    row = _one(db_path, "SELECT * FROM schedules WHERE id=?", (sid,))
+    assert row["enabled"] == 0
+    assert row["last_run_at"] is None
+
+
+def test_item14_not_due_and_missing_materialize_noop(db_path):
+    now = int(time.time())
+    sid = db.add_schedule("s1", "t", 60, now + 3600, path=db_path)
+    assert db.due_schedules(now, path=db_path) == []
+    assert db.materialize_schedule(sid, now, path=db_path) is None
+    assert db.materialize_schedule(9999, now, path=db_path) is None
+    assert db.list_tasks(path=db_path) == []
+
+
+def test_item14_live_task_slot_defers_the_fire(db_path):
+    now = int(time.time())
+    sid = db.add_schedule("s1", "scheduled work", 60, now - 1, path=db_path)
+    # the session already carries a live task - the unique live index
+    # refuses the insert, the whole materialize rolls back atomically
+    live = db.enqueue("s1", "busy", path=db_path)
+    assert live is not None
+    assert db.materialize_schedule(sid, now, path=db_path) is None
+    # no half-state: no task beyond the live one, no outbox row, and
+    # the schedule is still due (not advanced) for the next pass
+    assert len(db.list_tasks(path=db_path)) == 1
+    assert db.unrelayed_notifications(path=db_path) == []
+    row = _one(db_path, "SELECT * FROM schedules WHERE id=?", (sid,))
+    assert row["last_run_at"] is None
+    assert row["next_run_at"] == now - 1
+    # once the slot frees the deferred fire lands
+    _exec(db_path, "UPDATE tasks SET status='done' WHERE id=?", (live,))
+    assert db.materialize_schedule(sid, now, path=db_path) is not None
+
+
+def test_item14_list_schedules_session_filter(db_path):
+    now = int(time.time())
+    a = db.add_schedule("s-a", "ta", 60, now, path=db_path)
+    b = db.add_schedule("s-b", "tb", 120, now, path=db_path)
+    c = db.add_schedule("s-a", "tc", 180, now, path=db_path)
+    assert [r["id"] for r in db.list_schedules(path=db_path)] == [a, b, c]
+    assert [r["id"] for r in db.list_schedules("s-a", path=db_path)] == [a, c]
+    assert db.list_schedules("ghost", path=db_path) == []

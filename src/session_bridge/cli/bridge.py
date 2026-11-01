@@ -34,11 +34,18 @@ slot dispatches the next queued task.
 Notifications: transitions to NEEDS_KICK/FAILED call
 ``notify-send -u critical`` through ``db.mark_notified``'s 300s dedup;
 a missing notify-send is ignored.
+
+``bridge schedule`` manages persistent recurring task sources: a
+session id with ``--task`` plus ``--every N[s|m|h|d]`` or ``--at
+HH:MM`` adds one (``--catchup`` pins the misfire policy), ``list``
+shows them and ``clear <id>`` disables one. The daemon materializes
+due rows into regular queued tasks.
 """
 
 import argparse
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -2022,6 +2029,216 @@ def _cmd_escalate(args) -> int:
     return _emit(args, resp, ExitCode.USAGE, f"usage: unknown escalate action {action}")
 
 
+# --- recurring schedules (item_14) ----------------------------------------------
+
+#: ``--every`` grammar: a number plus an optional unit suffix
+#: (s/m/h/d); a bare number means seconds.
+_EVERY_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+
+
+def _parse_every(spec: str):
+    """Parse ``--every`` (e.g. ``300``, ``30m``, ``1h``, ``1d``).
+
+    Returns the interval in seconds, or ``None`` on a malformed spec.
+    """
+    m = re.fullmatch(r"(\d+)([smhd]?)", (spec or "").strip())
+    if m is None:
+        return None
+    seconds = int(m.group(1)) * _EVERY_UNITS[m.group(2) or "s"]
+    return seconds or None
+
+
+def _parse_at(spec: str, now: int):
+    """Parse ``--at HH:MM`` into the next local occurrence's unix ts.
+
+    Daily schedules normalize to ``every_seconds=86400`` anchored on
+    the nearest HH:MM (today when still ahead, else tomorrow) - a full
+    cron parser is deliberately out of scope. Returns ``None`` on a
+    malformed spec.
+    """
+    m = re.fullmatch(r"(\d{1,2}):(\d{2})", (spec or "").strip())
+    if m is None:
+        return None
+    hour, minute = int(m.group(1)), int(m.group(2))
+    if hour > 23 or minute > 59:
+        return None
+    tm = time.localtime(now)
+    candidate = time.mktime((*tm[:3], hour, minute, 0, *tm[6:]))
+    if candidate <= now:
+        candidate += 86400
+    return int(candidate)
+
+
+def _schedule_add(args) -> int:
+    sid = args.target
+    if not (args.schedule_task and args.schedule_task.strip()):
+        resp = JsonResponse(
+            session=sid,
+            status="usage",
+            error='schedule requires --task "text"',
+        )
+        return _emit(
+            args,
+            resp,
+            ExitCode.USAGE,
+            'usage: bridge schedule <sid> --task "text" --every N[s|m|h|d] | --at HH:MM',
+        )
+    if args.every is None and args.at is None:
+        resp = JsonResponse(
+            session=sid,
+            status="usage",
+            error="schedule requires --every or --at",
+        )
+        return _emit(
+            args,
+            resp,
+            ExitCode.USAGE,
+            'usage: bridge schedule <sid> --task "text" --every N[s|m|h|d] | --at HH:MM',
+        )
+    now = int(time.time())
+    if args.every is not None:
+        every = _parse_every(args.every)
+        if every is None:
+            resp = JsonResponse(
+                session=sid,
+                status="usage",
+                error=f"invalid --every interval: {args.every!r}",
+            )
+            return _emit(
+                args,
+                resp,
+                ExitCode.USAGE,
+                f"usage: invalid --every {args.every!r} (expect N[s|m|h|d])",
+            )
+        next_run_at = now + every
+    else:
+        next_run_at = _parse_at(args.at, now)
+        if next_run_at is None:
+            resp = JsonResponse(
+                session=sid,
+                status="usage",
+                error=f"invalid --at time: {args.at!r}",
+            )
+            return _emit(
+                args,
+                resp,
+                ExitCode.USAGE,
+                f"usage: invalid --at {args.at!r} (expect HH:MM local)",
+            )
+        every = 86400
+    schedule_id = db.add_schedule(
+        sid,
+        args.schedule_task,
+        every,
+        next_run_at,
+        catchup=args.catchup,
+        path=args.db,
+    )
+    resp = JsonResponse(
+        session=sid,
+        status="scheduled",
+        data={
+            "schedule_id": schedule_id,
+            "every_seconds": every,
+            "next_run_at": next_run_at,
+            "catchup": bool(args.catchup),
+        },
+    )
+    human = (
+        f"schedule {schedule_id} for {sid}: every {every}s,"
+        f" next run {time.strftime('%Y-%m-%d %H:%M', time.localtime(next_run_at))}"
+    )
+    if args.catchup:
+        human += " (catchup)"
+    return _emit(args, resp, ExitCode.OK, human)
+
+
+def _schedule_view(row) -> dict:
+    """One schedules row folded into the CLI payload."""
+    return {
+        "id": row["id"],
+        "session_id": row["session_id"],
+        "task_text": row["task_text"],
+        "every_seconds": row["every_seconds"],
+        "next_run_at": row["next_run_at"],
+        "last_run_at": row["last_run_at"],
+        "catchup": bool(row["catchup"]),
+        "enabled": bool(row["enabled"]),
+        "created_at": row["created_at"],
+    }
+
+
+def _schedule_list(args) -> int:
+    rows = db.list_schedules(session_id=args.session, path=args.db)
+    items = [_schedule_view(r) for r in rows]
+    resp = JsonResponse(status="ok", data={"schedules": items})
+    if not items:
+        return _emit(args, resp, ExitCode.OK, "(no schedules)")
+    lines = []
+    for i in items:
+        nxt = time.strftime("%Y-%m-%d %H:%M", time.localtime(i["next_run_at"]))
+        last = (
+            time.strftime("%Y-%m-%d %H:%M", time.localtime(i["last_run_at"]))
+            if i["last_run_at"] is not None
+            else "-"
+        )
+        lines.append(
+            f"schedule {i['id']} (session {i['session_id']}): every {i['every_seconds']}s"
+            f" | next {nxt} | last {last}"
+            f" | catchup {'on' if i['catchup'] else 'off'}"
+            f" | {'enabled' if i['enabled'] else 'disabled'}"
+            f" | {i['task_text']}"
+        )
+    return _emit(args, resp, ExitCode.OK, "\n".join(lines))
+
+
+def _schedule_clear(args) -> int:
+    """Disable a schedule (the row stays - fire history is kept)."""
+    if args.schedule_id is None:
+        resp = JsonResponse(status="usage", error="schedule clear requires an id")
+        return _emit(args, resp, ExitCode.USAGE, "usage: bridge schedule clear <id>")
+    if db.disable_schedule(args.schedule_id, path=args.db):
+        resp = JsonResponse(
+            status="disabled",
+            data={"schedule_id": args.schedule_id},
+        )
+        return _emit(args, resp, ExitCode.OK, f"schedule {args.schedule_id} disabled")
+    row = next(
+        (r for r in db.list_schedules(path=args.db) if r["id"] == args.schedule_id),
+        None,
+    )
+    if row is None:
+        resp = JsonResponse(
+            status="not_found",
+            error=f"schedule {args.schedule_id} not found",
+        )
+        return _emit(
+            args,
+            resp,
+            ExitCode.NOT_FOUND,
+            f"not found: schedule {args.schedule_id}",
+        )
+    resp = JsonResponse(
+        status="disabled",
+        error=f"schedule {args.schedule_id} is already disabled",
+        agent_instruction="do not retry: the schedule is already disabled",
+    )
+    return _emit(
+        args,
+        resp,
+        ExitCode.CONFLICT,
+        f"conflict: schedule {args.schedule_id} already disabled",
+    )
+
+
+def _cmd_schedule(args) -> int:
+    if args.target == "list":
+        return _schedule_list(args)
+    if args.target == "clear":
+        return _schedule_clear(args)
+    return _schedule_add(args)
+
+
 # --- daemon: external supervisor (item_13d) --------------------------------------
 
 #: grace period for SIGTERM before ``daemon stop`` reports a wedged daemon
@@ -2377,6 +2594,56 @@ def _parse_args(argv) -> argparse.Namespace:
     _add_json(sp_reply)
     _add_json(sp)
 
+    # recurring schedules (item_14); literal name like arm/disarm -
+    # the Command enum in cli/contract.py is frozen. The positional
+    # doubles as the subcommand: a session id adds a schedule, the
+    # reserved words 'list' and 'clear' run those actions.
+    sp = sub.add_parser(
+        "schedule",
+        help="recurring schedules: <sid> --task ... | list | clear <id>",
+    )
+    sp.add_argument(
+        "target",
+        help="session id for a new schedule, or 'list' / 'clear'",
+    )
+    sp.add_argument(
+        "schedule_id",
+        nargs="?",
+        type=int,
+        default=None,
+        help="schedule id (clear only)",
+    )
+    sp.add_argument(
+        "--task",
+        dest="schedule_task",
+        default=None,
+        help="task text the schedule dispatches",
+    )
+    group = sp.add_mutually_exclusive_group()
+    group.add_argument(
+        "--every",
+        default=None,
+        metavar="N[s|m|h|d]",
+        help="repeat interval (bare number = seconds)",
+    )
+    group.add_argument(
+        "--at",
+        default=None,
+        metavar="HH:MM",
+        help="daily local time (every=86400, next occurrence anchors)",
+    )
+    sp.add_argument(
+        "--catchup",
+        action="store_true",
+        help="after downtime: fire once and re-catch the grid (default: skip missed)",
+    )
+    sp.add_argument(
+        "--session",
+        default=None,
+        help="list filter: only this session's schedules",
+    )
+    _add_json(sp)
+
     sp = sub.add_parser(
         Command.WORK.value,
         help=argparse.SUPPRESS,  # internal worker
@@ -2406,6 +2673,7 @@ _HANDLERS = {
     "heartbeat": _cmd_heartbeat,
     "questions": _cmd_questions,
     "escalate": _cmd_escalate,
+    "schedule": _cmd_schedule,
 }
 
 

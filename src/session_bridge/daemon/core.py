@@ -4,21 +4,28 @@ The daemon is a supervisor only - it never injects anything into a
 session. A single instance per state dir is enforced by
 ``flock(daemon.lock)``; each loop pass:
 
-1. relays the notifications outbox into fs mailboxes
+1. materializes due recurring schedules: every enabled
+   ``schedules`` row with ``next_run_at <= now`` becomes a regular
+   ``queued`` task plus a ``task_dispatch`` outbox row in one
+   transaction (``db.materialize_schedule``; the CAS advance makes a
+   double fire impossible, a busy live-task slot defers the fire to
+   the next pass); runs first so the relay below ships the fresh
+   outbox rows in the same pass;
+2. relays the notifications outbox into fs mailboxes
    (``unrelayed_notifications`` -> ``mailbox.write_message`` ->
    ``mark_relayed``; at-least-once - a crash between the fs write and
    the mark re-delivers on the next pass, consumers dedup by id);
-2. sweeps heartbeat staleness: a session whose ``last_seen_at`` is
+3. sweeps heartbeat staleness: a session whose ``last_seen_at`` is
    older than ``HEARTBEAT_STALE_SECONDS`` flips to ``status='dead'``;
    a dead worker's live task is requeued carrying the reset-to-base
    instruction for the next worker, a silent orchestrator raises one
    deduped ``notify-send`` (both deduped by the ``active > dead``
    transition-CAS in ``set_session_status``);
-3. janitors stale question claims: ``db.janitor_questions`` returns
+4. janitors stale question claims: ``db.janitor_questions`` returns
    every claim older than ``CLAIM_TIMEOUT_SECONDS`` to ``pending``,
    so a claim whose orchestrator died mid-deliberation never wedges
    the question (one released ids line per pass in the decision log);
-4. stamps ``daemon_heartbeat.txt`` so an external watchdog
+5. stamps ``daemon_heartbeat.txt`` so an external watchdog
    (cron/systemd timer) can detect a dead or hung daemon.
 
 Every decision is appended to ``daemon_decisions.jsonl`` under the
@@ -291,6 +298,47 @@ def _notify_send(title: str, body: str) -> None:
 # --- loop passes ----------------------------------------------------------------------
 
 
+def _schedule_pass(db_path, state_directory, now: int) -> None:
+    """Materialize due recurring schedules into queued tasks.
+
+    Each due row becomes a regular ``queued`` task plus a
+    ``task_dispatch`` outbox notification inside
+    ``db.materialize_schedule``'s single transaction - the CAS advance
+    makes a double fire impossible even under a second daemon, and a
+    session already holding a live task keeps the schedule due for the
+    next pass instead of dropping the fire (never queue-until-online:
+    the queued task plus level-triggered mailbox cover a dead or busy
+    session; there is no drop policy). One bad schedule never sinks
+    the pass - the error is logged and the sweep continues.
+    """
+    for s in db.due_schedules(now, path=db_path):
+        sid = s["session_id"]
+        try:
+            task_id = db.materialize_schedule(s["id"], now, path=db_path)
+        except Exception as e:
+            _decision(
+                state_directory,
+                "schedule_error",
+                sid,
+                f"schedule={s['id']}: {type(e).__name__}: {e}",
+            )
+            continue
+        if task_id is None:
+            _decision(
+                state_directory,
+                "schedule_deferred",
+                sid,
+                f"schedule={s['id']} not materialized (CAS lost or live task slot busy)",
+            )
+            continue
+        _decision(
+            state_directory,
+            "schedule_fired",
+            sid,
+            f"schedule={s['id']} task_id={task_id}",
+        )
+
+
 def _relay_pass(db_path, queue_dir, state_directory) -> None:
     """Drain the outbox: unrelayed -> fs msg file -> mark_relayed."""
     for row in db.unrelayed_notifications(path=db_path):
@@ -468,8 +516,10 @@ def run(
             # staleness as the hang signal
             _write_heartbeat(state_directory)
             try:
+                now = int(time.time())
+                _schedule_pass(db_path, state_directory, now)
                 _relay_pass(db_path, queue_dir, state_directory)
-                _sweep_pass(db_path, state_directory, notify, int(time.time()))
+                _sweep_pass(db_path, state_directory, notify, now)
                 _question_janitor_pass(db_path, state_directory)
             except Exception as e:
                 if once:

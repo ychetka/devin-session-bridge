@@ -23,6 +23,7 @@ from session_bridge.state.contract import (
     NotificationKind,
     Question,
     QuestionState,
+    Schedule,
     Session,
     SessionMode,
     SessionRole,
@@ -486,3 +487,54 @@ def test_item13a_orchestration_constants_pinned() -> None:
     assert CLAIM_TIMEOUT_SECONDS == 300
     assert TURN_TTL_CYCLES == 10
     assert WATCHER_TTL_SECONDS == 7200
+
+
+# --- item_14: Schedule model (schema v3) ---------------------------------------
+
+
+def _schedule(**over) -> Schedule:
+    base = {
+        "session_id": "s1",
+        "task_text": "nightly sweep",
+        "every_seconds": 60,
+        "next_run_at": 1000,
+        "created_at": 100,
+    }
+    base.update(over)
+    return Schedule(**base)
+
+
+def test_item14_schedule_defaults() -> None:
+    s = _schedule()
+    assert s.id is None
+    assert s.last_run_at is None
+    assert s.catchup is False
+    assert s.enabled is True
+    assert Schedule.model_validate_json(s.model_dump_json()) == s
+
+
+def test_item14_schedule_validation() -> None:
+    with pytest.raises(ValidationError):
+        _schedule(every_seconds=0)  # CHECK(every_seconds>0) mirrored
+    with pytest.raises(ValidationError):
+        _schedule(every_seconds=-5)
+    with pytest.raises(ValidationError):
+        _schedule(session_id="")
+    with pytest.raises(ValidationError):
+        _schedule(task_text="")
+    with pytest.raises(ValidationError):
+        _schedule(bogus=1)  # extra=forbid
+
+
+def test_item14_schedule_roundtrip() -> None:
+    s = _schedule(
+        id=3,
+        every_seconds=86400,
+        next_run_at=2000,
+        last_run_at=1900,
+        catchup=True,
+        enabled=False,
+    )
+    assert Schedule.model_validate_json(s.model_dump_json()) == s
+    assert s.catchup is True
+    assert s.enabled is False

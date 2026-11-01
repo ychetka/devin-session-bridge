@@ -14,6 +14,10 @@ orchestration protocol tables: session roles/modes, the question
 claim protocol, the notifications outbox, worker heartbeats (the
 authoritative liveness/generation rows) and the append-only audit
 log.
+
+Schema v3 (item_14) adds the ``schedules`` table for persistent
+recurring task dispatch (``Schedule`` below) and the ``tasks``
+``run_after`` column the Task model already declared.
 """
 
 from enum import Enum
@@ -601,4 +605,38 @@ class AuditEvent(BaseModel):
     asked_at: int | None = None
     claimed_at: int | None = None
     answered_at: int | None = None
+    created_at: int
+
+
+# --- recurring schedules (item_14, schema v3) --------------------------------
+
+
+class Schedule(BaseModel):
+    """Row model for the ``schedules`` table.
+
+    A schedule is a persistent recurring task source: the daemon sweep
+    materializes each due row into a regular ``queued`` task plus a
+    ``task_dispatch`` outbox notification in one transaction, then
+    advances ``next_run_at``. Intervals only - ``every_seconds`` is the
+    grid period; a daily ``--at HH:MM`` schedule is normalized to
+    ``every_seconds=86400`` anchored on the next occurrence.
+
+    Misfire policy is pinned on the row: ``catchup=False`` skips the
+    missed grid points (one fire, ``next_run_at = now + every``);
+    ``catchup=True`` fires once and re-catches the grid
+    (``next_run_at`` advances by ``every_seconds`` until it is in the
+    future). ``enabled`` is the clear-target: ``bridge schedule clear``
+    flips it to 0 instead of deleting the row, keeping the history.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: int | None = Field(default=None, ge=1)  # SQLite AUTOINCREMENT
+    session_id: str = Field(min_length=1)
+    task_text: str = Field(min_length=1)
+    every_seconds: int = Field(gt=0)
+    next_run_at: int
+    last_run_at: int | None = None
+    catchup: bool = False
+    enabled: bool = True
     created_at: int

@@ -52,6 +52,14 @@ def _exec(path, sql, args=()):
         con.close()
 
 
+def _one(path, sql, args=()):
+    con = db.connect(path)
+    try:
+        return con.execute(sql, args).fetchone()
+    finally:
+        con.close()
+
+
 def _stale_heartbeat(path, sid):
     _exec(
         path,
@@ -417,3 +425,100 @@ def test_item13d_notify_send_env_override(env, monkeypatch, tmp_path):
     line = rec.read_text()
     assert "ORCHESTRATOR DEAD" in line
     assert "orc" in line
+
+
+# --- item_14: schedule materialization inside the pass -------------------------
+
+
+def test_item14_daemon_materializes_due_schedule(env):
+    now = int(time.time())
+    sid = db.add_schedule(SID, "nightly sweep", 60, now - 1, path=env.db)
+    assert daemon.run(env.db, env.qdir, once=True) == daemon.RUN_OK
+
+    task = db.get_live_task(SID, path=env.db)
+    assert task is not None
+    assert task["status"] == TaskStatus.QUEUED.value
+    assert task["task_text"] == "nightly sweep"
+    # the dispatch notification was relayed to the fs mailbox in the
+    # same pass (the schedule pass runs before the relay)
+    nid = db.unrelayed_notifications(path=env.db)
+    assert nid == []
+    mdir = Path(env.qdir) / SID
+    files = _msg_files(mdir)
+    assert len(files) == 1
+    text = (mdir / files[0]).read_text()
+    assert "kind: task_dispatch" in text
+    assert f"task_id: {task['id']}" in text
+    assert text.rstrip().endswith("nightly sweep")
+    # the grid advanced and the fire is in the decision log
+    row = _one(
+        env.db,
+        "SELECT * FROM schedules WHERE id=?",
+        (sid,),
+    )
+    assert row["last_run_at"] is not None
+    assert row["next_run_at"] > now
+    fired = [d for d in _decisions(env) if d["event"] == "schedule_fired"]
+    assert len(fired) == 1
+    assert fired[0]["sid"] == SID
+    assert f"schedule={sid}" in fired[0]["detail"]
+    assert f"task_id={task['id']}" in fired[0]["detail"]
+    # a quiet pass fires nothing
+    assert daemon.run(env.db, env.qdir, once=True) == daemon.RUN_OK
+    assert len([d for d in _decisions(env) if d["event"] == "schedule_fired"]) == 1
+    assert len(db.list_tasks(path=env.db)) == 1
+
+
+def test_item14_not_due_and_disabled_schedules_skipped(env):
+    now = int(time.time())
+    future = db.add_schedule(SID, "later", 60, now + 3600, path=env.db)
+    off = db.add_schedule(SID, "never", 60, now - 1, path=env.db)
+    assert db.disable_schedule(off, path=env.db)
+    assert daemon.run(env.db, env.qdir, once=True) == daemon.RUN_OK
+    assert db.list_tasks(path=env.db) == []
+    assert not any(d["event"] == "schedule_fired" for d in _decisions(env))
+    # grid anchors untouched
+    for sid_, anchor in ((future, now + 3600), (off, now - 1)):
+        row = _one(env.db, "SELECT * FROM schedules WHERE id=?", (sid_,))
+        assert row["next_run_at"] == anchor
+
+
+def test_item14_busy_session_defers_the_fire(env):
+    now = int(time.time())
+    db.add_schedule(SID, "scheduled work", 60, now - 1, path=env.db)
+    # the session already holds a live task - the materialize rolls
+    # back and the pass logs the deferral instead of dropping the fire
+    tid = db.enqueue(SID, "busy", path=env.db)
+    assert daemon.run(env.db, env.qdir, once=True) == daemon.RUN_OK
+    assert len(db.list_tasks(path=env.db)) == 1
+    deferred = [d for d in _decisions(env) if d["event"] == "schedule_deferred"]
+    assert len(deferred) == 1
+    # once the slot frees the next pass fires it
+    _exec(env.db, "UPDATE tasks SET status='done' WHERE id=?", (tid,))
+    assert daemon.run(env.db, env.qdir, once=True) == daemon.RUN_OK
+    task = db.get_live_task(SID, path=env.db)
+    assert task["task_text"] == "scheduled work"
+
+
+def test_item14_one_bad_schedule_does_not_sink_the_pass(env, monkeypatch):
+    now = int(time.time())
+    bad = db.add_schedule("s-bad", "boom", 60, now - 1, path=env.db)
+    good = db.add_schedule(SID, "fine", 60, now - 1, path=env.db)
+    real = db.materialize_schedule
+
+    def flaky(schedule_id, now_arg=None, *, path=None):
+        if schedule_id == bad:
+            raise RuntimeError("simulated materialize failure")
+        return real(schedule_id, now_arg, path=path)
+
+    monkeypatch.setattr(db, "materialize_schedule", flaky)
+    assert daemon.run(env.db, env.qdir, once=True) == daemon.RUN_OK
+    errors = [d for d in _decisions(env) if d["event"] == "schedule_error"]
+    assert len(errors) == 1
+    assert errors[0]["sid"] == "s-bad"
+    assert f"schedule={bad}" in errors[0]["detail"]
+    # the sibling schedule still fired and its task is queued
+    task = db.get_live_task(SID, path=env.db)
+    assert task is not None and task["task_text"] == "fine"
+    fired = [d for d in _decisions(env) if d["event"] == "schedule_fired"]
+    assert any(f"schedule={good}" in d["detail"] for d in fired)
