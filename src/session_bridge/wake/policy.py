@@ -34,6 +34,7 @@ class WakePolicy:
         self._breaker_cooldown = breaker_cooldown_seconds
         self._clock = clock
         self._next_allowed: dict[str, float] = {}
+        self._unconfirmed_streak: dict[str, int] = {}
         self._consecutive_failures: dict[str, int] = {}
         self._suspended_until: dict[str, float] = {}
 
@@ -59,11 +60,21 @@ class WakePolicy:
         The prompt bytes were written (TCP accepted them) but no turn
         evidence arrived, so the nudge may have landed while the host
         was not listening - the next pass retries after a short
-        backoff instead of the full cooldown.
+        backoff instead of the full cooldown. The backoff doubles per
+        consecutive unconfirmed streak (60s, 120s, 240s, ... capped at
+        the cooldown) so a host that never confirms is not polled
+        forever at the minimum interval.
         """
+        streak = self._unconfirmed_streak.get(session_id, 0) + 1
+        self._unconfirmed_streak[session_id] = streak
+        backoff = delay * (2 ** (streak - 1))
         self._next_allowed[session_id] = self._clock() + min(
-            delay, self._cooldown
+            backoff, self._cooldown
         )
+
+    def record_confirmed(self, session_id: str) -> None:
+        """Reset the unconfirmed streak after a fully confirmed wake."""
+        self._unconfirmed_streak.pop(session_id, None)
 
     def record_result(self, host_key: str, ok: bool) -> bool:
         """Track per-host failures; True when the breaker just opened."""

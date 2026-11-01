@@ -388,6 +388,33 @@ def test_policy_retry_soon_shortens_cooldown():
     assert p.check("s", "h") is None  # retried well before 300s
 
 
+def test_policy_unconfirmed_streak_grows_backoff():
+    """Repeated unconfirmed wakes back off exponentially (60,120,240,
+    capped at cooldown) instead of polling the host every 60s."""
+    clock = [1000.0]
+    p = WakePolicy(cooldown_seconds=300, clock=lambda: clock[0])
+    p.record_attempt("s")
+    p.record_retry_soon("s")
+    clock[0] += 61  # pass 2 allowed
+    p.record_attempt("s")
+    p.record_retry_soon("s")  # streak 2 -> 120s
+    clock[0] += 61
+    assert p.check("s", "h") == "cooldown"
+    clock[0] += 61
+    assert p.check("s", "h") is None
+    p.record_attempt("s")
+    p.record_retry_soon("s")  # streak 3 -> 240s
+    clock[0] += 121
+    assert p.check("s", "h") == "cooldown"
+    clock[0] += 121
+    assert p.check("s", "h") is None
+    p.record_confirmed("s")  # confirmed wake resets the streak
+    p.record_attempt("s")
+    p.record_retry_soon("s")
+    clock[0] += 61
+    assert p.check("s", "h") is None
+
+
 def test_policy_breaker_opens_after_threshold():
     clock = [1000.0]
     p = WakePolicy(breaker_threshold=2, breaker_cooldown_seconds=600, clock=lambda: clock[0])

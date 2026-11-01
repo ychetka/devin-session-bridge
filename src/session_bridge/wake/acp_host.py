@@ -160,7 +160,13 @@ def pid_alive(pid) -> bool:
 
 
 def nudge_text(session_id: str) -> str:
-    """The fixed wake nudge - a trigger only, never task payload."""
+    """The fixed wake nudge - a trigger only, never task payload.
+
+    INVARIANT (review finding): this text must stay a static drain
+    reminder - the only interpolation allowed is the session id.
+    The busy-check TOCTOU race is bounded precisely because a stray
+    nudge carries no data; parameterizing it re-opens that window.
+    """
     return (
         "[sessions-bridge] You have pending bridge mail. Per PLAYBOOK "
         f"drain mode: drain your mailbox now (ls -v the msg_*.txt files, "
