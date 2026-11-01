@@ -274,11 +274,18 @@ def test_item15_gwt2_drain_instructions_complete(qdir):
     # idempotent by notification id + disarm semantics preserved
     assert "idempotent" in text
     assert "disarm" in text
-    # optional exec-shell observer flagged as observation-only
+    # optional exec-shell observer flagged as observation-only; its
+    # poll loop also runs `bridge heartbeat` so the daemon never marks
+    # a live drain-mode session DEAD between turns
     assert "timeout=0" in text
     assert "cannot inject into your turn" in text
+    assert (
+        f"while true; do bridge heartbeat {SID}; "
+        f"ls -v {mdir}/msg_*.txt 2>/dev/null; sleep {POLL_SECONDS}; done" in text
+    )
+    assert "keeps your heartbeat alive between turns" in text
     # latency trade-off is stated explicitly
-    assert "latency" in text.lower() or "Latency" in text
+    assert "latency" in text.lower()
 
 
 def test_item15_gwt3_resident_path_not_regressed(qdir):

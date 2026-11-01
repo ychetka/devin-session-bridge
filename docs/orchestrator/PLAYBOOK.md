@@ -253,15 +253,17 @@ working fix: input stays free and deliveries drain on the next turn.
 
 ### Drain mode (orchestrator, default for interactive sessions)
 
-- At the start of every turn: `ls -v queue/<sid>/msg_*.txt`, then
-  `cat` + `rm` each file in order and handle it by kind. `ls -v` is
-  GNU version sort - the numeric head-of-queue (msg_2 before
+- At the start of every turn: `ls -v queue/<sid>/msg_*.txt 2>/dev/null`,
+  then `cat` + `rm` each file in order and handle it by kind. `ls -v`
+  is GNU version sort - the numeric head-of-queue (msg_2 before
   msg_10), same ordering as `next_message`.
 - Before the turn ends: run one more drain pass so nothing that
   arrived mid-turn sits unhandled.
 - A light background exec-shell observer (timeout=0) may watch the
-  mailbox as a signal aid, but a shell cannot inject into your
-  turn - never wait for a push from it; the drain is yours to run.
+  mailbox as a signal aid and run `bridge heartbeat <sid>` inside its
+  poll loop - the observer shell keeps your heartbeat alive between
+  turns. But a shell cannot inject into your turn - never wait for a
+  push from it; the drain is yours to run.
 - Stamp `bridge heartbeat <sid>` at turn start (the same write
   resident mode does on every watcher cycle).
 - Do not "fix" the next-turn latency by spawning a resident watcher
@@ -281,7 +283,7 @@ working fix: input stays free and deliveries drain on the next turn.
   processing guarantee.
 - Keep the heartbeat inside the 120s stale window:
   `bridge heartbeat <sid>` on every watcher cycle (resident) or at
-  every turn start (drain).
+  every turn start plus via the observer loop (drain).
 - Between deliveries, work the question queue: claim, committee,
   directive, audit. Deliveries meanwhile are also how worker
   `bridge ask` results and task completions reach you - the

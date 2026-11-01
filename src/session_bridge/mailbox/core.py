@@ -260,6 +260,14 @@ def mailbox_duty_text(session_id: str, *, db_path=None, queue_dir=None) -> str:
     """
     mdir = mailbox_dir(session_id, db_path=db_path, queue_dir=queue_dir)
     loop = watcher_loop_text(mdir)
+    # Optional drain-mode observer: polls the mailbox and heartbeats
+    # each cycle, keeping the session inside HEARTBEAT_STALE_SECONDS
+    # between turns (a drain-mode session has no turn open to
+    # heartbeat from, so only a shell can do it).
+    observer = (
+        f"while true; do bridge heartbeat {session_id}; "
+        f"ls -v {mdir}/msg_*.txt 2>/dev/null; sleep {POLL_SECONDS}; done"
+    )
     return f"""[sessions-bridge] MANAGED MODE - mailbox duty (session {session_id})
 
 You are a managed sessions-bridge worker. Tasks, question answers and
@@ -313,8 +321,8 @@ your turn slot open and block the human's input. You drain the
 mailbox yourself, twice per turn:
 
 1. Turn start (right after this duty arrives): run
-   `ls -v {mdir}/msg_*.txt` (version sort keeps numeric order -
-   msg_2 before msg_10), then for each listed file in order: `cat`
+   `ls -v {mdir}/msg_*.txt 2>/dev/null` (version sort keeps numeric
+   order - msg_2 before msg_10), then for each listed file in order: `cat`
    it, handle it by the same notification-kind table as resident
    mode above, and `rm` it. Deliveries are idempotent by
    notification id: if you already handled id N, skip it.
@@ -327,8 +335,9 @@ mailbox yourself, twice per turn:
    after each drain pass to advance your restart-ack watermark.
 5. Optional observation aid only: you may run a light background
    exec-shell (timeout=0) that watches the mailbox, e.g.
-   `while true; do ls -v {mdir}/msg_*.txt 2>/dev/null; sleep {POLL_SECONDS}; done`
-   - but a shell cannot inject into your turn, so NEVER wait for a
+   `{observer}`
+   - the observer shell keeps your heartbeat alive between turns,
+   but a shell cannot inject into your turn, so NEVER wait for a
    push from it; the drain steps above are still yours to run.
 6. Latency trade-off: a delivery may wait until your next turn. That
    is the conscious price of keeping the human's input line free -
