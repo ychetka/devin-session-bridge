@@ -352,19 +352,27 @@ def wake_session(
                 _rpc(chan, req, method, params)
                 return _await_response(chan, req, timeout, cap)
 
-            call(
-                "initialize",
-                {
-                    "protocolVersion": 1,
-                    "clientCapabilities": {
-                        "fs": {"readTextFile": False, "writeTextFile": False}
+            try:
+                call(
+                    "initialize",
+                    {
+                        "protocolVersion": 1,
+                        "clientCapabilities": {
+                            "fs": {"readTextFile": False, "writeTextFile": False}
+                        },
+                        "clientInfo": {"name": "sessions-bridge-wake", "version": "0"},
                     },
-                    "clientInfo": {"name": "sessions-bridge-wake", "version": "0"},
-                },
-            )
-            chan.send({"jsonrpc": "2.0", "method": "initialized", "params": {}})
+                )
+                chan.send({"jsonrpc": "2.0", "method": "initialized", "params": {}})
 
-            listing = call("session/list", {})
+                listing = call("session/list", {})
+            except WakeError as e:
+                # rpc errors before the session list completes mean
+                # the host handshake/list failed - host-level, not
+                # session-level (breaker accounting depends on it)
+                if e.reason == "rpc_error":
+                    raise WakeError("attach_failed", str(e)) from e
+                raise
             entry = None
             for item in listing.get("sessions", []):
                 if item.get("sessionId") == session_id:
@@ -433,6 +441,15 @@ def wake_session(
                         return "sent"
                     continue
                 if msg.get("id") == prompt_id:
+                    if msg.get("error") is not None:
+                        # e.g. the session went busy between list and
+                        # prompt and the host rejected it - surfaces
+                        # as a session-level failure, not a sent wake
+                        err = msg["error"]
+                        detail = (
+                            err.get("message") if isinstance(err, dict) else str(err)
+                        )
+                        raise WakeError("rpc_error", f"session/prompt: {detail}")
                     return "sent"
             return "sent_unconfirmed"
         finally:

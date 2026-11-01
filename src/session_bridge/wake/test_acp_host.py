@@ -389,6 +389,42 @@ def test_wake_replay_overflow_still_prompts():
     assert outcome in ("sent", "sent_unconfirmed")
 
 
+def test_wake_prompt_error_is_not_sent():
+    """A session/prompt error response (e.g. host rejected a
+    mid-turn prompt) must surface as rpc_error, not 'sent'."""
+
+    class ErrHost(FakeAcpHost):
+        def _client(self, conn):
+            f = conn.makefile("rw")
+            try:
+                json.loads(f.readline())  # hello
+                f.write(json.dumps({"ok": True, "protocol": 1}) + "\n")
+                f.flush()
+                for line in f:
+                    msg = json.loads(line)
+                    if "id" not in msg:
+                        continue
+                    method = msg.get("method")
+                    out = {"jsonrpc": "2.0", "id": msg["id"]}
+                    if method == "session/prompt":
+                        out["error"] = {"code": -32000, "message": "session is busy"}
+                    elif method == "session/list":
+                        out["result"] = {"sessions": self.sessions}
+                    else:
+                        out["result"] = {}
+                    f.write(json.dumps(out) + "\n")
+                    f.flush()
+            except (OSError, json.JSONDecodeError):
+                pass
+            finally:
+                conn.close()
+
+    host = ErrHost(sessions=[IDLE_SESSION])
+    with pytest.raises(WakeError) as exc:
+        wake_session(SID, "/tmp/ws", lock_data=host.lock_data())
+    assert exc.value.reason == "rpc_error"
+
+
 def test_wake_prompt_unconfirmed_still_reports():
     host = FakeAcpHost(sessions=[IDLE_SESSION], prompt_update=True)
     outcome = wake_session(
