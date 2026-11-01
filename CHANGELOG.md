@@ -1,6 +1,6 @@
 # Changelog
 
-## [0.2.0] - 2026-10-31
+## [0.2.0] - 2026-11-01
 
 Orchestration protocol release: the bridge becomes a two-way
 message bus for orchestrator-managed session fleets, with
