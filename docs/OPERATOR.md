@@ -281,7 +281,8 @@ Daemon files in the state dir:
 - `daemon_decisions.jsonl` - one `{ts, event, sid, detail}` JSON line
   per decision: `daemon_start`, `relayed`, `relay_error`,
   `orchestrator_dead`, `worker_dead`, `pass_error`, `lock_refused`,
-  `daemon_stop`.
+  `daemon_stop`, `wake_sent`, `wake_skipped_busy`, `wake_failed`,
+  `wake_breaker_open`, `wake_pass_deadline`.
 - `logs/daemon.log` - the detached daemon's stderr (decision lines are
   echoed there too).
 
@@ -291,7 +292,11 @@ Each pass (~5s, with up to ~1s startup jitter):
    `queue/<sid>/msg_<id>.txt` file (atomic write), then `relayed_at`
    is CAS-marked. Delivery is at-least-once; consumers dedup by
    notification id.
-2. Sweep: sessions whose `worker_heartbeats.last_seen_at` is older
+2. Wake: managed+armed sessions with a stale heartbeat (or none) and
+   unacked relayed mail get a nudge prompt through the acp-host wake
+   transport (see below) - this is what closes the delivery loop for
+   idle sessions. A session mid-turn is never prompted.
+3. Sweep: sessions whose `worker_heartbeats.last_seen_at` is older
    than `HEARTBEAT_STALE_SECONDS` (120s) flip to `status='dead'`.
    A dead worker's live task is requeued (attempt +1, terminal
    `failed` at the `MAX_ATTEMPTS = 2` budget) carrying the note
@@ -299,6 +304,56 @@ Each pass (~5s, with up to ~1s startup jitter):
    dead-worker-backup-<id>) and reset the worktree to the task's base
    ref before starting". A silent orchestrator raises one deduped
    `notify-send -u critical`.
+
+## Wake transport (acp-host)
+
+The mailbox alone cannot reach an idle session: with no turn open,
+nobody drains `queue/<sid>/`. The daemon's wake step attaches a
+transient client to the detached acp-host that owns every local Devin
+session and injects a short "drain your mailbox" prompt - a real
+turn, so the session's drain duty runs and the mail is handled. The
+nudge carries no payload; the fs mailbox stays the only data
+channel, so a lost or duplicated wake is harmless.
+
+Requirements:
+
+- the target session must be open in Devin Desktop / the shared
+  `devin acp` process on the same host;
+- an `acp-host-*.lock` file in `~/.devin-server/cli/` (JSON
+  `{pid, port, token}`); the newest valid lockfile wins and is
+  re-read on every attempt;
+- the session must report an idle `cognition.ai/statusEnum`
+  (`finished`/`idle`); a mid-turn session is skipped with a
+  `wake_skipped_busy` decision and retried next pass.
+
+Failure modes (all land in `daemon_decisions.jsonl`, none modify
+notification state):
+
+- `wake_failed` with `reason=wake_host_down` - no lockfile, dead pid,
+  or connect refused;
+- `wake_failed` with `reason=unauthorized` - stale/rotated token;
+  a fresh lockfile is picked up on the next pass;
+- `wake_failed` with `reason=no_session` - the session is not known
+  to the acp-host (tab closed, never opened);
+- `wake_breaker_open` - N consecutive host failures suspended all
+  wake attempts for the breaker window (default 3 failures, 600s);
+- `wake_pass_deadline` - the pass ran out of its 120s budget;
+  remaining candidates retry next pass.
+
+Pacing: per-session cooldown 300s between wake attempts; all
+attaches are serialized on a process-wide lock so the daemon pass and
+a manual `bridge wake` can never overlap.
+
+Manual wake:
+
+```bash
+bridge wake <session_id>          # attach + idle check + nudge prompt
+bridge wake <session_id> --prompt "custom nudge text"
+```
+
+`bridge wake` bypasses the cooldown but keeps the busy check - it
+refuses (conflict) while the session is mid-turn. Useful to verify
+the transport or to nudge a session on demand.
 
 ## External watchdog (cron / systemd)
 

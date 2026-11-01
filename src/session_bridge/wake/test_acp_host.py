@@ -50,12 +50,14 @@ class FakeAcpHost:
         hang=False,
         replay_count=0,
         prompt_update=True,
+        truncate_hello=False,
     ):
         self.sessions = list(sessions)
         self.hello_error = hello_error
         self.hang = hang
         self.replay_count = replay_count
         self.prompt_update = prompt_update
+        self.truncate_hello = truncate_hello
         self.hellos: list[dict] = []
         self.calls: list[tuple[str, dict]] = []
         self.errors: list[str] = []
@@ -84,6 +86,10 @@ class FakeAcpHost:
         try:
             hello = json.loads(f.readline())
             self.hellos.append(hello)
+            if self.truncate_hello:
+                f.write('{"ok": tru')  # truncated NDJSON then drop
+                f.flush()
+                return
             if self.hello_error is not None:
                 f.write(json.dumps({"ok": False, "protocol": 1, "error": self.hello_error}) + "\n")
                 f.flush()
@@ -91,7 +97,8 @@ class FakeAcpHost:
             f.write(json.dumps({"ok": True, "protocol": 1, "pid": os.getpid()}) + "\n")
             f.flush()
             if self.hang:
-                return  # hold the socket open, never answer ACP
+                self._stop.wait(30)  # hold the socket open, never answer ACP
+                return
             for line in f:
                 line = line.strip()
                 if not line:
@@ -310,6 +317,22 @@ def test_wake_unauthorized():
     with pytest.raises(WakeError) as exc:
         wake_session(SID, "/tmp/ws", lock_data=host.lock_data())
     assert exc.value.reason == "unauthorized"
+
+
+def test_wake_truncated_hello_clean_error():
+    host = FakeAcpHost(sessions=[IDLE_SESSION], truncate_hello=True)
+    with pytest.raises(WakeError):
+        wake_session(SID, "/tmp/ws", lock_data=host.lock_data())
+
+
+def test_wake_stalled_response_is_timeout(monkeypatch):
+    import session_bridge.wake.acp_host as acp_host
+
+    monkeypatch.setattr(acp_host, "_REQUEST_TIMEOUT", 0.3)
+    host = FakeAcpHost(sessions=[IDLE_SESSION], hang=True)
+    with pytest.raises(WakeError) as exc:
+        wake_session(SID, "/tmp/ws", lock_data=host.lock_data())
+    assert exc.value.reason in ("timeout", "malformed_message")
 
 
 def test_wake_replay_overflow_still_prompts():
