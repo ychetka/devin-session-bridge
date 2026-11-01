@@ -1399,3 +1399,173 @@ def test_item13g_stale_boundary_matches_daemon(env, capsys):
         con.close()
     lines = _status_human(capsys)
     assert any(line.startswith("ORCHESTRATOR DEAD") for line in lines)
+
+
+# --- item_14: bridge schedule ----------------------------------------------------
+
+
+def _schedules(env):
+    return db.list_schedules(path=env.db)
+
+
+def test_item14_schedule_add_every(env, capsys):
+    before = int(time.time())
+    rc, out = _run(
+        ["schedule", SID, "--task", "nightly sweep", "--every", "60", "--json"],
+        capsys,
+    )
+    assert rc == ExitCode.OK
+    assert out["status"] == "scheduled"
+    assert out["data"]["every_seconds"] == 60
+    assert out["data"]["catchup"] is False
+    assert before + 60 <= out["data"]["next_run_at"] <= int(time.time()) + 60
+    rows = _schedules(env)
+    assert len(rows) == 1
+    assert rows[0]["id"] == out["data"]["schedule_id"]
+    assert rows[0]["session_id"] == SID
+    assert rows[0]["task_text"] == "nightly sweep"
+    assert rows[0]["enabled"] == 1
+    assert rows[0]["catchup"] == 0
+
+
+def test_item14_schedule_add_every_unit_suffixes(env, capsys):
+    cases = {"300": 300, "30m": 1800, "1h": 3600, "2d": 172800, "45s": 45}
+    for spec, seconds in cases.items():
+        rc, out = _run(
+            ["schedule", SID, "--task", "t", "--every", spec, "--json"],
+            capsys,
+        )
+        assert rc == ExitCode.OK, spec
+        assert out["data"]["every_seconds"] == seconds, spec
+
+
+def test_item14_schedule_add_every_rejects_bad_specs(env, capsys):
+    for spec in ("abc", "1x", "0", "-5", "1.5h", "h"):
+        rc, _out = _run(
+            ["schedule", SID, "--task", "t", "--every", spec, "--json"],
+            capsys,
+        )
+        assert rc == ExitCode.USAGE, spec
+    assert _schedules(env) == []
+
+
+def test_item14_gwt5_schedule_add_at_sets_daily_grid(env, capsys):
+    # a time comfortably ahead today: the grid anchors on it
+    ahead = time.localtime(time.time() + 2 * 3600)
+    spec = f"{ahead.tm_hour:02d}:{ahead.tm_min:02d}"
+    before = int(time.time())
+    rc, out = _run(
+        ["schedule", SID, "--task", "standup", "--at", spec, "--json"],
+        capsys,
+    )
+    assert rc == ExitCode.OK
+    assert out["data"]["every_seconds"] == 86400
+    nxt = out["data"]["next_run_at"]
+    assert before < nxt <= before + 86400
+    tm = time.localtime(nxt)
+    assert (tm.tm_hour, tm.tm_min) == (ahead.tm_hour, ahead.tm_min)
+
+
+def test_item14_gwt5_schedule_add_at_past_time_wraps_to_tomorrow(env, capsys):
+    # a time already behind today: the nearest occurrence is tomorrow
+    behind = time.localtime(time.time() - 2 * 3600)
+    spec = f"{behind.tm_hour:02d}:{behind.tm_min:02d}"
+    before = int(time.time())
+    rc, out = _run(
+        ["schedule", SID, "--task", "standup", "--at", spec, "--json"],
+        capsys,
+    )
+    assert rc == ExitCode.OK
+    nxt = out["data"]["next_run_at"]
+    assert out["data"]["every_seconds"] == 86400
+    assert nxt > before
+    tm = time.localtime(nxt)
+    assert (tm.tm_hour, tm.tm_min) == (behind.tm_hour, behind.tm_min)
+    # today's slot (~2h ago) was skipped: the next occurrence is ~22h
+    # out, never the missed one (tolerance for minute truncation)
+    assert nxt - before > 86400 - 2 * 3600 - 120
+
+
+def test_item14_schedule_add_at_rejects_bad_specs(env, capsys):
+    for spec in ("25:00", "12:60", "noon", "9", "9:5x"):
+        rc, _out = _run(
+            ["schedule", SID, "--task", "t", "--at", spec, "--json"],
+            capsys,
+        )
+        assert rc == ExitCode.USAGE, spec
+    assert _schedules(env) == []
+
+
+def test_item14_schedule_add_requires_task_and_interval(env, capsys):
+    rc, _out = _run(["schedule", SID, "--every", "60", "--json"], capsys)
+    assert rc == ExitCode.USAGE
+    rc, _out = _run(["schedule", SID, "--task", "t", "--json"], capsys)
+    assert rc == ExitCode.USAGE
+    assert _schedules(env) == []
+
+
+def test_item14_schedule_add_catchup_flag(env, capsys):
+    rc, out = _run(
+        ["schedule", SID, "--task", "t", "--every", "60", "--catchup", "--json"],
+        capsys,
+    )
+    assert rc == ExitCode.OK
+    assert out["data"]["catchup"] is True
+    assert _schedules(env)[0]["catchup"] == 1
+
+
+def test_item14_schedule_list_and_session_filter(env, capsys):
+    _run(["schedule", "s-a", "--task", "ta", "--every", "60", "--json"], capsys)
+    _run(["schedule", "s-b", "--task", "tb", "--every", "120", "--json"], capsys)
+    _run(["schedule", "s-a", "--task", "tc", "--at", "09:30", "--json"], capsys)
+    rc, out = _run(["schedule", "list", "--json"], capsys)
+    assert rc == ExitCode.OK
+    items = out["data"]["schedules"]
+    assert [i["session_id"] for i in items] == ["s-a", "s-b", "s-a"]
+    assert items[2]["every_seconds"] == 86400
+    rc, out = _run(["schedule", "list", "--session", "s-a", "--json"], capsys)
+    assert [i["task_text"] for i in out["data"]["schedules"]] == ["ta", "tc"]
+    # human render smoke: one line per schedule
+    assert bridge.main(["schedule", "list"]) == ExitCode.OK
+    lines = capsys.readouterr().out.strip().splitlines()
+    assert len(lines) == 3
+    assert all(line.startswith("schedule ") for line in lines)
+    rc, out = _run(["schedule", "list", "--session", "ghost", "--json"], capsys)
+    assert out["data"]["schedules"] == []
+
+
+def test_item14_schedule_clear_disables_and_keeps_row(env, capsys):
+    rc, out = _run(
+        ["schedule", SID, "--task", "t", "--every", "60", "--json"],
+        capsys,
+    )
+    sched_id = out["data"]["schedule_id"]
+    rc, out = _run(["schedule", "clear", str(sched_id), "--json"], capsys)
+    assert rc == ExitCode.OK
+    assert out["status"] == "disabled"
+    row = _schedules(env)[0]
+    assert row["enabled"] == 0
+    # the row is kept (history), the schedule never fires again
+    assert len(_schedules(env)) == 1
+    # a repeated clear conflicts; an unknown id is not_found
+    rc, out = _run(["schedule", "clear", str(sched_id), "--json"], capsys)
+    assert rc == ExitCode.CONFLICT
+    rc, out = _run(["schedule", "clear", "9999", "--json"], capsys)
+    assert rc == ExitCode.NOT_FOUND
+    # clear without an id is a usage error
+    rc, _out = _run(["schedule", "clear", "--json"], capsys)
+    assert rc == ExitCode.USAGE
+
+
+def test_item14_schedule_cli_created_schedule_fires(env, capsys):
+    # a schedule created through the CLI materializes on a daemon pass
+    rc, _out = _run(
+        ["schedule", SID, "--task", "cli tick", "--every", "1", "--json"],
+        capsys,
+    )
+    assert rc == ExitCode.OK
+    time.sleep(1.1)
+    assert daemon.run(env.db, str(env.qdir), once=True) == daemon.RUN_OK
+    task = db.get_live_task(SID, path=env.db)
+    assert task is not None
+    assert task["task_text"] == "cli tick"
