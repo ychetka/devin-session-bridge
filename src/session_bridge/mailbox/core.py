@@ -19,14 +19,23 @@ Write/read semantics (proven by the bead-beast spike):
 
 The daemon relay (item_13d) is the producer: it turns outbox rows
 (``notifications.relayed_at`` NULL) into mailbox files. The managed
-session's background watcher subagent (``WATCHER_LOOP``) is the
-consumer: it polls the directory every ``POLL_SECONDS``, prints each
-pending message, removes it and exits after the first non-empty pass
-so its completion lands inside the parent's open turn. The watcher
-also exits on ``WATCHER_TTL_SECONDS`` so its transcript stays bounded;
-the parent re-arms a fresh watcher on every completion and rotates
-the whole turn after ``TURN_TTL_CYCLES`` (the SessionStart hook
-re-arms the duty).
+session is the consumer, in one of two watcher modes picked by
+context (item_15):
+
+- ``resident``: a background watcher subagent runs ``WATCHER_LOOP`` -
+  it polls the directory every ``POLL_SECONDS``, prints each pending
+  message, removes it and exits after the first non-empty pass so its
+  completion lands inside the parent's open turn. The watcher also
+  exits on ``WATCHER_TTL_SECONDS`` so its transcript stays bounded;
+  the parent re-arms a fresh watcher on every completion and rotates
+  the whole turn after ``TURN_TTL_CYCLES`` (the SessionStart hook
+  re-arms the duty). For autonomous/headless sessions only: the
+  occupied turn slot blocks human input in interactive sessions.
+- ``drain``: no resident watcher - the session itself drains the
+  mailbox (``ls -v`` / ``cat`` / ``rm``) at the start of every turn
+  and once more before the turn ends. For interactive Desktop
+  sessions; the trade-off is delivery latency bounded by the next
+  turn.
 """
 
 import os
@@ -241,17 +250,31 @@ def mailbox_duty_text(session_id: str, *, db_path=None, queue_dir=None) -> str:
     """additionalContext for a managed session: the mailbox duty.
 
     Imperative instructions the SessionStart/UserPromptSubmit hooks
-    inject: arm a background watcher subagent, process deliveries by
-    notification kind, re-arm before end_turn, rotate the turn after
-    TURN_TTL_CYCLES, exit on disarm.
+    inject. Two watcher modes, selected by the session itself from
+    context: ``resident`` (background watcher subagent, for
+    autonomous sessions - the occupied turn slot blocks human input)
+    or ``drain`` (self-drain at turn start and end, for interactive
+    Desktop sessions). Both process deliveries by notification kind,
+    dedup by notification id, ack and exit on disarm; resident also
+    rotates the turn after TURN_TTL_CYCLES.
     """
     mdir = mailbox_dir(session_id, db_path=db_path, queue_dir=queue_dir)
     loop = watcher_loop_text(mdir)
     return f"""[sessions-bridge] MANAGED MODE - mailbox duty (session {session_id})
 
 You are a managed sessions-bridge worker. Tasks, question answers and
-orchestrator directives arrive as files in your mailbox directory;
-a background watcher keeps your turn open and wakes you on delivery.
+orchestrator directives arrive as files in your mailbox directory:
+{mdir}
+
+Pick your watcher mode NOW - the choice is yours, by context:
+if a live human may be sitting behind this session (Desktop/GUI
+interactive), use DRAIN mode; if you are an autonomous worker, use
+RESIDENT mode. A resident watcher occupies the turn slot, which
+blocks the human's input in an interactive session - that is the
+live finding this split exists for. Drain mode trades delivery
+latency for a free input line.
+
+== MODE RESIDENT - background watcher subagent (autonomous sessions) ==
 
 1. Arm the watcher NOW: spawn a background subagent running this bash
    loop verbatim (never run it inline - its completion must land
@@ -281,4 +304,35 @@ a background watcher keeps your turn open and wakes you on delivery.
    watcher unless a disarm arrived.
 6. Turn rotation: after {TURN_TTL_CYCLES} watcher cycles in this
    turn, end the turn cleanly - the SessionStart hook re-injects
-   this duty and re-arms automatically."""
+   this duty and re-arms automatically.
+
+== MODE DRAIN - self-drain each turn (interactive/Desktop sessions) ==
+
+No resident watcher: do NOT spawn a mailbox subagent - it would hold
+your turn slot open and block the human's input. You drain the
+mailbox yourself, twice per turn:
+
+1. Turn start (right after this duty arrives): run
+   `ls -v {mdir}/msg_*.txt` (version sort keeps numeric order -
+   msg_2 before msg_10), then for each listed file in order: `cat`
+   it, handle it by the same notification-kind table as resident
+   mode above, and `rm` it. Deliveries are idempotent by
+   notification id: if you already handled id N, skip it.
+2. Heartbeat: `bridge heartbeat {session_id}` at turn start, the
+   same liveness write resident mode does on every watcher cycle.
+3. Before your turn ends: run one more drain pass (the same
+   `ls -v` / `cat` / `rm`) so nothing that arrived mid-turn sits
+   unhandled.
+4. If `bridge ack` is available, run `bridge ack --session {session_id}`
+   after each drain pass to advance your restart-ack watermark.
+5. Optional observation aid only: you may run a light background
+   exec-shell (timeout=0) that watches the mailbox, e.g.
+   `while true; do ls -v {mdir}/msg_*.txt 2>/dev/null; sleep {POLL_SECONDS}; done`
+   - but a shell cannot inject into your turn, so NEVER wait for a
+   push from it; the drain steps above are still yours to run.
+6. Latency trade-off: a delivery may wait until your next turn. That
+   is the conscious price of keeping the human's input line free -
+   do not "fix" it by spawning a resident watcher in an interactive
+   session.
+7. disarm still applies: on a disarm delivery, managed mode is off -
+   stop draining and resume normal unmanaged operation."""
