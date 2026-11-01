@@ -1651,6 +1651,26 @@ def test_item14_gwt3_catchup1_recatches_the_grid(db_path):
     assert len(db.list_tasks(status=TaskStatus.QUEUED, path=db_path)) == 1
 
 
+def test_item14_catchup1_far_missed_grid_realigns_in_o1(db_path):
+    # regression: a linear grid walk over hundreds of millions of
+    # missed every=1 points would hang inside the write txn - the
+    # catchup realign must be closed-form
+    now = int(time.time())
+    anchor = 946684800  # 2000-01-01T00:00:00Z, decades of missed fires
+    sid = db.add_schedule("s1", "t", 1, anchor, catchup=True, path=db_path)
+    started = time.monotonic()
+    task_id = db.materialize_schedule(sid, now, path=db_path)
+    assert task_id is not None
+    assert time.monotonic() - started < 5
+    row = _one(db_path, "SELECT * FROM schedules WHERE id=?", (sid,))
+    # still exactly one task, and the next fire sits on the anchor
+    # grid strictly ahead of now (anchor + k*1 > now)
+    assert len(db.list_tasks(status=TaskStatus.QUEUED, path=db_path)) == 1
+    assert row["next_run_at"] == now + 1
+    assert row["next_run_at"] > now
+    assert (row["next_run_at"] - anchor) % 1 == 0
+
+
 def test_item14_gwt4_disable_stops_the_schedule(db_path):
     now = int(time.time())
     sid = db.add_schedule("s1", "t", 60, now - 1, path=db_path)

@@ -122,6 +122,8 @@ CREATE TABLE IF NOT EXISTS tasks (
   last_notified_at INTEGER,
   last_assistant_message TEXT,
   note TEXT,
+  -- dead schema for now: declared for the contract model, not yet
+  -- consumed by claim_queued
   run_after INTEGER,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
@@ -2007,14 +2009,17 @@ def _next_grid_run(next_run_at: int, every_seconds: int, now: int, catchup: bool
     and resumes fresh. ``catchup=True`` (fire once and re-catch): the
     grid is walked forward by ``every_seconds`` until it lands in the
     future - still exactly one task this fire, but the next fire is
-    on the original grid, not a drifted one.
+    on the original grid, not a drifted one. The walk is closed-form
+    (O(1)): a linear loop over a long-missed grid (``every_seconds=1``
+    after months of downtime iterates billions of times) would hang
+    inside the BEGIN IMMEDIATE write transaction.
     """
     if not catchup:
         return now + every_seconds
-    nxt = next_run_at
-    while nxt <= now:
-        nxt += every_seconds
-    return nxt
+    if next_run_at > now:
+        return next_run_at
+    behind = now - next_run_at
+    return next_run_at + ((behind // every_seconds) + 1) * every_seconds
 
 
 def materialize_schedule(schedule_id: int, now: int | None = None, *, path=None):
