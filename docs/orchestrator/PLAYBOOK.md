@@ -259,6 +259,11 @@ working fix: input stays free and deliveries drain on the next turn.
   msg_10), same ordering as `next_message`.
 - Before the turn ends: run one more drain pass so nothing that
   arrived mid-turn sits unhandled.
+- The daemon closes the latency gap itself: when your heartbeat is
+  stale and relayed mail waits unacked, it injects a short "drain
+  your mailbox" prompt through the acp-host - a real turn that runs
+  this drain. You do not poll for it; the wake arrives as a normal
+  turn and the mailbox stays the only data channel.
 - A light background exec-shell observer (timeout=0) may watch the
   mailbox as a signal aid and run `bridge heartbeat <sid>` inside its
   poll loop - the observer shell keeps your heartbeat alive between
