@@ -378,6 +378,16 @@ def test_policy_cooldown_blocks_second_attempt():
     assert p.check("s", "h") is None
 
 
+def test_policy_retry_soon_shortens_cooldown():
+    clock = [1000.0]
+    p = WakePolicy(cooldown_seconds=300, clock=lambda: clock[0])
+    p.record_attempt("s")
+    p.record_retry_soon("s")
+    assert p.check("s", "h") == "cooldown"  # still inside 60s
+    clock[0] += 61
+    assert p.check("s", "h") is None  # retried well before 300s
+
+
 def test_policy_breaker_opens_after_threshold():
     clock = [1000.0]
     p = WakePolicy(breaker_threshold=2, breaker_cooldown_seconds=600, clock=lambda: clock[0])

@@ -33,7 +33,7 @@ class WakePolicy:
         self._breaker_threshold = breaker_threshold
         self._breaker_cooldown = breaker_cooldown_seconds
         self._clock = clock
-        self._last_attempt: dict[str, float] = {}
+        self._next_allowed: dict[str, float] = {}
         self._consecutive_failures: dict[str, int] = {}
         self._suspended_until: dict[str, float] = {}
 
@@ -43,15 +43,27 @@ class WakePolicy:
         suspended = self._suspended_until.get(host_key)
         if suspended is not None and now < suspended:
             return "breaker_open"
-        last = self._last_attempt.get(session_id)
-        if last is not None and now - last < self._cooldown:
+        allowed = self._next_allowed.get(session_id)
+        if allowed is not None and now < allowed:
             return "cooldown"
         return None
 
     def record_attempt(self, session_id: str) -> None:
         """Stamp the attempt time - cooldown runs from the attach try,
         not the outcome, so failures cannot hot-loop a session."""
-        self._last_attempt[session_id] = self._clock()
+        self._next_allowed[session_id] = self._clock() + self._cooldown
+
+    def record_retry_soon(self, session_id: str, delay: float = 60.0) -> None:
+        """Shorten the wait after a ``sent_unconfirmed`` wake.
+
+        The prompt bytes were written (TCP accepted them) but no turn
+        evidence arrived, so the nudge may have landed while the host
+        was not listening - the next pass retries after a short
+        backoff instead of the full cooldown.
+        """
+        self._next_allowed[session_id] = self._clock() + min(
+            delay, self._cooldown
+        )
 
     def record_result(self, host_key: str, ok: bool) -> bool:
         """Track per-host failures; True when the breaker just opened."""

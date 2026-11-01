@@ -25,6 +25,22 @@ Every step is bounded - a wake attempt has an overall deadline and
 can never stall the daemon loop. ``ATTACH_LOCK`` serializes all
 attaches process-wide (daemon pass and manual ``bridge wake`` can
 never overlap).
+
+Security and race notes:
+
+- the lockfile token is a same-uid bearer credential: Devin writes
+  ``acp-host-*.lock`` mode 0600 inside a 0700 directory, so the
+  boundary is "any process running as this user" - the same set of
+  processes that could drive the session anyway;
+- the busy check is a snapshot: between ``session/list`` and
+  ``session/prompt`` the session can go busy for reasons outside our
+  process (the human types, another client attaches). The acp-host is
+  the arbiter for that window - a prompt rejected mid-turn surfaces
+  as an rpc_error -> ``wake_failed``; a nudge that lands anyway is a
+  fixed, harmless drain reminder, never task payload;
+- ``sent_unconfirmed`` means the prompt bytes were written but no
+  turn evidence arrived within the bound; the daemon retries those
+  on a short backoff rather than the full cooldown.
 """
 
 import glob

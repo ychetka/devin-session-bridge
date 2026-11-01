@@ -340,9 +340,20 @@ notification state):
 - `wake_pass_deadline` - the pass ran out of its 120s budget;
   remaining candidates retry next pass.
 
-Pacing: per-session cooldown 300s between wake attempts; all
-attaches are serialized on a process-wide lock so the daemon pass and
-a manual `bridge wake` can never overlap.
+Pacing: per-session cooldown 300s between wake attempts, shortened
+to 60s after a `sent_unconfirmed` outcome (prompt written but no
+turn evidence) so a silently missed nudge self-heals; all attaches
+are serialized on a process-wide lock so the daemon pass and a
+manual `bridge wake` can never overlap.
+
+Security boundary: the lockfile token is a same-uid bearer
+credential - Devin writes `acp-host-*.lock` mode 0600 inside the
+0700 `~/.devin-server/cli/` directory. Anyone able to read the
+lockfile can already act as the user. The idle check is a snapshot
+taken just before the prompt; a session that goes busy inside that
+window is arbitrated by the acp-host (a rejected prompt surfaces as
+`wake_failed`), and a stray nudge is always the fixed drain text,
+never payload.
 
 Manual wake:
 

@@ -508,6 +508,10 @@ def _wake_pass(db_path, state_directory, now: int, policy: WakePolicy) -> None:
         if outcome == "busy":
             _decision(state_directory, "wake_skipped_busy", sid)
             continue
+        if outcome == "sent_unconfirmed":
+            # prompt written but unconfirmed - retry sooner than the
+            # full cooldown so a silently missed nudge self-heals
+            policy.record_retry_soon(sid)
         _decision(state_directory, "wake_sent", sid, f"outcome={outcome}")
 
 
