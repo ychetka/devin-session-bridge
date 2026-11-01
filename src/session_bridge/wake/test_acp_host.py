@@ -51,6 +51,7 @@ class FakeAcpHost:
         replay_count=0,
         prompt_update=True,
         truncate_hello=False,
+        on_prompt=None,
     ):
         self.sessions = list(sessions)
         self.hello_error = hello_error
@@ -58,6 +59,7 @@ class FakeAcpHost:
         self.replay_count = replay_count
         self.prompt_update = prompt_update
         self.truncate_hello = truncate_hello
+        self.on_prompt = on_prompt
         self.hellos: list[dict] = []
         self.calls: list[tuple[str, dict]] = []
         self.errors: list[str] = []
@@ -131,6 +133,8 @@ class FakeAcpHost:
                         )
                     out["result"] = {}
                 elif method == "session/prompt":
+                    if self.on_prompt is not None:
+                        self.on_prompt()
                     if self.prompt_update:
                         f.write(
                             json.dumps(
@@ -505,6 +509,41 @@ def test_item16_bridge_wake_busy_conflict(env, tmp_path, monkeypatch, capsys):
     assert code != 0
     assert "session/prompt" not in host.methods()
     assert "mid-turn" in capsys.readouterr().out
+
+
+def test_item16_lockfile_reread_mid_pass(env, tmp_path, monkeypatch):
+    """Host rotates between candidates of one pass: s1 wakes against
+    host A; during that wake the lockfile is replaced by host B; s2's
+    attempt must use B (the re-read), not the pass-start snapshot."""
+    s2 = "s2"
+    lockdir = tmp_path / "locks"
+    lockdir.mkdir()
+    lockfile = lockdir / "acp-host-test.lock"
+
+    host_a = FakeAcpHost(sessions=[IDLE_SESSION])
+    host_b = FakeAcpHost(
+        sessions=[{**IDLE_SESSION, "sessionId": s2}],
+    )
+
+    def write_lock(data):
+        data = dict(data)
+        data.pop("_path", None)
+        lockfile.write_text(json.dumps(data))
+
+    write_lock(host_a.lock_data())
+    monkeypatch.setenv("SESSIONS_BRIDGE_ACP_LOCK_DIR", str(lockdir))
+    # during s1's wake the host rotates: lockfile now points at B
+    host_a.on_prompt = lambda: write_lock(host_b.lock_data())
+
+    for s in (SID, s2):
+        _session(env.db, s, managed=True)
+        _heartbeat(env.db, s, age=999)
+        _relayed_mail(env.db, s)
+
+    daemon._wake_pass(env.db, env.sdir, int(time.time()), WakePolicy())
+
+    assert "session/prompt" in host_a.methods()
+    assert "session/prompt" in host_b.methods()
 
 
 def test_item16_breaker_suspends_after_failures(env, tmp_path, monkeypatch):

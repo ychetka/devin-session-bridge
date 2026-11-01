@@ -474,8 +474,6 @@ def _wake_pass(db_path, state_directory, now: int, policy: WakePolicy) -> None:
     harmless. Pacing (per-session cooldown, per-host circuit breaker)
     lives in ``policy``; outcome events land in the decision log.
     """
-    lock_data = find_lockfile()
-    host_key = lock_data["_path"] if lock_data else "none"
     deadline = time.monotonic() + _WAKE_PASS_DEADLINE_SECONDS
     for row in _wake_candidates(db_path, now):
         if time.monotonic() >= deadline:
@@ -486,6 +484,11 @@ def _wake_pass(db_path, state_directory, now: int, policy: WakePolicy) -> None:
             )
             break
         sid = row["sid"]
+        # Re-read the lockfile per attempt: the host can rotate
+        # (restart -> new port/token) between candidates of one pass,
+        # and a stale key must not poison the breaker.
+        lock_data = find_lockfile()
+        host_key = lock_data["_path"] if lock_data else "none"
         if policy.check(sid, host_key) is not None:
             continue  # cooldown or open breaker - normal pacing
         policy.record_attempt(sid)
