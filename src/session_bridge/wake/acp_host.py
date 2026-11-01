@@ -287,9 +287,7 @@ def _attach(lock_data: dict, agent_id: str):
     try:
         port = int(port)
     except (TypeError, ValueError) as e:
-        raise WakeError(
-            "malformed_lockfile", f"lockfile port {port!r} is not an int"
-        ) from e
+        raise WakeError("malformed_lockfile", f"lockfile port {port!r} is not an int") from e
     try:
         sock = socket.create_connection(("127.0.0.1", port), timeout=_CONNECT_TIMEOUT)
     except (ConnectionRefusedError, OSError) as e:
@@ -446,9 +444,7 @@ def wake_session(
                         # prompt and the host rejected it - surfaces
                         # as a session-level failure, not a sent wake
                         err = msg["error"]
-                        detail = (
-                            err.get("message") if isinstance(err, dict) else str(err)
-                        )
+                        detail = err.get("message") if isinstance(err, dict) else str(err)
                         raise WakeError("rpc_error", f"session/prompt: {detail}")
                     return "sent"
             return "sent_unconfirmed"

@@ -2505,9 +2505,7 @@ def _parse_args(argv) -> argparse.Namespace:
         "wake", help="acp-host wake nudge: prompt an idle session to drain its mailbox"
     )
     sp.add_argument("session_id")
-    sp.add_argument(
-        "--prompt", help="override the default drain-nudge text", default=None
-    )
+    sp.add_argument("--prompt", help="override the default drain-nudge text", default=None)
     _add_json(sp)
 
     sp = sub.add_parser("disarm", help="leave managed mode (--all for the fleet)")

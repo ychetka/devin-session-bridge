@@ -253,9 +253,7 @@ BUSY_SESSION = {
 def test_find_lockfile_picks_newest_valid(tmp_path):
     (tmp_path / "acp-host-a.lock").write_text(json.dumps({"pid": 1, "port": 1, "token": "a"}))
     time.sleep(0.01)
-    (tmp_path / "acp-host-b.lock").write_text(
-        json.dumps({"pid": 2, "port": 2, "token": "b"})
-    )
+    (tmp_path / "acp-host-b.lock").write_text(json.dumps({"pid": 2, "port": 2, "token": "b"}))
     found = find_lockfile(str(tmp_path))
     assert found is not None and found["token"] == "b"
     assert found["_path"].endswith("acp-host-b.lock")
@@ -286,22 +284,16 @@ def test_find_lockfile_prefers_live_pid(tmp_path):
 
 
 def test_find_lockfile_all_dead_returns_newest(tmp_path):
-    (tmp_path / "acp-host-a.lock").write_text(
-        json.dumps({"pid": 2**22, "port": 1, "token": "a"})
-    )
+    (tmp_path / "acp-host-a.lock").write_text(json.dumps({"pid": 2**22, "port": 1, "token": "a"}))
     time.sleep(0.01)
-    (tmp_path / "acp-host-b.lock").write_text(
-        json.dumps({"pid": 2**22, "port": 2, "token": "b"})
-    )
+    (tmp_path / "acp-host-b.lock").write_text(json.dumps({"pid": 2**22, "port": 2, "token": "b"}))
     found = find_lockfile(str(tmp_path))
     assert found is not None and found["token"] == "b"
 
 
 def test_wake_corrupt_port_is_wake_error():
     with pytest.raises(WakeError) as exc:
-        wake_session(
-            SID, "/tmp", lock_data={"pid": os.getpid(), "port": "x", "token": "t"}
-        )
+        wake_session(SID, "/tmp", lock_data={"pid": os.getpid(), "port": "x", "token": "t"})
     assert exc.value.reason == "malformed_lockfile"
 
 
@@ -323,9 +315,7 @@ def test_wake_host_down_on_refused():
     port = dead.getsockname()[1]
     dead.close()
     with pytest.raises(WakeError) as exc:
-        wake_session(
-            SID, "/tmp", lock_data={"pid": os.getpid(), "port": port, "token": "t"}
-        )
+        wake_session(SID, "/tmp", lock_data={"pid": os.getpid(), "port": port, "token": "t"})
     assert exc.value.reason == "wake_host_down"
 
 
@@ -427,9 +417,7 @@ def test_wake_prompt_error_is_not_sent():
 
 def test_wake_prompt_unconfirmed_still_reports():
     host = FakeAcpHost(sessions=[IDLE_SESSION], prompt_update=True)
-    outcome = wake_session(
-        SID, "/tmp/ws", lock_data=host.lock_data(), confirm_timeout=0.5
-    )
+    outcome = wake_session(SID, "/tmp/ws", lock_data=host.lock_data(), confirm_timeout=0.5)
     # the update notification or the response itself confirms "sent"
     assert outcome in ("sent", "sent_unconfirmed")
 

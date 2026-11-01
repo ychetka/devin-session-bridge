@@ -68,9 +68,7 @@ class WakePolicy:
         streak = self._unconfirmed_streak.get(session_id, 0) + 1
         self._unconfirmed_streak[session_id] = streak
         backoff = delay * (2 ** (streak - 1))
-        self._next_allowed[session_id] = self._clock() + min(
-            backoff, self._cooldown
-        )
+        self._next_allowed[session_id] = self._clock() + min(backoff, self._cooldown)
 
     def record_confirmed(self, session_id: str) -> None:
         """Reset the unconfirmed streak after a fully confirmed wake."""
