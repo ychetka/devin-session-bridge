@@ -414,6 +414,85 @@ def enqueue(
     return _retry(op)
 
 
+def dispatch_managed(task_id: int, owner: str, *, path=None) -> bool:
+    """CAS ``queued > dispatch_decided`` + lease for a managed task.
+
+    Relay-side dedup (item_18): the pump marks the task the moment it
+    writes the TASK_DISPATCH notification, so a still-unclaimed task
+    leaves the queued scan and cannot be re-notified every pass. The
+    lease doubles as the claim window: if the notification is acked
+    but the worker never claims, ``recover_stale`` folds the task back
+    to ``queued`` and the next pass re-dispatches. ``transport`` stays
+    NULL - managed delivery is the mailbox, not a transport enum.
+    """
+    ts = _now()
+
+    def op():
+        con = connect(path)
+        try:
+            cur = con.execute(
+                "UPDATE tasks SET status=?, lease_owner=?,"
+                " lease_expires_at=?, lease_renewed_at=?, updated_at=?"
+                " WHERE id=? AND status=?",
+                (
+                    TaskStatus.DISPATCH_DECIDED.value,
+                    owner,
+                    ts + LEASE_SECONDS,
+                    ts,
+                    ts,
+                    task_id,
+                    TaskStatus.QUEUED.value,
+                ),
+            )
+            return cur.rowcount == 1
+        finally:
+            con.close()
+
+    return _retry(op)
+
+
+def claim_managed(task_id: int, session_id: str, owner: str, *, path=None) -> bool:
+    """CAS ``queued|dispatch_decided > running`` for a managed worker.
+
+    Managed delivery happens via the notifications outbox: the pump
+    marks the task ``dispatch_decided`` (``dispatch_managed``) when it
+    writes the notification, so the claim promotes either that staged
+    row or a still-queued legacy one straight to ``running`` with the
+    same lease shape ``claim_queued`` stamps. The ``session_id`` guard
+    keeps a worker from claiming a task addressed to someone else;
+    ``queue_paused`` sessions are skipped exactly like
+    ``claim_queued``.
+    """
+    ts = _now()
+
+    def op():
+        con = connect(path)
+        try:
+            cur = con.execute(
+                "UPDATE tasks SET status=?, lease_owner=?,"
+                " lease_expires_at=?, lease_renewed_at=?, updated_at=?"
+                " WHERE id=? AND status IN (?, ?) AND session_id=? AND COALESCE("
+                "  (SELECT queue_paused FROM sessions"
+                "   WHERE session_id=tasks.session_id), 0) = 0",
+                (
+                    TaskStatus.RUNNING.value,
+                    owner,
+                    ts + LEASE_SECONDS,
+                    ts,
+                    ts,
+                    task_id,
+                    TaskStatus.QUEUED.value,
+                    TaskStatus.DISPATCH_DECIDED.value,
+                    session_id,
+                ),
+            )
+            return cur.rowcount == 1
+        finally:
+            con.close()
+
+    return _retry(op)
+
+
 def claim_queued(task_id: int, owner: str, transport, *, path=None) -> bool:
     """CAS ``queued > dispatch_decided`` for ``owner``.
 

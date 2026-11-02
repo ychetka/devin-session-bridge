@@ -483,16 +483,22 @@ def pump(args) -> dict:
             if _session_mode(sid, args) == SessionMode.MANAGED.value:
                 # managed sessions take deliveries only through the
                 # notifications outbox -> fs mailbox (the daemon relay
-                # writes the msg file in item_13d); the task stays
-                # queued as the durable record, no transport is run
+                # writes the msg file in item_13d). dispatch_managed
+                # marks the task dispatch_decided with a lease the
+                # moment the notification is written (item_18): the
+                # task leaves the queued scan so it cannot be re-
+                # notified every pass, and a never-claimed delivery
+                # folds back via recover_stale when the lease lapses.
                 if not _has_open_dispatch(tid, args):
-                    db.notify(
-                        sid,
-                        NotificationKind.TASK_DISPATCH,
-                        task["task_text"] or f"execute spec file {task['task_file']}",
-                        task_id=tid,
-                        path=args.db,
-                    )
+                    owner = _managed_owner(sid, tid)
+                    if db.dispatch_managed(tid, owner, path=args.db):
+                        db.notify(
+                            sid,
+                            NotificationKind.TASK_DISPATCH,
+                            task["task_text"] or f"execute spec file {task['task_file']}",
+                            task_id=tid,
+                            path=args.db,
+                        )
                 managed.append(tid)
                 continue
             locked, _pid = db.is_locked(sid)
@@ -1710,6 +1716,128 @@ def _cmd_ack(args) -> int:
     return _emit(args, resp, ExitCode.OK, human)
 
 
+def _managed_owner(sid: str, tid: int) -> str:
+    """Deterministic lease owner for managed claim/finish (item_18).
+
+    Derived from (session, task) so `bridge finish` recomputes the
+    same owner without any state - the finish CAS binds on it.
+    """
+    return f"{DISPATCH_OWNER_PREFIX}{sid}-{tid}"
+
+
+def _cmd_claim(args) -> int:
+    """``bridge claim <task_id> --session <sid>``: managed task claim.
+
+    Managed delivery happens via the mailbox; nothing else marks the
+    task, so the worker claims it straight to ``running`` (item_18).
+    Idempotent: claiming a task already running under this session's
+    owner renews the lease instead of failing - long tasks keep
+    calling it as a heartbeat. Refusals are structured: the task
+    belongs to another session, or it is no longer queued.
+    """
+    tid = args.task_id
+    sid = args.session
+    task = db.get_task(tid, path=args.db)
+    if task is None:
+        resp = JsonResponse(session=sid, status="not_found", error=f"task {tid} not found")
+        return _emit(args, resp, ExitCode.NOT_FOUND, f"not found: task {tid}")
+    if task["session_id"] != sid:
+        resp = JsonResponse(
+            session=sid,
+            status="conflict",
+            error=f"task {tid} belongs to {task['session_id']}, not {sid}",
+        )
+        return _emit(args, resp, ExitCode.CONFLICT, f"conflict: task {tid} is not yours")
+    owner = _managed_owner(sid, tid)
+    if task["status"] == TaskStatus.RUNNING.value and task["lease_owner"] == owner:
+        renewed = db.renew_lease(tid, owner, path=args.db)
+        resp = JsonResponse(
+            session=sid,
+            status="running",
+            data={"renewed": bool(renewed)},
+        )
+        return _emit(args, resp, ExitCode.OK, f"task {tid}: lease renewed")
+    claimable = task["status"] == TaskStatus.QUEUED.value or (
+        task["status"] == TaskStatus.DISPATCH_DECIDED.value and task["lease_owner"] == owner
+    )
+    if not claimable:
+        resp = JsonResponse(
+            session=sid,
+            status=task["status"],
+            error=(
+                f"task {tid} is {task['status']}"
+                f" (lease_owner={task['lease_owner']}); only your queued or"
+                " mailbox-dispatched tasks are claimable"
+            ),
+        )
+        return _emit(
+            args,
+            resp,
+            ExitCode.CONFLICT,
+            f"conflict: task {tid} is {task['status']}",
+        )
+    if not db.claim_managed(tid, sid, owner, path=args.db):
+        resp = JsonResponse(
+            session=sid,
+            status="conflict",
+            error=f"claim of task {tid} refused (queue_paused or raced)",
+        )
+        return _emit(args, resp, ExitCode.CONFLICT, f"conflict: claim refused for task {tid}")
+    row = db.get_task(tid, path=args.db)
+    resp = JsonResponse(
+        session=sid,
+        status="running",
+        data={
+            "task_id": tid,
+            "task_text": row["task_text"],
+            "task_file": row["task_file"],
+            "lease_expires_at": row["lease_expires_at"],
+        },
+    )
+    return _emit(args, resp, ExitCode.OK, f"task {tid}: claimed, running")
+
+
+def _cmd_finish(args) -> int:
+    """``bridge finish <task_id> --session <sid> [--fail] [--note T]``.
+
+    Lease-owner CAS ``running > done|failed`` for a managed worker -
+    the closing half of the claim lifecycle (item_18).
+    """
+    tid = args.task_id
+    sid = args.session
+    task = db.get_task(tid, path=args.db)
+    if task is None:
+        resp = JsonResponse(session=sid, status="not_found", error=f"task {tid} not found")
+        return _emit(args, resp, ExitCode.NOT_FOUND, f"not found: task {tid}")
+    if task["session_id"] != sid:
+        resp = JsonResponse(
+            session=sid,
+            status="conflict",
+            error=f"task {tid} belongs to {task['session_id']}, not {sid}",
+        )
+        return _emit(args, resp, ExitCode.CONFLICT, f"conflict: task {tid} is not yours")
+    owner = _managed_owner(sid, tid)
+    ok = not args.fail
+    if not db.finish_task(tid, owner, ok, note=args.note, path=args.db):
+        resp = JsonResponse(
+            session=sid,
+            status=task["status"],
+            error=(
+                f"finish refused: task {tid} is {task['status']}"
+                f" (lease_owner={task['lease_owner']}); only the claiming"
+                " session can finish a running task"
+            ),
+        )
+        return _emit(
+            args,
+            resp,
+            ExitCode.CONFLICT,
+            f"conflict: finish refused for task {tid}",
+        )
+    resp = JsonResponse(session=sid, status="done" if ok else "failed")
+    return _emit(args, resp, ExitCode.OK, f"task {tid}: {'done' if ok else 'failed'}")
+
+
 def _cmd_heartbeat(args) -> int:
     """``bridge heartbeat <sid>``: the liveness metronome (item_13g).
 
@@ -2604,6 +2732,26 @@ def _parse_args(argv) -> argparse.Namespace:
     sp.add_argument("session_id")
     _add_json(sp)
 
+    # managed task lifecycle (item_18): claim/finish verbs - the
+    # mailbox had no way to transition a delivered task before
+    sp = sub.add_parser(
+        "claim",
+        help="claim your queued managed task (queued > running, idempotent renew)",
+    )
+    sp.add_argument("task_id", type=int)
+    sp.add_argument("--session", required=True, help="claiming session id")
+    _add_json(sp)
+
+    sp = sub.add_parser(
+        "finish",
+        help="finish your running managed task (running > done|failed)",
+    )
+    sp.add_argument("task_id", type=int)
+    sp.add_argument("--session", required=True, help="finishing session id")
+    sp.add_argument("--fail", action="store_true", help="mark failed instead of done")
+    sp.add_argument("--note", default=None, help="optional completion note")
+    _add_json(sp)
+
     sp = sub.add_parser(
         "questions",
         help="orchestrator question queue: list / claim / answer",
@@ -2720,6 +2868,8 @@ _HANDLERS = {
     "register": _cmd_register,
     "ask": _cmd_ask,
     "ack": _cmd_ack,
+    "claim": _cmd_claim,
+    "finish": _cmd_finish,
     "heartbeat": _cmd_heartbeat,
     "questions": _cmd_questions,
     "escalate": _cmd_escalate,

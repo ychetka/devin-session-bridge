@@ -100,6 +100,16 @@ Storage layout (state dir = the directory holding `state.db`, default
    watcher loop self-sustains: tasks pushed with `bridge push <sid>`
    arrive as `task_dispatch` mailbox messages with zero touch.
 
+   Managed task lifecycle (item_18): the pump marks the task
+   `dispatch_decided` with a lease when it writes the notification,
+   so a delivered-but-unclaimed task can never be re-notified every
+   pass. The worker drains the mailbox, runs `bridge claim <id>
+   --session <sid>` (queued/dispatch_decided > running), executes,
+   then `bridge finish <id> --session <sid>` (running > done, or
+   `--fail`). The dispatch lease doubles as the claim window: an
+   acked-but-never-claimed task folds back to `queued` on lease
+   expiry via `recover_stale` and gets exactly one re-dispatch.
+
 6. Declare the repo's protected paths (e.g. `migrations/`, `auth/`,
    `.github/`) to the orchestrator in the task text or repo rules.
    There is no `bridge register` flag for this in the current CLI -
@@ -544,7 +554,9 @@ Global flags: `--db PATH` (`SESSIONS_BRIDGE_DB`), `--queue-dir DIR`
 
 | Command | Effect |
 | --- | --- |
-| `bridge push <sid> --task "..."` / `--file <path>` | enqueue a task; pump picks the transport: managed session > outbox notification (mailbox), locked session > hook queue, idle session > acp push worker. |
+| `bridge push <sid> --task "..."` / `--file <path>` | enqueue a task; pump picks the transport: managed session > outbox notification (mailbox) + `dispatch_decided` mark, locked session > hook queue, idle session > acp push worker. |
+| `bridge claim <task_id> --session SID` | managed worker claims its delivered task: `queued`/`dispatch_decided` > `running` + lease. Idempotent - a repeat claim on the session's own running task renews the lease (long-task heartbeat). Refusals: wrong session, task already claimed/running/done/failed, `queue_paused`. |
+| `bridge finish <task_id> --session SID [--fail] [--note T]` | close the managed lifecycle: `running` > `done` (or `failed` with `--fail`), CAS'd on the claiming session's deterministic lease owner. |
 | `bridge status` | fleet view above. |
 | `bridge inspect <sid\|task_id>` | full task detail + next action. |
 | `bridge clear <sid>` | drop the session's queued task. |
