@@ -433,7 +433,9 @@ def dispatch_managed(task_id: int, owner: str, *, path=None) -> bool:
             cur = con.execute(
                 "UPDATE tasks SET status=?, lease_owner=?,"
                 " lease_expires_at=?, lease_renewed_at=?, updated_at=?"
-                " WHERE id=? AND status=?",
+                " WHERE id=? AND status=? AND COALESCE("
+                "  (SELECT queue_paused FROM sessions"
+                "   WHERE session_id=tasks.session_id), 0) = 0",
                 (
                     TaskStatus.DISPATCH_DECIDED.value,
                     owner,
@@ -459,9 +461,10 @@ def claim_managed(task_id: int, session_id: str, owner: str, *, path=None) -> bo
     writes the notification, so the claim promotes either that staged
     row or a still-queued legacy one straight to ``running`` with the
     same lease shape ``claim_queued`` stamps. The ``session_id`` guard
-    keeps a worker from claiming a task addressed to someone else;
-    ``queue_paused`` sessions are skipped exactly like
-    ``claim_queued``.
+    keeps a worker from claiming a task addressed to someone else,
+    the ``lease_owner`` binding keeps a staged dispatch from being
+    claimed under a foreign owner, and ``queue_paused`` sessions are
+    skipped exactly like ``claim_queued``.
     """
     ts = _now()
 
@@ -471,7 +474,8 @@ def claim_managed(task_id: int, session_id: str, owner: str, *, path=None) -> bo
             cur = con.execute(
                 "UPDATE tasks SET status=?, lease_owner=?,"
                 " lease_expires_at=?, lease_renewed_at=?, updated_at=?"
-                " WHERE id=? AND status IN (?, ?) AND session_id=? AND COALESCE("
+                " WHERE id=? AND session_id=? AND (status=? OR (status=?"
+                " AND lease_owner=?)) AND COALESCE("
                 "  (SELECT queue_paused FROM sessions"
                 "   WHERE session_id=tasks.session_id), 0) = 0",
                 (
@@ -481,9 +485,10 @@ def claim_managed(task_id: int, session_id: str, owner: str, *, path=None) -> bo
                     ts,
                     ts,
                     task_id,
+                    session_id,
                     TaskStatus.QUEUED.value,
                     TaskStatus.DISPATCH_DECIDED.value,
-                    session_id,
+                    owner,
                 ),
             )
             return cur.rowcount == 1

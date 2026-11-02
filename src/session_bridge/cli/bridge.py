@@ -1748,15 +1748,29 @@ def _cmd_claim(args) -> int:
             error=f"task {tid} belongs to {task['session_id']}, not {sid}",
         )
         return _emit(args, resp, ExitCode.CONFLICT, f"conflict: task {tid} is not yours")
-    owner = _managed_owner(sid, tid)
-    if task["status"] == TaskStatus.RUNNING.value and task["lease_owner"] == owner:
-        renewed = db.renew_lease(tid, owner, path=args.db)
+    if _session_mode(sid, args) != SessionMode.MANAGED.value:
         resp = JsonResponse(
             session=sid,
-            status="running",
-            data={"renewed": bool(renewed)},
+            status="conflict",
+            error=(
+                f"{sid} is not managed; unmanaged tasks move through"
+                " the hook/acp transports, not claim"
+            ),
         )
-        return _emit(args, resp, ExitCode.OK, f"task {tid}: lease renewed")
+        return _emit(args, resp, ExitCode.CONFLICT, f"conflict: {sid} is not managed")
+    owner = _managed_owner(sid, tid)
+    if task["status"] == TaskStatus.RUNNING.value and task["lease_owner"] == owner:
+        if db.renew_lease(tid, owner, path=args.db):
+            resp = JsonResponse(session=sid, status="running", data={"renewed": True})
+            return _emit(args, resp, ExitCode.OK, f"task {tid}: lease renewed")
+        # the row moved under us (requeue/dead-worker race): do not
+        # tell the worker it still owns the lease
+        resp = JsonResponse(
+            session=sid,
+            status="conflict",
+            error=f"lease renew CAS lost for task {tid}; re-inspect before continuing",
+        )
+        return _emit(args, resp, ExitCode.CONFLICT, f"conflict: lease renew lost for task {tid}")
     claimable = task["status"] == TaskStatus.QUEUED.value or (
         task["status"] == TaskStatus.DISPATCH_DECIDED.value and task["lease_owner"] == owner
     )
@@ -1816,6 +1830,16 @@ def _cmd_finish(args) -> int:
             error=f"task {tid} belongs to {task['session_id']}, not {sid}",
         )
         return _emit(args, resp, ExitCode.CONFLICT, f"conflict: task {tid} is not yours")
+    if _session_mode(sid, args) != SessionMode.MANAGED.value:
+        resp = JsonResponse(
+            session=sid,
+            status="conflict",
+            error=(
+                f"{sid} is not managed; unmanaged tasks are finished by"
+                " their transport worker, not finish"
+            ),
+        )
+        return _emit(args, resp, ExitCode.CONFLICT, f"conflict: {sid} is not managed")
     owner = _managed_owner(sid, tid)
     ok = not args.fail
     if not db.finish_task(tid, owner, ok, note=args.note, path=args.db):

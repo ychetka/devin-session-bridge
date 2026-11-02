@@ -1591,6 +1591,7 @@ def test_item14_schedule_cli_created_schedule_fires(env, capsys):
 
 
 def test_item18_gwt1_claim_queued_managed_task(env, capsys):
+    db.set_session_mode(SID, SessionMode.MANAGED, path=env.db)
     """[ITEM-18.GWT-1] queued managed task -> running + lease."""
     tid = _task(env)
     rc, out = _run(["claim", str(tid), "--session", SID, "--json"], capsys)
@@ -1603,6 +1604,7 @@ def test_item18_gwt1_claim_queued_managed_task(env, capsys):
 
 
 def test_item18_gwt2_second_claim_refused(env, capsys):
+    db.set_session_mode(SID, SessionMode.MANAGED, path=env.db)
     """[ITEM-18.GWT-2] a queued task claimed elsewhere refuses."""
     tid = _task(env)
     rc, _ = _run(["claim", str(tid), "--session", SID, "--json"], capsys)
@@ -1623,6 +1625,7 @@ def test_item18_gwt2_second_claim_refused(env, capsys):
 
 
 def test_item18_claim_renews_own_lease(env, capsys):
+    db.set_session_mode(SID, SessionMode.MANAGED, path=env.db)
     """Repeat claim on own running task = lease renew, not a conflict."""
     tid = _task(env)
     assert _run(["claim", str(tid), "--session", SID, "--json"], capsys)[0] == ExitCode.OK
@@ -1639,6 +1642,7 @@ def test_item18_claim_renews_own_lease(env, capsys):
 
 
 def test_item18_gwt3_finish_ok_and_fail(env, capsys):
+    db.set_session_mode(SID, SessionMode.MANAGED, path=env.db)
     """[ITEM-18.GWT-3] finish closes running -> done|failed."""
     t1 = _task(env)
     assert _run(["claim", str(t1), "--session", SID, "--json"], capsys)[0] == ExitCode.OK
@@ -1659,6 +1663,7 @@ def test_item18_gwt3_finish_ok_and_fail(env, capsys):
 
 
 def test_item18_gwt4_claim_terminal_refused(env, capsys):
+    db.set_session_mode(SID, SessionMode.MANAGED, path=env.db)
     """[ITEM-18.GWT-4] done/failed tasks are not claimable."""
     tid = _task(env)
     assert _run(["claim", str(tid), "--session", SID, "--json"], capsys)[0] == ExitCode.OK
@@ -1669,6 +1674,7 @@ def test_item18_gwt4_claim_terminal_refused(env, capsys):
 
 
 def test_item18_wrong_session_and_missing(env, capsys):
+    db.set_session_mode(SID, SessionMode.MANAGED, path=env.db)
     tid = _task(env)
     rc, _ = _run(["claim", str(tid), "--session", "other-sid", "--json"], capsys)
     assert rc == ExitCode.CONFLICT
@@ -1679,6 +1685,7 @@ def test_item18_wrong_session_and_missing(env, capsys):
 
 
 def test_item18_finish_wrong_owner_refused(env, capsys):
+    db.set_session_mode(SID, SessionMode.MANAGED, path=env.db)
     """finish needs the claiming session's owner - foreign owner loses."""
     tid = _task(env)
     _claim_acp(env, tid, owner="acp-9-1")
@@ -1688,6 +1695,7 @@ def test_item18_finish_wrong_owner_refused(env, capsys):
 
 
 def test_item18_queue_paused_claim_refused(env, capsys):
+    db.set_session_mode(SID, SessionMode.MANAGED, path=env.db)
     tid = _task(env)
     db.session_pause(SID, True, path=env.db)
     rc, _ = _run(["claim", str(tid), "--session", SID, "--json"], capsys)
@@ -1756,3 +1764,41 @@ def test_item18_unclaimed_dispatch_recovers_to_queued(env, capsys):
     assert row["attempt"] == 1
     rows = db.unrelayed_notifications(SID, path=env.db)
     assert len(rows) == 2  # original + exactly one re-dispatch
+
+
+def test_item18_unmanaged_session_claim_refused(env, capsys):
+    """managed verbs refuse unmanaged sessions - transports own them."""
+    db.set_session_mode(SID, SessionMode.UNMANAGED, path=env.db)
+    tid = _task(env)
+    rc, out = _run(["claim", str(tid), "--session", SID, "--json"], capsys)
+    assert rc == ExitCode.CONFLICT
+    assert "not managed" in out["error"]
+    rc, out = _run(["finish", str(tid), "--session", SID, "--json"], capsys)
+    assert rc == ExitCode.CONFLICT
+    assert "not managed" in out["error"]
+    assert db.get_task(tid, path=env.db)["status"] == TaskStatus.QUEUED.value
+
+
+def test_item18_paused_session_dispatch_skipped(env, capsys):
+    """a queue_paused managed session gets no dispatch mark nor mail
+    (review: a paused task must not burn attempts re-dispatching)."""
+    db.set_session_mode(SID, SessionMode.MANAGED, path=env.db)
+    db.session_pause(SID, True, path=env.db)
+    tid = _task(env)
+    _run(["status", "--json"], capsys)
+    row = db.get_task(tid, path=env.db)
+    assert row["status"] == TaskStatus.QUEUED.value
+    assert row["lease_owner"] is None
+    assert db.unrelayed_notifications(SID, path=env.db) == []
+
+
+def test_item18_renew_cas_lost_reports_conflict(env, capsys, monkeypatch):
+    """a running task whose renew CAS loses is never reported as
+    renewed - the worker must not trust a lease it does not own."""
+    db.set_session_mode(SID, SessionMode.MANAGED, path=env.db)
+    tid = _task(env)
+    assert _run(["claim", str(tid), "--session", SID, "--json"], capsys)[0] == ExitCode.OK
+    monkeypatch.setattr(db, "renew_lease", lambda *a, **k: False)
+    rc, out = _run(["claim", str(tid), "--session", SID, "--json"], capsys)
+    assert rc == ExitCode.CONFLICT
+    assert "renew" in out["error"]
