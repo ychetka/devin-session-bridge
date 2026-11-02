@@ -1,5 +1,66 @@
 # Changelog
 
+## [0.2.1] - 2026-11-02
+
+Zero-touch delivery completed: the bridge can now wake idle
+managed sessions itself, and the daemon's liveness model is
+coherent with that wake path. Closes #31 and #33.
+
+### acp-host wake transport (wake/)
+
+- The daemon gains a `_wake_pass` after relay: a managed session
+  with a stale heartbeat and relayed-but-unacked mail (or a live
+  task) gets a short "drain your mailbox" prompt injected through
+  the local detached acp-host - a real turn, so drain-mode
+  sessions process queued mail with no human typing. The nudge
+  carries no payload; the fs mailbox stays the only data channel.
+- Transport: `acp-host-*.lock` discovery ({pid, port, token},
+  live-pid preferred, re-read per attempt), NDJSON token hello,
+  then plain ACP `initialize > session/list > session/load >
+  session/prompt > detach` over `127.0.0.1:<port>`.
+- Safety: `cognition.ai/statusEnum` busy check (never prompt a
+  mid-turn session -> `wake_skipped_busy`), process-local attach
+  mutex, bounded replay drain, 120s pass deadline, per-session
+  300s cooldown (60s retry-soon after `sent_unconfirmed` with
+  exponential growth, capped), per-host circuit breaker
+  (3 failures -> 600s), structured `wake_failed` reasons.
+- `bridge wake <sid>` - manual wake through the same path
+  (bypasses cooldown, keeps the busy check).
+- Security boundary documented: lockfile `0600` + dir `0700` =
+  same-UID bearer access.
+
+### Managed-session liveness coherence (item_17)
+
+- The heartbeat sweep no longer marks `mode='managed'` sessions
+  dead: between turns they are stale-hb by design (that signal is
+  the wake trigger), and the sweep was failing their tasks 120s
+  after dispatch while wake prompts were in flight.
+- Managed death is ACP-reported instead: 3 consecutive
+  `no_session` wake outcomes (absent from the host's
+  `session/list`) flip the session to dead and requeue its live
+  task through the same path as the unmanaged sweep
+  (`worker_dead`, `reason=no_session_streak`). `no_cwd`
+  (present in list, unwakeable) counts as seen; all other
+  failures are streak-neutral.
+- `_wake_candidates` requires `status='active'` and also matches
+  sessions with a live task - the wake probe doubles as the
+  liveness check when the outbox is empty.
+- `bridge arm` clears a leftover `queue_paused` flag in the same
+  upsert, so arming restores task claimability.
+- `db.ask()` now also writes the active orchestrator a
+  `directive` notification ("[question #N pending ...]") in the
+  same transaction - worker replies reach the orchestrator
+  mailbox without manual `questions` polling.
+
+### Docs
+
+- `docs/OPERATOR.md`: wake transport requirements and failure
+  modes, sweep exclusion for managed mode, no_session dead path
+  and MTTD note, `bridge wake`, arm-clears-pause.
+- `docs/orchestrator/PLAYBOOK.md`: drain + wake close the loop
+  for interactive sessions; pending questions arrive as
+  `directive` mail (no manual polling needed).
+
 ## [0.2.0] - 2026-11-01
 
 Orchestration protocol release: the bridge becomes a two-way
