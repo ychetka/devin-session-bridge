@@ -166,8 +166,9 @@ def _queue_dir(args) -> str:
     return os.path.join(os.path.dirname(os.path.abspath(base)), "queue")
 
 
-def _owner() -> str:
-    return f"{HOOK_OWNER_PREFIX}{os.getpid()}"
+def _owner(session_id: str) -> str:
+    """Hook-worker lease owner naming the executing session (item_19)."""
+    return f"{HOOK_OWNER_PREFIX}{session_id}-{os.getpid()}"
 
 
 def _is_hook_owner(owner) -> bool:
@@ -414,7 +415,7 @@ def _on_stop(p: StopPayload, args, cfg: ParkConfig | None):
         # watcher - the parking/claim machinery below is the unmanaged
         # path and must not double-deliver a queued task
         return None
-    owner = _owner()
+    owner = _owner(session_id)
     task = db.get_live_task(session_id, path=args.db)
 
     if task is not None:
@@ -469,7 +470,7 @@ def _on_user_prompt(p: UserPromptSubmitPayload, args, cfg):
     task = db.get_live_task(session_id, path=args.db)
     if task is None or task["status"] != TaskStatus.QUEUED.value:
         return None
-    if not _claim_running(task["id"], _owner(), args):
+    if not _claim_running(task["id"], _owner(session_id), args):
         return None
     _reset_cycles(session_id, cfg, args)
     return _context(f"{PARKED_TASK_PREFIX} {_deliver_text(task)}")
@@ -500,7 +501,7 @@ def _on_session_end(p: SessionEndPayload, args):
     if task is None:
         return None
     tid, st = task["id"], task["status"]
-    owner = _owner()
+    owner = _owner(session_id)
     if st == TaskStatus.QUEUED.value:
         # the session is dead: a stale pause must not block cleanup
         db.session_pause(session_id, False, path=args.db)
