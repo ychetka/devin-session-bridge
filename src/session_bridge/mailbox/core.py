@@ -299,7 +299,13 @@ latency for a free input line.
      Deliveries are idempotent by notification id: if you already
      handled id N, skip it.
 3. Process each delivery by notification kind:
-   - task_dispatch: the payload is your task - execute it.
+   - task_dispatch: the payload is your task. Claim it FIRST:
+     `bridge claim <task_id> --session {session_id}` - a refusal
+     means the task is already claimed/done elsewhere, skip it.
+     On success execute it, then close the lifecycle:
+     `bridge finish <task_id> --session {session_id}` (or
+     `--fail --note "<why>"` on failure). Repeat `bridge claim`
+     on long tasks to renew the lease.
    - question_answer: apply the answer to your pending question.
    - directive: obey the orchestrator directive.
    - heartbeat_tick: liveness poke - no work needed.

@@ -770,10 +770,12 @@ def test_item13c_push_managed_goes_to_outbox(env, capsys):
     assert rc == ExitCode.OK
     tid = out["data"]["task_id"]
     row = db.get_task(tid, path=env.db)
-    # the task stays queued as the durable record; no transport runs
-    assert row["status"] == TaskStatus.QUEUED.value
+    # dispatch_decided + lease is the durable delivery record
+    # (item_18): the task left the queued scan so pump passes cannot
+    # re-notify it; the lease is the claim window for recover_stale
+    assert row["status"] == TaskStatus.DISPATCH_DECIDED.value
     assert row["transport"] is None
-    assert row["lease_owner"] is None
+    assert row["lease_owner"] == f"bridge-{SID}-{tid}"
     assert env.spawned == []
     assert not _trigger(env).exists()  # no unmanaged queue trigger
     # the durable delivery is a TASK_DISPATCH outbox row (the daemon
@@ -805,7 +807,7 @@ def test_item13c_managed_session_never_takes_acp_or_hook(env, capsys):
     rc, out = _run(["push", SID, "--task", "do it", "--json"], capsys)
     assert rc == ExitCode.OK
     row = db.get_task(out["data"]["task_id"], path=env.db)
-    assert row["status"] == TaskStatus.QUEUED.value
+    assert row["status"] == TaskStatus.DISPATCH_DECIDED.value
     assert row["transport"] is None
     assert env.spawned == []
     assert not _trigger(env).exists()
@@ -1583,3 +1585,220 @@ def test_item14_schedule_cli_created_schedule_fires(env, capsys):
     task = db.get_live_task(SID, path=env.db)
     assert task is not None
     assert task["task_text"] == "cli tick"
+
+
+# --- item_18: managed task lifecycle verbs -------------------------------------
+
+
+def test_item18_gwt1_claim_queued_managed_task(env, capsys):
+    db.set_session_mode(SID, SessionMode.MANAGED, path=env.db)
+    """[ITEM-18.GWT-1] queued managed task -> running + lease."""
+    tid = _task(env)
+    rc, out = _run(["claim", str(tid), "--session", SID, "--json"], capsys)
+    assert rc == ExitCode.OK
+    assert out["status"] == "running"
+    row = db.get_task(tid, path=env.db)
+    assert row["status"] == TaskStatus.RUNNING.value
+    assert row["lease_owner"] == f"bridge-{SID}-{tid}"
+    assert row["lease_expires_at"] is not None
+
+
+def test_item18_gwt2_second_claim_refused(env, capsys):
+    db.set_session_mode(SID, SessionMode.MANAGED, path=env.db)
+    """[ITEM-18.GWT-2] a queued task claimed elsewhere refuses."""
+    tid = _task(env)
+    rc, _ = _run(["claim", str(tid), "--session", SID, "--json"], capsys)
+    assert rc == ExitCode.OK
+    # claim from another owner path -> running, not queued -> conflict
+    con = db.connect(env.db)
+    try:
+        con.execute(
+            "UPDATE tasks SET status=?, lease_owner=? WHERE id=?",
+            (TaskStatus.RUNNING.value, "acp-other-1", tid),
+        )
+        con.commit()
+    finally:
+        con.close()
+    rc, out = _run(["claim", str(tid), "--session", SID, "--json"], capsys)
+    assert rc == ExitCode.CONFLICT
+    assert out["status"] == TaskStatus.RUNNING.value
+
+
+def test_item18_claim_renews_own_lease(env, capsys):
+    db.set_session_mode(SID, SessionMode.MANAGED, path=env.db)
+    """Repeat claim on own running task = lease renew, not a conflict."""
+    tid = _task(env)
+    assert _run(["claim", str(tid), "--session", SID, "--json"], capsys)[0] == ExitCode.OK
+    con = db.connect(env.db)
+    try:
+        con.execute("UPDATE tasks SET lease_expires_at=? WHERE id=?", (1, tid))  # about to expire
+        con.commit()
+    finally:
+        con.close()
+    rc, out = _run(["claim", str(tid), "--session", SID, "--json"], capsys)
+    assert rc == ExitCode.OK
+    assert out["data"]["renewed"] is True
+    assert db.get_task(tid, path=env.db)["lease_expires_at"] > 1
+
+
+def test_item18_gwt3_finish_ok_and_fail(env, capsys):
+    db.set_session_mode(SID, SessionMode.MANAGED, path=env.db)
+    """[ITEM-18.GWT-3] finish closes running -> done|failed."""
+    t1 = _task(env)
+    assert _run(["claim", str(t1), "--session", SID, "--json"], capsys)[0] == ExitCode.OK
+    rc, out = _run(["finish", str(t1), "--session", SID, "--json"], capsys)
+    assert rc == ExitCode.OK
+    assert out["status"] == "done"
+    assert db.get_task(t1, path=env.db)["status"] == TaskStatus.DONE.value
+    t2 = _task(env)
+    assert _run(["claim", str(t2), "--session", SID, "--json"], capsys)[0] == ExitCode.OK
+    rc, out = _run(
+        ["finish", str(t2), "--session", SID, "--fail", "--note", "boom", "--json"],
+        capsys,
+    )
+    assert rc == ExitCode.OK
+    row = db.get_task(t2, path=env.db)
+    assert row["status"] == TaskStatus.FAILED.value
+    assert row["note"] == "boom"
+
+
+def test_item18_gwt4_claim_terminal_refused(env, capsys):
+    db.set_session_mode(SID, SessionMode.MANAGED, path=env.db)
+    """[ITEM-18.GWT-4] done/failed tasks are not claimable."""
+    tid = _task(env)
+    assert _run(["claim", str(tid), "--session", SID, "--json"], capsys)[0] == ExitCode.OK
+    assert _run(["finish", str(tid), "--session", SID, "--json"], capsys)[0] == ExitCode.OK
+    rc, out = _run(["claim", str(tid), "--session", SID, "--json"], capsys)
+    assert rc == ExitCode.CONFLICT
+    assert out["status"] == TaskStatus.DONE.value
+
+
+def test_item18_wrong_session_and_missing(env, capsys):
+    db.set_session_mode(SID, SessionMode.MANAGED, path=env.db)
+    tid = _task(env)
+    rc, _ = _run(["claim", str(tid), "--session", "other-sid", "--json"], capsys)
+    assert rc == ExitCode.CONFLICT
+    rc, _ = _run(["claim", "9999", "--session", SID, "--json"], capsys)
+    assert rc == ExitCode.NOT_FOUND
+    rc, _ = _run(["finish", "9999", "--session", SID, "--json"], capsys)
+    assert rc == ExitCode.NOT_FOUND
+
+
+def test_item18_finish_wrong_owner_refused(env, capsys):
+    db.set_session_mode(SID, SessionMode.MANAGED, path=env.db)
+    """finish needs the claiming session's owner - foreign owner loses."""
+    tid = _task(env)
+    _claim_acp(env, tid, owner="acp-9-1")
+    rc, _ = _run(["finish", str(tid), "--session", SID, "--json"], capsys)
+    assert rc == ExitCode.CONFLICT
+    assert db.get_task(tid, path=env.db)["status"] == TaskStatus.RUNNING.value
+
+
+def test_item18_queue_paused_claim_refused(env, capsys):
+    db.set_session_mode(SID, SessionMode.MANAGED, path=env.db)
+    tid = _task(env)
+    db.session_pause(SID, True, path=env.db)
+    rc, _ = _run(["claim", str(tid), "--session", SID, "--json"], capsys)
+    assert rc == ExitCode.CONFLICT
+
+
+def test_item18_gwt5_duty_text_instructs_claim_finish():
+    """[ITEM-18.GWT-5] the managed mailbox duty teaches the lifecycle."""
+    from session_bridge.mailbox.core import mailbox_duty_text
+
+    text = mailbox_duty_text("s1")
+    assert "bridge claim <task_id> --session" in text
+    assert "bridge finish <task_id> --session" in text
+
+
+def test_item18_no_redispatch_after_ack(env, capsys):
+    """[ITEM-18.regression] the reported storm: acked dispatch +
+    unclaimed task must NOT re-notify - the task left queued."""
+    db.set_session_mode(SID, SessionMode.MANAGED, path=env.db)
+    _, out = _run(["push", SID, "--task", "do it", "--json"], capsys)
+    tid = out["data"]["task_id"]
+    db.ack_notifications(SID, path=env.db)
+    for _ in range(3):
+        _run(["status", "--json"], capsys)
+    rows = db.unrelayed_notifications(SID, path=env.db)
+    assert len(rows) == 1  # the original dispatch, no storm
+    row = db.get_task(tid, path=env.db)
+    assert row["status"] == TaskStatus.DISPATCH_DECIDED.value
+
+
+def test_item18_claim_after_pump_dispatch(env, capsys):
+    """[ITEM-18.e2e] pump dispatch -> drain -> claim -> finish."""
+    db.set_session_mode(SID, SessionMode.MANAGED, path=env.db)
+    _, out = _run(["push", SID, "--task", "do it", "--json"], capsys)
+    tid = out["data"]["task_id"]
+    assert db.get_task(tid, path=env.db)["status"] == TaskStatus.DISPATCH_DECIDED.value
+    rc, _ = _run(["claim", str(tid), "--session", SID, "--json"], capsys)
+    assert rc == ExitCode.OK
+    row = db.get_task(tid, path=env.db)
+    assert row["status"] == TaskStatus.RUNNING.value
+    assert row["lease_owner"] == f"bridge-{SID}-{tid}"
+    rc, _ = _run(["finish", str(tid), "--session", SID, "--json"], capsys)
+    assert rc == ExitCode.OK
+    assert db.get_task(tid, path=env.db)["status"] == TaskStatus.DONE.value
+
+
+def test_item18_unclaimed_dispatch_recovers_to_queued(env, capsys):
+    """acked-but-never-claimed dispatch lapses -> recover_stale
+    requeues -> the next pump pass re-notifies exactly once."""
+    db.set_session_mode(SID, SessionMode.MANAGED, path=env.db)
+    _, out = _run(["push", SID, "--task", "do it", "--json"], capsys)
+    tid = out["data"]["task_id"]
+    db.ack_notifications(SID, path=env.db)
+    con = db.connect(env.db)
+    try:
+        con.execute("UPDATE tasks SET lease_expires_at=1 WHERE id=?", (tid,))
+        con.commit()
+    finally:
+        con.close()
+    # the same pump pass recovers the lapsed dispatch lease back to
+    # queued, then re-dispatches it - bounded to one new notification
+    for _ in range(3):
+        _run(["status", "--json"], capsys)
+    row = db.get_task(tid, path=env.db)
+    assert row["status"] == TaskStatus.DISPATCH_DECIDED.value
+    assert row["attempt"] == 1
+    rows = db.unrelayed_notifications(SID, path=env.db)
+    assert len(rows) == 2  # original + exactly one re-dispatch
+
+
+def test_item18_unmanaged_session_claim_refused(env, capsys):
+    """managed verbs refuse unmanaged sessions - transports own them."""
+    db.set_session_mode(SID, SessionMode.UNMANAGED, path=env.db)
+    tid = _task(env)
+    rc, out = _run(["claim", str(tid), "--session", SID, "--json"], capsys)
+    assert rc == ExitCode.CONFLICT
+    assert "not managed" in out["error"]
+    rc, out = _run(["finish", str(tid), "--session", SID, "--json"], capsys)
+    assert rc == ExitCode.CONFLICT
+    assert "not managed" in out["error"]
+    assert db.get_task(tid, path=env.db)["status"] == TaskStatus.QUEUED.value
+
+
+def test_item18_paused_session_dispatch_skipped(env, capsys):
+    """a queue_paused managed session gets no dispatch mark nor mail
+    (review: a paused task must not burn attempts re-dispatching)."""
+    db.set_session_mode(SID, SessionMode.MANAGED, path=env.db)
+    db.session_pause(SID, True, path=env.db)
+    tid = _task(env)
+    _run(["status", "--json"], capsys)
+    row = db.get_task(tid, path=env.db)
+    assert row["status"] == TaskStatus.QUEUED.value
+    assert row["lease_owner"] is None
+    assert db.unrelayed_notifications(SID, path=env.db) == []
+
+
+def test_item18_renew_cas_lost_reports_conflict(env, capsys, monkeypatch):
+    """a running task whose renew CAS loses is never reported as
+    renewed - the worker must not trust a lease it does not own."""
+    db.set_session_mode(SID, SessionMode.MANAGED, path=env.db)
+    tid = _task(env)
+    assert _run(["claim", str(tid), "--session", SID, "--json"], capsys)[0] == ExitCode.OK
+    monkeypatch.setattr(db, "renew_lease", lambda *a, **k: False)
+    rc, out = _run(["claim", str(tid), "--session", SID, "--json"], capsys)
+    assert rc == ExitCode.CONFLICT
+    assert "renew" in out["error"]
