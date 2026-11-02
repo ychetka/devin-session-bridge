@@ -1495,6 +1495,8 @@ def ask(session_id: str, task_id: int, text: str, *, path=None) -> AskResult:
             # (item_17): without it worker replies sit invisible in the
             # questions table until someone polls it by hand. Same
             # transaction - a relayed notice always has its question row.
+            # role='orchestrator' is a CAS singleton (register refuses a
+            # second live holder) - LIMIT 1 is the whole active set
             orch = con.execute(
                 "SELECT session_id FROM sessions"
                 " WHERE role=? AND status=? AND session_id<>?"

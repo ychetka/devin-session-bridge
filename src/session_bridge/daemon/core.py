@@ -451,7 +451,7 @@ _WAKE_PASS_DEADLINE_SECONDS = 120
 # successful attach+list happened before the failure, so they must
 # not count against the host circuit breaker (a fleet of dead tabs
 # would otherwise suspend every wake).
-_SESSION_LEVEL_REASONS = {"no_session", "rpc_error"}
+_SESSION_LEVEL_REASONS = {"no_session", "no_cwd", "rpc_error"}
 
 # Consecutive no_session outcomes before a managed session is marked
 # dead - the managed counterpart of the heartbeat sweep (item_17).
@@ -460,12 +460,15 @@ _NO_SESSION_DEAD_STREAK = 3
 
 
 def _wake_candidates(db_path, now: int):
-    """Managed sessions with stale heartbeat and unacked relayed mail.
+    """Active managed sessions, heartbeat stale, with mail or live work.
 
     These are the sessions the mailbox alone cannot reach: no turn is
     open (heartbeat stale, or never heartbeated) while mail waits in
     the fs queue, so the daemon gives them a nudge prompt through the
-    acp-host (item_16).
+    acp-host (item_16). A live task also qualifies (item_17): it keeps
+    the liveness probe - and thus no_session death detection - running
+    even when the outbox is empty. Dead sessions are excluded so a
+    no_session-marked session is not probed forever.
     """
     cutoff = now - db.HEARTBEAT_STALE_SECONDS
     con = db.connect(db_path)
@@ -474,12 +477,19 @@ def _wake_candidates(db_path, now: int):
             "SELECT DISTINCT s.session_id AS sid, s.cwd AS cwd"
             " FROM sessions s"
             " LEFT JOIN worker_heartbeats wh ON wh.session_id=s.session_id"
-            " WHERE s.mode=?"
+            " WHERE s.mode=? AND s.status='active'"
             " AND (wh.last_seen_at IS NULL OR wh.last_seen_at<=?)"
-            " AND EXISTS (SELECT 1 FROM notifications n"
-            "             WHERE n.session_id=s.session_id"
-            "               AND n.relayed_at IS NOT NULL"
-            "               AND n.ack_at IS NULL)",
+            " AND (EXISTS (SELECT 1 FROM notifications n"
+            "              WHERE n.session_id=s.session_id"
+            "                AND n.relayed_at IS NOT NULL"
+            "                AND n.ack_at IS NULL)"
+            # a live task is also wake-worthy mail: it keeps liveness
+            # probing (and thus no_session death detection) alive even
+            # when the outbox is empty (item_17 review)
+            "      OR EXISTS (SELECT 1 FROM tasks t"
+            "                 WHERE t.session_id=s.session_id"
+            "                   AND t.status IN ('queued','dispatch_decided',"
+            "                                    'running','awaiting_user')))",
             (SessionMode.MANAGED.value, cutoff),
         ).fetchall()
     finally:
@@ -524,6 +534,10 @@ def _wake_pass(db_path, state_directory, now: int, policy: WakePolicy) -> None:
                 opened = False
             else:
                 opened = policy.record_result(host_key, False)
+            if e.reason == "no_cwd":
+                # session was in session/list (present, unwakeable) -
+                # counts as seen, never toward the dead-streak
+                policy.record_session_seen(sid)
             if e.reason == "no_session":
                 streak = policy.record_no_session(sid)
                 if streak >= _NO_SESSION_DEAD_STREAK:

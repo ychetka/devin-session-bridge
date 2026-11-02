@@ -382,7 +382,10 @@ def wake_session(
                 return "busy"
             wake_cwd = cwd or entry.get("cwd")
             if not wake_cwd:
-                raise WakeError("no_session", f"no cwd known for {session_id}")
+                # the session IS in the list - present but unwakeable;
+                # distinct from no_session so it never feeds the
+                # dead-streak (item_17 review)
+                raise WakeError("no_cwd", f"no cwd known for {session_id}")
 
             # load replays stored session/update notifications to this
             # client - drained with a hard cap; a transcript too big to
