@@ -20,6 +20,7 @@ from session_bridge.state import db
 from session_bridge.state.contract import (
     CLAIM_TIMEOUT_SECONDS,
     NotificationKind,
+    SessionMode,
     SessionStatus,
     TaskStatus,
     Transport,
@@ -522,3 +523,49 @@ def test_item14_one_bad_schedule_does_not_sink_the_pass(env, monkeypatch):
     assert task is not None and task["task_text"] == "fine"
     fired = [d for d in _decisions(env) if d["event"] == "schedule_fired"]
     assert any(f"schedule={good}" in d["detail"] for d in fired)
+
+
+# --- item_17: managed liveness coherence ---------------------------------------
+
+
+def test_item17_gwt1_managed_worker_stale_hb_not_swept(env):
+    """[ITEM-17.GWT-1] managed worker + stale hb -> idle, not dead.
+
+    Between turns a managed drain-mode session is stale-hb by design;
+    the sweep must leave it (and its live task) alone.
+    """
+    res = db.register(SID, "/repo/ws", path=env.db)
+    assert res.accepted
+    db.set_session_mode(SID, SessionMode.MANAGED, path=env.db)
+    tid = db.enqueue(SID, "do the thing", path=env.db)
+    assert db.claim_queued(tid, "acp-1", Transport.ACP_PUSH, path=env.db)
+    assert db.mark_running(tid, "acp-1", path=env.db)
+    _stale_heartbeat(env.db, SID)
+
+    assert daemon.run(env.db, env.qdir, once=True) == daemon.RUN_OK
+
+    session = db.get_session(SID, path=env.db)
+    assert session["status"] == SessionStatus.ACTIVE.value
+    assert db.get_task(tid, path=env.db)["status"] == TaskStatus.RUNNING.value
+    assert not any(d["event"] == "worker_dead" for d in _decisions(env))
+
+
+def test_item17_gwt2_unmanaged_stale_hb_still_dead(env):
+    """[ITEM-17.GWT-2] regression guard: unmanaged sweep unchanged."""
+    res = db.register(SID, "/repo/ws", path=env.db)
+    assert res.accepted  # default mode: unmanaged
+    _stale_heartbeat(env.db, SID)
+    assert daemon.run(env.db, env.qdir, once=True) == daemon.RUN_OK
+    assert db.get_session(SID, path=env.db)["status"] == SessionStatus.DEAD.value
+
+
+def test_item17_gwt3_managed_orchestrator_stale_hb_no_notify(env):
+    """[ITEM-17.GWT-3] managed orchestrator idle -> no DEAD flip."""
+    res = db.register("orc", "/repo/ctl", role="orchestrator", path=env.db)
+    assert res.accepted
+    db.set_session_mode("orc", SessionMode.MANAGED, path=env.db)
+    _stale_heartbeat(env.db, "orc")
+
+    assert daemon.run(env.db, env.qdir, once=True, notify_send=env.notifier) == daemon.RUN_OK
+    assert env.sent == []
+    assert db.get_session("orc", path=env.db)["status"] == SessionStatus.ACTIVE.value

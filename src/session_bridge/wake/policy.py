@@ -35,6 +35,7 @@ class WakePolicy:
         self._clock = clock
         self._next_allowed: dict[str, float] = {}
         self._unconfirmed_streak: dict[str, int] = {}
+        self._no_session_streak: dict[str, int] = {}
         self._consecutive_failures: dict[str, int] = {}
         self._suspended_until: dict[str, float] = {}
 
@@ -73,6 +74,22 @@ class WakePolicy:
     def record_confirmed(self, session_id: str) -> None:
         """Reset the unconfirmed streak after a fully confirmed wake."""
         self._unconfirmed_streak.pop(session_id, None)
+
+    def record_no_session(self, session_id: str) -> int:
+        """Bump the consecutive ``no_session`` count; return it.
+
+        A session absent from the host's session/list is unreachable
+        for orchestration (tab closed, session gone). Enough misses in
+        a row lets the daemon mark it dead - the managed counterpart
+        of the unmanaged heartbeat sweep.
+        """
+        streak = self._no_session_streak.get(session_id, 0) + 1
+        self._no_session_streak[session_id] = streak
+        return streak
+
+    def record_session_seen(self, session_id: str) -> None:
+        """The session answered to session/list - reset the streak."""
+        self._no_session_streak.pop(session_id, None)
 
     def record_result(self, host_key: str, ok: bool) -> bool:
         """Track per-host failures; True when the breaker just opened."""

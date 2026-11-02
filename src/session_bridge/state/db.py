@@ -1235,6 +1235,11 @@ def set_session_mode(session_id: str, mode, *, path=None) -> None:
                 "INSERT INTO sessions(session_id,mode,updated_at)"
                 " VALUES(?,?,?) ON CONFLICT(session_id)"
                 " DO UPDATE SET mode=excluded.mode,"
+                # arming restores claimability: a queue_paused=1 flag
+                # left over from a smart-kick pause would keep tasks
+                # unclaimable while mail still delivers (item_17)
+                " queue_paused=CASE WHEN excluded.mode='managed'"
+                " THEN 0 ELSE queue_paused END,"
                 " updated_at=excluded.updated_at",
                 (session_id, mode_v, ts),
             )
@@ -1485,7 +1490,39 @@ def ask(session_id: str, task_id: int, text: str, *, path=None) -> AskResult:
                 )
             except sqlite3.IntegrityError:
                 return AskResult(accepted=False, reason="pending_exists")
-            return AskResult(accepted=True, question_id=cur.lastrowid)
+            question_id = cur.lastrowid
+            # Surface the pending question in the orchestrator's mailbox
+            # (item_17): without it worker replies sit invisible in the
+            # questions table until someone polls it by hand. Same
+            # transaction - a relayed notice always has its question row.
+            # role='orchestrator' is a CAS singleton (register refuses a
+            # second live holder) - LIMIT 1 is the whole active set
+            orch = con.execute(
+                "SELECT session_id FROM sessions"
+                " WHERE role=? AND status=? AND session_id<>?"
+                " ORDER BY updated_at DESC LIMIT 1",
+                (
+                    SessionRole.ORCHESTRATOR.value,
+                    SessionStatus.ACTIVE.value,
+                    session_id,
+                ),
+            ).fetchone()
+            if orch is not None:
+                con.execute(
+                    "INSERT INTO notifications"
+                    "(session_id,kind,body,task_id,question_id,created_at)"
+                    " VALUES(?,?,?,?,?,?)",
+                    (
+                        orch["session_id"],
+                        NotificationKind.DIRECTIVE.value,
+                        f"[question #{question_id} pending from {session_id}"
+                        f" task {task_id}] {text}",
+                        task_id,
+                        question_id,
+                        ts,
+                    ),
+                )
+            return AskResult(accepted=True, question_id=question_id)
         finally:
             con.close()
 

@@ -1368,10 +1368,10 @@ def test_item13c_set_session_mode_preserves_other_fields(db_path):
     db.upsert_session(sid, cwd="/repo", queue_paused=True, path=db_path)
     db.set_session_mode(sid, SessionMode.MANAGED, path=db_path)
     row = db.get_session(sid, path=db_path)
-    # only mode (+ updated_at) moves; the upsert fields stay put
+    # mode moves; arming also clears queue_paused (item_17); the rest stays put
     assert row["mode"] == "managed"
     assert row["cwd"] == "/repo"
-    assert row["queue_paused"] == 1
+    assert row["queue_paused"] == 0
 
 
 def test_item13c_set_session_mode_validates(db_path):
@@ -1725,3 +1725,57 @@ def test_item14_list_schedules_session_filter(db_path):
     assert [r["id"] for r in db.list_schedules(path=db_path)] == [a, b, c]
     assert [r["id"] for r in db.list_schedules("s-a", path=db_path)] == [a, c]
     assert db.list_schedules("ghost", path=db_path) == []
+
+
+# --- item_17: arm clears queue_paused; ask surfaces to orchestrator -------------
+
+
+def test_item17_gwt5_arm_clears_queue_paused(db_path):
+    """[ITEM-17.GWT-5] set_session_mode(managed) clears queue_paused -
+    tasks become claimable again in the same CAS."""
+    db.register("s1", "/repo", path=db_path)
+    db.session_pause("s1", True, path=db_path)
+    assert db.get_session("s1", path=db_path)["queue_paused"] == 1
+    db.set_session_mode("s1", SessionMode.MANAGED, path=db_path)
+    assert db.get_session("s1", path=db_path)["queue_paused"] == 0
+    # disarm/rearm stays consistent
+    db.session_pause("s1", True, path=db_path)
+    db.set_session_mode("s1", SessionMode.UNMANAGED, path=db_path)
+    assert db.get_session("s1", path=db_path)["queue_paused"] == 1
+    db.set_session_mode("s1", SessionMode.MANAGED, path=db_path)
+    assert db.get_session("s1", path=db_path)["queue_paused"] == 0
+
+
+def _notifications(db_path, sid):
+    con = db.connect(db_path)
+    try:
+        return con.execute(
+            "SELECT * FROM notifications WHERE session_id=? ORDER BY id", (sid,)
+        ).fetchall()
+    finally:
+        con.close()
+
+
+def test_item17_gwt6_ask_notifies_active_orchestrator(db_path):
+    """[ITEM-17.GWT-6] worker ask -> DIRECTIVE notification lands in the
+    orchestrator's outbox with task/question correlation refs."""
+    db.register("orc", "/repo/ctl", role=SessionRole.ORCHESTRATOR, path=db_path)
+    tid = db.enqueue("w1", "work", path=db_path)
+    r = db.ask("w1", tid, "which base ref?", path=db_path)
+    assert r.accepted
+    rows = _notifications(db_path, "orc")
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["kind"] == "directive"
+    assert row["task_id"] == tid
+    assert row["question_id"] == r.question_id
+    assert row["relayed_at"] is None  # outbox pending, daemon relays it
+    assert "w1" in row["body"] and str(tid) in row["body"]
+
+
+def test_item17_ask_without_orchestrator_still_accepted(db_path):
+    """No orchestrator registered -> question accepted, no notification."""
+    tid = db.enqueue("w1", "work", path=db_path)
+    r = db.ask("w1", tid, "q", path=db_path)
+    assert r.accepted
+    assert _notifications(db_path, "w1") == []

@@ -293,12 +293,23 @@ Each pass (~5s, with up to ~1s startup jitter):
    is CAS-marked. Delivery is at-least-once; consumers dedup by
    notification id.
 2. Wake: managed+armed sessions with a stale heartbeat (or none) and
-   unacked relayed mail get a nudge prompt through the acp-host wake
-   transport (see below) - this is what closes the delivery loop for
-   idle sessions. A session mid-turn is never prompted.
-3. Sweep: sessions whose `worker_heartbeats.last_seen_at` is older
-   than `HEARTBEAT_STALE_SECONDS` (120s) flip to `status='dead'`.
-   A dead worker's live task is requeued (attempt +1, terminal
+   either unacked relayed mail or a live task get a nudge prompt
+   through the acp-host wake transport (see below) - this is what
+   closes the delivery loop for idle sessions, and the live-task leg
+   keeps the liveness probe running so a managed session's death is
+   still detected when its outbox is empty. A session mid-turn is
+   never prompted. Dead sessions are not candidates.
+3. Sweep: **unmanaged** sessions whose `worker_heartbeats.last_seen_at`
+   is older than `HEARTBEAT_STALE_SECONDS` (120s) flip to
+   `status='dead'`. Managed sessions are excluded: between turns a
+   managed drain-mode session is stale-hb by design, and that signal
+   is the wake trigger - treating it as death would fail every
+   dispatched task 120s after dispatch. A managed session's real
+   death is detected on the wake path instead: 3 consecutive
+   `no_session` outcomes (absent from the host's session/list) flip
+   it to dead the same way, with the same task requeue (a
+   `worker_dead` decision carrying `reason=no_session_streak`). A
+   dead worker's live task is requeued (attempt +1, terminal
    `failed` at the `MAX_ATTEMPTS = 2` budget) carrying the note
    "requeued-dead-worker: stash dirty state (git stash -u -m
    dead-worker-backup-<id>) and reset the worktree to the task's base
@@ -334,7 +345,15 @@ notification state):
 - `wake_failed` with `reason=unauthorized` - stale/rotated token;
   a fresh lockfile is picked up on the next pass;
 - `wake_failed` with `reason=no_session` - the session is not known
-  to the acp-host (tab closed, never opened);
+  to the acp-host (tab closed, never opened); 3 consecutive misses
+  mark the managed session dead and requeue its live task
+  (`worker_dead` decision, `reason=no_session_streak`). The streak is
+  held in memory - a daemon restart resets it, so worst-case
+  detection time is streak x wake cooldown (~15 min at defaults)
+  after the restart;
+- `wake_failed` with `reason=no_cwd` - the session IS in the host's
+  list but carries no cwd (registered without `--workspace` and the
+  host reports none); it counts as alive - fix the registration;
 - `wake_breaker_open` - N consecutive host failures suspended all
   wake attempts for the breaker window (default 3 failures, 600s);
 - `wake_pass_deadline` - the pass ran out of its 120s budget;
@@ -526,7 +545,7 @@ Global flags: `--db PATH` (`SESSIONS_BRIDGE_DB`), `--queue-dir DIR`
 | `bridge clear <sid>` | drop the session's queued task. |
 | `bridge unpark <sid>` | resume a paused/awaiting session (requeues paused tasks, clears the queue pause). |
 | `bridge retry <sid\|task_id>` | requeue a failed task; attempt resets. |
-| `bridge arm <sid>` | enroll the session into managed mode. |
+| `bridge arm <sid>` | enroll the session into managed mode; also clears a leftover `queue_paused` flag so tasks stay claimable. |
 | `bridge disarm <sid>` / `bridge disarm --all` | leave managed mode + send a `disarm` mailbox notice. |
 | `bridge register <sid> [--role worker\|orchestrator] [--workspace DIR] [--force]` | join the bus and stamp the heartbeat; orchestrator is a CAS singleton. |
 | `bridge ask --session SID --task ID "text"` | post a worker question; refused when another question is pending (`pending_exists`) or the task hit the 3-question budget (`question_limit`). |

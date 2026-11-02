@@ -24,6 +24,8 @@ from session_bridge.state.contract import (
     NotificationKind,
     SessionMode,
     SessionRole,
+    TaskStatus,
+    Transport,
 )
 from session_bridge.wake import (
     WakeError,
@@ -681,3 +683,130 @@ def test_item16_breaker_suspends_after_failures(env, tmp_path, monkeypatch):
     events = [d["event"] for d in _decisions(env)]
     assert "wake_breaker_open" in events
     assert len(host.hellos) == 2
+
+
+# --- item_17: managed dead-path via no_session streak --------------------------
+
+
+def _live_task(path, sid):
+    tid = db.enqueue(sid, "work", path=path)
+    assert db.claim_queued(tid, "w1", Transport.ACP_PUSH, path=path)
+    assert db.mark_running(tid, "w1", path=path)
+    return tid
+
+
+def test_policy_no_session_streak_reset():
+    p = WakePolicy()
+    assert p.record_no_session("s") == 1
+    assert p.record_no_session("s") == 2
+    p.record_session_seen("s")
+    assert p.record_no_session("s") == 1
+
+
+def test_item17_gwt4_no_session_streak_marks_dead(env, tmp_path, monkeypatch):
+    """[ITEM-17.GWT-4] no_session x3 -> managed session marked dead,
+    live task requeued like the unmanaged sweep would do."""
+    host = FakeAcpHost(sessions=[])  # SID absent -> no_session
+    _lockdir(tmp_path, host, monkeypatch)
+    _session(env.db, SID, managed=True)
+    _heartbeat(env.db, SID, age=999)
+    _relayed_mail(env.db, SID)
+    tid = _live_task(env.db, SID)
+    policy = WakePolicy(cooldown_seconds=0)
+
+    for _ in range(3):
+        daemon._wake_pass(env.db, env.sdir, int(time.time()), policy)
+
+    session = db.get_session(SID, path=env.db)
+    assert session["status"] == "dead"
+    dead = [d for d in _decisions(env) if d["event"] == "worker_dead"]
+    assert dead and "no_session_streak" in dead[0]["detail"]
+    task = db.get_task(tid, path=env.db)
+    assert task["status"] == TaskStatus.QUEUED.value  # requeued, not failed
+
+
+def test_item17_seen_outcome_resets_no_session_streak(env, tmp_path, monkeypatch):
+    """A session that reappears in session/list resets the streak -
+    intermittent absence never kills it."""
+    host = FakeAcpHost(sessions=[])
+    _lockdir(tmp_path, host, monkeypatch)
+    _session(env.db, SID, managed=True)
+    _heartbeat(env.db, SID, age=999)
+    _relayed_mail(env.db, SID)
+    _live_task(env.db, SID)
+    policy = WakePolicy(cooldown_seconds=0)
+
+    for _ in range(2):
+        daemon._wake_pass(env.db, env.sdir, int(time.time()), policy)
+    host.sessions.append(IDLE_SESSION)  # session reappears
+    daemon._wake_pass(env.db, env.sdir, int(time.time()), policy)
+    host.sessions.remove(IDLE_SESSION)  # and vanishes again
+    for _ in range(2):
+        daemon._wake_pass(env.db, env.sdir, int(time.time()), policy)
+
+    assert db.get_session(SID, path=env.db)["status"] == "active"  # streak reset
+    daemon._wake_pass(env.db, env.sdir, int(time.time()), policy)
+    assert db.get_session(SID, path=env.db)["status"] == "dead"  # 3rd consecutive
+
+
+def test_item17_live_task_only_is_wake_candidate(env, tmp_path, monkeypatch):
+    """A managed session with a live task but no mail still gets probed -
+    keeps no_session death detection alive (review coverage hole)."""
+    host = FakeAcpHost(sessions=[IDLE_SESSION])
+    _lockdir(tmp_path, host, monkeypatch)
+    _session(env.db, SID, managed=True)
+    _heartbeat(env.db, SID, age=999)
+    _live_task(env.db, SID)  # no notification at all
+
+    daemon._wake_pass(env.db, env.sdir, int(time.time()), WakePolicy())
+
+    assert "session/prompt" in host.methods()
+    assert any(d["event"] == "wake_sent" for d in _decisions(env))
+
+
+def test_item17_dead_session_not_a_wake_candidate(env, tmp_path, monkeypatch):
+    """Once marked dead the session leaves the candidate set - no
+    repeated attaches or wake_failed spam while mail sits unacked."""
+    host = FakeAcpHost(sessions=[])
+    _lockdir(tmp_path, host, monkeypatch)
+    _session(env.db, SID, managed=True)
+    _heartbeat(env.db, SID, age=999)
+    _relayed_mail(env.db, SID)
+    _live_task(env.db, SID)
+    policy = WakePolicy(cooldown_seconds=0)
+
+    for _ in range(3):
+        daemon._wake_pass(env.db, env.sdir, int(time.time()), policy)
+    assert db.get_session(SID, path=env.db)["status"] == "dead"
+    hellos_after_dead = len(host.hellos)
+    for _ in range(3):
+        daemon._wake_pass(env.db, env.sdir, int(time.time()), policy)
+    assert len(host.hellos) == hellos_after_dead  # no further attempts
+
+
+def test_item17_no_cwd_counts_as_seen_not_absent(env, tmp_path, monkeypatch):
+    """Session in the list but with no cwd -> no_cwd, streak stays 0:
+    a present-but-unwakeable session is never marked dead."""
+    host = FakeAcpHost(
+        sessions=[{"sessionId": SID, "_meta": {"cognition.ai/statusEnum": "finished"}}]
+    )
+    _lockdir(tmp_path, host, monkeypatch)
+    _session(env.db, SID, managed=True)
+    _heartbeat(env.db, SID, age=999)
+    _relayed_mail(env.db, SID)
+    _live_task(env.db, SID)
+    con = db.connect(env.db)
+    try:
+        con.execute("UPDATE sessions SET cwd=NULL WHERE session_id=?", (SID,))
+        con.commit()
+    finally:
+        con.close()
+    policy = WakePolicy(cooldown_seconds=0)
+
+    for _ in range(5):
+        daemon._wake_pass(env.db, env.sdir, int(time.time()), policy)
+
+    assert db.get_session(SID, path=env.db)["status"] == "active"
+    failed = [d for d in _decisions(env) if d["event"] == "wake_failed"]
+    assert failed and all("no_cwd" in d["detail"] for d in failed)
+    assert not any(d["event"] == "worker_dead" for d in _decisions(env))
