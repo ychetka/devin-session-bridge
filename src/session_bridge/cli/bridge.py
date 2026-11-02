@@ -1171,13 +1171,20 @@ def _status_snapshot(args) -> dict:
         for r in escalations
     ]
     # the orchestrator counts as dead when the supervisor marked it or
-    # its heartbeat already slipped past the bounded stale window - the
-    # banner must not wait for the next daemon pass to fire; the
-    # ``>=`` boundary mirrors the daemon sweep (age == STALE is dead)
+    # (unmanaged only) its heartbeat already slipped past the bounded
+    # stale window - the banner must not wait for the next daemon pass
+    # to fire; a MANAGED orchestrator idle between turns is stale-hb by
+    # design (the wake trigger), so only a real dead flip counts - same
+    # rule the sweep applies since item_17
     if orchestrator is not None and (
         orchestrator["session_status"] == SessionStatus.DEAD.value
-        or orchestrator["heartbeat_age_seconds"] is None
-        or orchestrator["heartbeat_age_seconds"] >= db.HEARTBEAT_STALE_SECONDS
+        or (
+            orchestrator["mode"] != SessionMode.MANAGED.value
+            and (
+                orchestrator["heartbeat_age_seconds"] is None
+                or orchestrator["heartbeat_age_seconds"] >= db.HEARTBEAT_STALE_SECONDS
+            )
+        )
     ):
         attention.append(
             {
