@@ -506,7 +506,7 @@ def pump(args) -> dict:
                 # transport decision: the session is open in devin, so
                 # the parked Stop hook delivers it - claim + fold back
                 # to queued with the hook transport, then wake the hook
-                owner = f"{DISPATCH_OWNER_PREFIX}{os.getpid()}-{tid}"
+                owner = f"{DISPATCH_OWNER_PREFIX}{sid}-{os.getpid()}-{tid}"
                 if db.claim_queued(
                     tid, owner, Transport.HOOK_QUEUE, path=args.db
                 ) and db.fallback_to_hook(tid, owner, path=args.db):
@@ -520,7 +520,7 @@ def pump(args) -> dict:
                 if sid not in unknown:
                     unknown.append(sid)
                 continue
-            owner = f"{ACP_OWNER_PREFIX}{os.getpid()}-{tid}"
+            owner = f"{ACP_OWNER_PREFIX}{sid}-{os.getpid()}-{tid}"
             if not db.claim_queued(tid, owner, Transport.ACP_PUSH, path=args.db):
                 continue
             # atomic admission: the running count is checked inside the
@@ -644,12 +644,16 @@ def _acp_failure(
     )
 
 
-def _work_task(task_id: int, owner: str, args) -> JsonResponse:
+def _work_task(task_id: int, owner: str | None, args) -> JsonResponse:
     """One acp push cycle for a claimed task."""
     task = db.get_task(task_id, path=args.db)
     if task is None:
         return JsonResponse(status="not_found", error=f"task {task_id} not found")
     sid = task["session_id"]
+    if owner is None:
+        # standalone `bridge work` (no pump-spawned owner): attribute
+        # the lease to the executing session like the pump paths do
+        owner = f"{ACP_OWNER_PREFIX}{sid}-{os.getpid()}-{task_id}"
     if task["status"] == TaskStatus.DISPATCH_DECIDED.value:
         db.mark_running(task_id, owner, path=args.db)  # standalone run
     elif task["status"] != TaskStatus.RUNNING.value:
@@ -2903,8 +2907,6 @@ _HANDLERS = {
 
 def main(argv=None) -> int:
     args = _parse_args(argv)
-    if args.command == Command.WORK.value and not args.owner:
-        args.owner = f"{ACP_OWNER_PREFIX}{os.getpid()}"
     try:
         db.init(args.db)
     except Exception as e:

@@ -1802,3 +1802,33 @@ def test_item18_renew_cas_lost_reports_conflict(env, capsys, monkeypatch):
     rc, out = _run(["claim", str(tid), "--session", SID, "--json"], capsys)
     assert rc == ExitCode.CONFLICT
     assert "renew" in out["error"]
+
+
+def test_item19_hook_owner_names_session(env, capsys):
+    """[ITEM-19.GWT-1] hook-fold dispatch folds to queued cleanly;
+    the transient pump owner names the session (asserted via the
+    db-level CAS since fallback clears the lease)."""
+    env.locks[SID] = (True, 1234)
+    db.set_session_mode(SID, SessionMode.UNMANAGED, path=env.db)
+    _, out = _run(["push", SID, "--task", "do it", "--json"], capsys)
+    tid = out["data"]["task_id"]
+    row = db.get_task(tid, path=env.db)
+    # folded back: transport decided, lease released - the hook
+    # worker re-claims as hook-<sid>-<pid> (worker-side test)
+    assert row["status"] == TaskStatus.QUEUED.value
+    assert row["transport"] == Transport.HOOK_QUEUE.value
+
+
+def test_item19_acp_owner_names_session(env, capsys):
+    """[ITEM-19.GWT-2] acp-push owner names the session, not just pid."""
+    env.devin[SID] = {"working_directory": "/repo"}
+    db.set_session_mode(SID, SessionMode.UNMANAGED, path=env.db)
+    _, out = _run(["push", SID, "--task", "do it", "--json"], capsys)
+    tid = out["data"]["task_id"]
+    assert env.spawned
+    _tid, owner = env.spawned[0]
+    assert _tid == tid
+    assert owner.startswith(f"acp-{SID}-")
+    assert owner.endswith(f"-{tid}")
+    row = db.get_task(tid, path=env.db)
+    assert row["lease_owner"] == owner

@@ -49,7 +49,12 @@ import time
 
 from session_bridge.mailbox import write_message
 from session_bridge.state import db
-from session_bridge.state.contract import SessionMode, SessionRole, SessionStatus
+from session_bridge.state.contract import (
+    NotificationKind,
+    SessionMode,
+    SessionRole,
+    SessionStatus,
+)
 from session_bridge.wake import WakeError, WakePolicy, find_lockfile, wake_session
 
 __all__ = [
@@ -116,24 +121,50 @@ def _decision_log_path(state_directory: str) -> str:
 # --- relay payload ------------------------------------------------------------
 
 
-def relay_payload(notification) -> str:
+def relay_payload(notification, source: str | None = None) -> str:
     """fs mailbox body for one outbox row.
 
-    Header lines route the delivery: ``notification_id`` and ``kind``
-    always, ``task_id``/``question_id`` when the refs are set; a blank
-    line, then the body verbatim. ``kind`` is required in the payload -
-    the managed session's duty text routes deliveries by it (the file
-    name ``msg_<id>.txt`` alone cannot carry it).
+    Header lines route the delivery: ``notification_id``, ``kind`` and
+    ``session_id`` always - the recipient is the executing session, so
+    the delivery names the side that owns the work (item_19; before,
+    the only name in a dispatch note was the dispatcher's, embedded
+    in body prose). ``task_id``/``question_id`` when the refs are set,
+    ``from`` when the source is derivable; a blank line, then the body
+    verbatim. ``kind`` is required in the payload - the managed
+    session's duty text routes deliveries by it (the file name
+    ``msg_<id>.txt`` alone cannot carry it).
     """
     lines = [
         f"notification_id: {notification['id']}",
+        f"session_id: {notification['session_id']}",
         f"kind: {notification['kind']}",
     ]
+    if source is not None:
+        lines.append(f"from: {source}")
     if notification["task_id"] is not None:
         lines.append(f"task_id: {notification['task_id']}")
     if notification["question_id"] is not None:
         lines.append(f"question_id: {notification['question_id']}")
     return "\n".join(lines) + "\n\n" + notification["body"]
+
+
+def _notification_source(notification, db_path) -> str | None:
+    """Best-effort sender attribution for the ``from`` header (item_19).
+
+    Only question-linked rows carry a resolvable source today: for a
+    ``question_answer`` the answerer is ``questions.claimed_by``, for a
+    worker-ask ``directive`` it is ``questions.session_id``. Task
+    dispatches record no pusher, so they stay unattributed.
+    """
+    qid = notification["question_id"]
+    if qid is None:
+        return None
+    q = db.get_question(qid, path=db_path)
+    if q is None:
+        return None
+    if notification["kind"] == NotificationKind.QUESTION_ANSWER.value:
+        return q["claimed_by"]
+    return q["session_id"]
 
 
 def requeue_note(task_id: int) -> str:
@@ -347,7 +378,7 @@ def _relay_pass(db_path, queue_dir, state_directory) -> None:
             path = write_message(
                 row["session_id"],
                 row["id"],
-                relay_payload(row),
+                relay_payload(row, source=_notification_source(row, db_path)),
                 db_path=db_path,
                 queue_dir=queue_dir,
             )

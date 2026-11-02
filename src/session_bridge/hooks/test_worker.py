@@ -133,7 +133,7 @@ def test_item06_gwt2_stop_delivers_queued_task(env, monkeypatch, capsys):
     row = _get_task(env, tid)
     assert row["status"] == "running"
     assert row["transport"] == Transport.HOOK_QUEUE.value
-    assert row["lease_owner"].startswith("hook-")
+    assert row["lease_owner"].startswith(f"hook-{SID}-")  # session-named (item_19)
     assert row["lease_expires_at"] > int(time.time())
     # a delivered task refreshes the park budget
     assert db.get_session(SID, path=env["db"])["park_cycles_left"] == 2

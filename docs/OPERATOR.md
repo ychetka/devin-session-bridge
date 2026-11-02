@@ -110,6 +110,15 @@ Storage layout (state dir = the directory holding `state.db`, default
    acked-but-never-claimed task folds back to `queued` on lease
    expiry via `recover_stale` and gets exactly one re-dispatch.
 
+   Attribution (item_19): every `lease_owner` names the executing
+   session - `bridge-<sid>-<tid>` (managed), `acp-<sid>-<pid>-<tid>`
+   (acp-push), `hook-<sid>-<pid>` (Stop-hook worker) - so `inspect`
+   and `status` show who runs the task, not which dispatcher pid
+   stamped the claim. Mailbox deliveries carry `session_id:` (the
+   executing recipient) in the msg header, plus `from:` when the
+   source is derivable (`questions.claimed_by` for answers, the
+   asking session for worker-ask directives).
+
 6. Declare the repo's protected paths (e.g. `migrations/`, `auth/`,
    `.github/`) to the orchestrator in the task text or repo rules.
    There is no `bridge register` flag for this in the current CLI -
