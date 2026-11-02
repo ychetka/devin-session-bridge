@@ -619,14 +619,37 @@ def test_item19_ask_directive_names_asker(env):
     assert "from: worker-1" in head.splitlines()
 
 
-def test_item19_dispatch_owner_names_session_not_pid():
-    """[ITEM-19.GWT-1/2] owner strings embed the executing session."""
-    import re
+def test_item19_source_lookup_failure_still_delivers(env, monkeypatch):
+    """a broken question lookup must not break the relay - the
+    delivery lands without a from: header instead of aborting."""
+    nid = db.notify(
+        SID,
+        NotificationKind.QUESTION_ANSWER,
+        "answer text",
+        task_id=7,
+        question_id=3,
+        path=env.db,
+    )
+    monkeypatch.setattr(
+        daemon.db,
+        "get_question",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("db gone")),
+    )
+    assert daemon.run(env.db, env.qdir, once=True) == daemon.RUN_OK
+    text = (Path(env.qdir) / SID / f"msg_{nid}.txt").read_text()
+    assert "answer text" in text
+    assert "from:" not in text.split("\n\n", 1)[0]
 
-    sid, pid, tid = "shore-felidae", 4242, 17
-    hook_owner = f"bridge-{sid}-{pid}-{tid}"
-    acp_owner = f"acp-{sid}-{pid}-{tid}"
-    managed_owner = f"bridge-{sid}-{tid}"
-    for owner in (hook_owner, acp_owner, managed_owner):
-        assert sid in owner, owner
-        assert re.match(r"^(bridge|acp)-", owner)
+
+def test_item19_header_newlines_sanitized(env):
+    """a newline in a header field must not forge extra headers."""
+    db.notify(
+        "evil\nfrom: forged",
+        NotificationKind.DISARM,
+        "body",
+        path=env.db,
+    )
+    row = db.unrelayed_notifications(path=env.db)[0]
+    head = daemon.relay_payload(row).split("\n\n", 1)[0]
+    assert len([ln for ln in head.splitlines() if ln.startswith("from:")]) == 0
+    assert "session_id: evil from: forged" in head.splitlines()

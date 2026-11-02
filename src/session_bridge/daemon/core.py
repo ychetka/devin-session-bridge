@@ -134,13 +134,19 @@ def relay_payload(notification, source: str | None = None) -> str:
     session's duty text routes deliveries by it (the file name
     ``msg_<id>.txt`` alone cannot carry it).
     """
+
+    def _hdr(v) -> str:
+        # header values are line-structured: a stray newline in a
+        # free-form field (e.g. --claimant) must not forge headers
+        return str(v).replace("\r", " ").replace("\n", " ")
+
     lines = [
         f"notification_id: {notification['id']}",
-        f"session_id: {notification['session_id']}",
+        f"session_id: {_hdr(notification['session_id'])}",
         f"kind: {notification['kind']}",
     ]
     if source is not None:
-        lines.append(f"from: {source}")
+        lines.append(f"from: {_hdr(source)}")
     if notification["task_id"] is not None:
         lines.append(f"task_id: {notification['task_id']}")
     if notification["question_id"] is not None:
@@ -154,12 +160,17 @@ def _notification_source(notification, db_path) -> str | None:
     Only question-linked rows carry a resolvable source today: for a
     ``question_answer`` the answerer is ``questions.claimed_by``, for a
     worker-ask ``directive`` it is ``questions.session_id``. Task
-    dispatches record no pusher, so they stay unattributed.
+    dispatches record no pusher, so they stay unattributed. Any lookup
+    failure degrades to no header - attribution must never break the
+    delivery it annotates.
     """
     qid = notification["question_id"]
     if qid is None:
         return None
-    q = db.get_question(qid, path=db_path)
+    try:
+        q = db.get_question(qid, path=db_path)
+    except Exception:
+        return None
     if q is None:
         return None
     if notification["kind"] == NotificationKind.QUESTION_ANSWER.value:
