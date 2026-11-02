@@ -370,7 +370,16 @@ def _relay_pass(db_path, queue_dir, state_directory) -> None:
 
 
 def _stale_sessions(db_path, now: int):
-    """Sessions whose heartbeat is older than HEARTBEAT_STALE_SECONDS."""
+    """Unmanaged sessions whose heartbeat is older than the limit.
+
+    Managed sessions are excluded deliberately (item_17): between
+    turns a managed drain-mode session is stale-hb by design - that
+    very signal is what makes it a WAKE candidate. Treating it as
+    dead would fail every dispatched task 120s after dispatch while
+    the wake nudge is in flight. Managed liveness is ACP-reported:
+    repeated wake ``no_session`` outcomes mark the session dead in
+    ``_wake_pass`` instead.
+    """
     cutoff = now - db.HEARTBEAT_STALE_SECONDS
     con = db.connect(db_path)
     try:
@@ -379,8 +388,10 @@ def _stale_sessions(db_path, now: int):
             " wh.last_seen_at AS seen"
             " FROM sessions s"
             " JOIN worker_heartbeats wh ON wh.session_id=s.session_id"
-            " WHERE wh.last_seen_at<=? ORDER BY s.session_id",
-            (cutoff,),
+            " WHERE wh.last_seen_at<=?"
+            " AND COALESCE(s.mode,'unmanaged')<>?"
+            " ORDER BY s.session_id",
+            (cutoff, SessionMode.MANAGED.value),
         ).fetchall()
     finally:
         con.close()
@@ -441,6 +452,11 @@ _WAKE_PASS_DEADLINE_SECONDS = 120
 # not count against the host circuit breaker (a fleet of dead tabs
 # would otherwise suspend every wake).
 _SESSION_LEVEL_REASONS = {"no_session", "rpc_error"}
+
+# Consecutive no_session outcomes before a managed session is marked
+# dead - the managed counterpart of the heartbeat sweep (item_17).
+# At the default 300s cooldown this is ~15 minutes of absence.
+_NO_SESSION_DEAD_STREAK = 3
 
 
 def _wake_candidates(db_path, now: int):
@@ -508,6 +524,28 @@ def _wake_pass(db_path, state_directory, now: int, policy: WakePolicy) -> None:
                 opened = False
             else:
                 opened = policy.record_result(host_key, False)
+            if e.reason == "no_session":
+                streak = policy.record_no_session(sid)
+                if streak >= _NO_SESSION_DEAD_STREAK:
+                    # absent from session/list over enough attempts =
+                    # really gone (closed tab) - the managed dead path;
+                    # kills its live task like the unmanaged sweep does
+                    if db.set_session_status(sid, SessionStatus.DEAD, path=db_path):
+                        task = db.get_live_task(sid, path=db_path)
+                        outcome = "no live task"
+                        if task is not None:
+                            result = db.requeue_dead_worker(
+                                task["id"], note=requeue_note(task["id"]), path=db_path
+                            )
+                            outcome = (
+                                f"task={task['id']} -> {result.value if result else 'unchanged'}"
+                            )
+                        _decision(
+                            state_directory,
+                            "worker_dead",
+                            sid,
+                            f"reason=no_session_streak streak={streak} {outcome}",
+                        )
             _decision(state_directory, "wake_failed", sid, f"reason={e.reason} {e}")
             if opened:
                 _decision(
@@ -517,6 +555,7 @@ def _wake_pass(db_path, state_directory, now: int, policy: WakePolicy) -> None:
                 )
             continue
         policy.record_result(host_key, True)
+        policy.record_session_seen(sid)
         if outcome == "busy":
             _decision(state_directory, "wake_skipped_busy", sid)
             continue

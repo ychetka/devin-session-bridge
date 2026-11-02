@@ -67,8 +67,11 @@ Registration and heartbeats:
 Worker questions (`questions` table, pending > claimed > answered):
 
 - Workers post them with `bridge ask --session <sid> --task <id>
-  "text"`. You claim and answer through the library API - there is no
-  dedicated `bridge` subcommand for it:
+  "text"`. Each accepted ask also writes you a `directive`
+  notification ("[question #N pending from <sid> task <tid>] ..."),
+  relayed to your mailbox like any other mail - you do not need to
+  poll `list_pending_questions`; drain, then claim and answer through
+  the library API (there is no dedicated `bridge` subcommand):
 
   ```bash
   PYTHONPATH=<sessions-bridge>/src python3 - <<'PY'
