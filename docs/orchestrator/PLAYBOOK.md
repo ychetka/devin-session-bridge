@@ -58,9 +58,13 @@ Registration and heartbeats:
   the old holder to worker.
 - Your heartbeat (`worker_heartbeats.last_seen_at`) is stamped by
   `bridge heartbeat <sid>` - run it on every watcher cycle (it bumps
-  the generation without touching the orchestrator CAS); otherwise
-  the daemon marks you dead after 120s. `bridge register` also
-  re-stamps as a side effect.
+  the generation without touching the orchestrator CAS, and keeps
+  `bridge status` age columns honest). A managed orchestrator is NOT
+  marked dead on heartbeat staleness alone - stale-hb between turns
+  is by design and only makes you a wake candidate; a real dead flip
+  comes from the no_session streak (session absent from the acp-host)
+  or an explicit `disarm`. `bridge register` also re-stamps as a side
+  effect.
 - `bridge status` - fleet re-grounding (attention banner, vitals,
   fleet table, 24h digest). `--json` for the uncapped payload.
 
@@ -289,9 +293,12 @@ working fix: input stays free and deliveries drain on the next turn.
   `bridge ack --session <sid>` (optionally `--up-to <id>`). A restarted
   session re-delivers only unacked rows - this is the no-double-
   processing guarantee.
-- Keep the heartbeat inside the 120s stale window:
-  `bridge heartbeat <sid>` on every watcher cycle (resident) or at
-  every turn start plus via the observer loop (drain).
+- Keep stamping the heartbeat (`bridge heartbeat <sid>`) on every
+  watcher cycle (resident) or at every turn start plus via the
+  observer loop (drain). It no longer guards against a dead flip for
+  managed sessions - stale hb is the wake trigger, not death - but
+  it keeps `bridge status` ages accurate and the orchestrator CAS
+  window clean.
 - Between deliveries, work the question queue: claim, committee,
   directive, audit. Deliveries meanwhile are also how worker
   `bridge ask` results and task completions reach you - the

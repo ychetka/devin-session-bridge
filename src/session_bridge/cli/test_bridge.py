@@ -1162,6 +1162,20 @@ def test_item13e2_orchestrator_dead_banner_and_hint(env, capsys):
     assert not any(line.startswith("ORCHESTRATOR DEAD") for line in lines)
 
 
+def test_item17_managed_orchestrator_stale_hb_no_banner(env, capsys):
+    """Managed orchestrator idle between turns is stale-hb by design -
+    the banner mirrors the sweep's managed exemption (item_17)."""
+    _run(["register", "orc1", "--role", "orchestrator", "--json"], capsys)
+    _run(["arm", "orc1", "--json"], capsys)
+    _stale_heartbeat(env.db, "orc1")
+    lines = _status_human(capsys)
+    assert not any(line.startswith("ORCHESTRATOR DEAD") for line in lines)
+    # a real dead flip still shows
+    assert db.set_session_status("orc1", SessionStatus.DEAD, path=env.db)
+    lines = _status_human(capsys)
+    assert any(line.startswith("ORCHESTRATOR DEAD") for line in lines)
+
+
 def test_item13e2_dead_session_compact_marker(env, capsys):
     _run(["register", "w1", "--json"], capsys)
     assert db.set_session_status("w1", SessionStatus.DEAD, path=env.db)

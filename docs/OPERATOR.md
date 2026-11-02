@@ -15,8 +15,10 @@ bootstrap prompt in Playbook 2 expects it at that path.
   log all live there.
 - The fs mailbox is the transport: the daemon turns outbox rows into
   `queue/<sid>/msg_<id>.txt` files next to `state.db`.
-- `bridge daemon` is the supervisor: it relays the outbox to mailboxes
-  and marks dead sessions. It never injects anything into a session.
+- `bridge daemon` is the supervisor: it relays the outbox to mailboxes,
+  wakes idle managed sessions with a short "drain your mailbox" prompt
+  through the local acp-host (no payload - the mailbox stays the data
+  channel), and marks dead sessions.
 - Managed watchers are the delivery inside an open turn, in one of
   two modes the session picks by context: `resident` (a background
   watcher subagent polls the mailbox, prints and removes pending
@@ -40,6 +42,7 @@ state.db (SQLite WAL)           = source of truth
 bridge daemon (flock on         = supervisor + relay, ~5s passes
   daemon.lock)                  |
   |  writes queue/<sid>/msg_<id>.txt
+  |  injects a wake nudge via acp-host when the session is idle
   v
 managed watcher (resident or    = delivery into the open turn
   drain; resident shown)          |  prints + removes msg files, exits
@@ -484,9 +487,11 @@ Attention banner (printed only when needed):
   open (directive NULL); the line carries the exact reply command.
   More than 5 collapse into `+N more open escalation(s) - bridge
   escalate show`.
-- `ORCHESTRATOR DEAD` - the orchestrator session is marked dead or
-  its heartbeat is past the 120s stale window; reopen the session and
-  re-register (`--force` when the old holder is known-dead).
+- `ORCHESTRATOR DEAD` - the orchestrator session is marked dead, or
+  (unmanaged mode only) its heartbeat is past the 120s stale window;
+  a managed orchestrator idle between turns is stale-hb by design and
+  does NOT trip this banner. Reopen the session and re-register
+  (`--force` when the old holder is known-dead).
 
 Vitals:
 
@@ -563,11 +568,15 @@ Global flags: `--db PATH` (`SESSIONS_BRIDGE_DB`), `--queue-dir DIR`
 `worker_heartbeats.last_seen_at` is the liveness record the daemon
 sweeps and `bridge status` reports. Two commands refresh it:
 `bridge heartbeat <sid>` (lightweight, heartbeat only) and
-`bridge register` (which also re-stamps + bumps the generation), so a
-session that must stay "alive" for longer than the 120s stale window
-should run `bridge heartbeat` on every mailbox-watcher cycle (the
-orchestrator does this per its watcher loop; see
-docs/orchestrator/PLAYBOOK.md).
+`bridge register` (which also re-stamps + bumps the generation).
+Mode matters (item_17): for UNMANAGED sessions a stale heartbeat
+(>120s) means `status='dead'` - keep heartbeating on every watcher
+cycle to stay alive. For MANAGED sessions the heartbeat is not the
+death signal anymore - stale-hb between turns is normal and just
+makes the session a wake candidate; a managed session only goes dead
+via the no_session streak (or `disarm`). Heartbeats are still useful
+for managed sessions though: they drive `bridge status` age columns
+and the orchestrator CAS window.
 
 ## DoA matrix (summary)
 
