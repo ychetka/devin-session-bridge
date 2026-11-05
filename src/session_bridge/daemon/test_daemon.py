@@ -19,6 +19,7 @@ from session_bridge.daemon import core as daemon
 from session_bridge.state import db
 from session_bridge.state.contract import (
     CLAIM_TIMEOUT_SECONDS,
+    PENDING_TIMEOUT_SECONDS,
     NotificationKind,
     SessionMode,
     SessionStatus,
@@ -306,6 +307,7 @@ def test_item13d_requeue_note_is_reset_instruction():
 
 
 def test_item13g_daemon_pass_janitors_stale_claims(env):
+    db.register("orc1", "/repo/ctl", role="orchestrator", path=env.db)
     tid = db.enqueue(SID, "do the thing", path=env.db)
     qid = db.ask(SID, tid, "which branch?", path=env.db).question_id
     assert db.claim_question(qid, "orc1", path=env.db)
@@ -329,7 +331,49 @@ def test_item13g_daemon_pass_janitors_stale_claims(env):
     assert len([d for d in _decisions(env) if d["event"] == "question_claims_released"]) == 1
 
 
+def test_item20_daemon_pass_expires_pending_and_notifies_worker(env):
+    """[ITEM-20.GWT-3] a pending question older than the TTL expires
+    in the janitor pass and the worker is notified through the outbox;
+    the freed slot lets the worker re-ask."""
+    db.register("orc1", "/repo/ctl", role="orchestrator", path=env.db)
+    tid = db.enqueue(SID, "do the thing", path=env.db)
+    qid = db.ask(SID, tid, "which branch?", path=env.db).question_id
+    _exec(
+        env.db,
+        "UPDATE questions SET asked_at=? WHERE id=?",
+        (int(time.time()) - PENDING_TIMEOUT_SECONDS - 5, qid),
+    )
+    assert daemon.run(env.db, env.qdir, once=True) == daemon.RUN_OK
+    q = db.get_question(qid, path=env.db)
+    assert q["state"] == "expired"
+    # the expiry notice is an outbox row for the worker: it relays on
+    # the next pass (the janitor runs after the relay in the loop)
+    pending = db.unrelayed_notifications(SID, path=env.db)
+    assert len(pending) == 1
+    assert pending[0]["kind"] == NotificationKind.QUESTION_ANSWER.value
+    assert pending[0]["question_id"] == qid
+    assert pending[0]["task_id"] == tid
+    assert "expired" in pending[0]["body"]
+    decisions = _decisions(env)
+    assert any(d["event"] == "question_pending_expired" for d in decisions)
+    # second pass: the notice relays to the fs mailbox; expired is
+    # terminal so nothing further expires
+    assert daemon.run(env.db, env.qdir, once=True) == daemon.RUN_OK
+    msgs = _msg_files(Path(env.qdir) / SID)
+    expiry = [
+        m
+        for m in msgs
+        if "expired" in (Path(env.qdir) / SID / m).read_text()
+        and f"question_id: {qid}" in (Path(env.qdir) / SID / m).read_text()
+    ]
+    assert len(expiry) == 1
+    assert len([d for d in _decisions(env) if d["event"] == "question_pending_expired"]) == 1
+    # the freed slot: a fresh ask on the same task is accepted again
+    assert db.ask(SID, tid, "retry?", path=env.db).accepted
+
+
 def test_item13g_fresh_claim_survives_the_pass(env):
+    db.register("orc1", "/repo/ctl", role="orchestrator", path=env.db)
     tid = db.enqueue(SID, "do the thing", path=env.db)
     qid = db.ask(SID, tid, "which branch?", path=env.db).question_id
     assert db.claim_question(qid, "orc1", path=env.db)
@@ -587,6 +631,7 @@ def test_item19_msg_headers_name_executing_session(env):
 
 def test_item19_question_answer_names_answerer(env):
     """[ITEM-19.GWT-4] question_answer deliveries carry from: <answerer>."""
+    db.register("orch-1", "/repo/ctl", role="orchestrator", path=env.db)
     res = db.ask("worker-1", 7, "which file?", path=env.db)
     assert res.accepted
     db.claim_question(res.question_id, "orch-1", path=env.db)

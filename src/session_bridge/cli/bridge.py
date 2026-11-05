@@ -1679,6 +1679,12 @@ def _cmd_ask(args) -> int:
         if result.reason == "pending_exists":
             error = f"task {args.task} already has a pending question"
             instruction = "do not retry: wait for the pending question to be answered"
+        elif result.reason == "no_orchestrator":
+            error = "no active orchestrator on the bus - the question has nowhere to go"
+            instruction = (
+                "do not retry: escalate to the human or wait for an"
+                " orchestrator to register, then re-ask"
+            )
         else:
             error = (
                 f"task {args.task} exhausted the question budget"
@@ -1999,17 +2005,13 @@ def _questions_answer(args) -> int:
             ExitCode.USAGE,
             "usage: bridge questions answer <qid> --claimant SID <text>",
         )
-    if not db.answer_question(qid, args.text, claimant=args.claimant, path=args.db):
+    # notify_worker commits the QUESTION_ANSWER outbox row inside the
+    # answer's transaction - no crash window between the two (item_20)
+    if not db.answer_question(
+        qid, args.text, claimant=args.claimant, notify_worker=True, path=args.db
+    ):
         return _claim_refusal(args, qid, "answer")
     q = db.get_question(qid, path=args.db)
-    db.notify(
-        q["session_id"],
-        NotificationKind.QUESTION_ANSWER,
-        args.text,
-        task_id=q["task_id"],
-        question_id=qid,
-        path=args.db,
-    )
     resp = JsonResponse(
         session=q["session_id"],
         status=QuestionState.ANSWERED.value,

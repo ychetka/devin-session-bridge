@@ -68,14 +68,22 @@ Registration and heartbeats:
 - `bridge status` - fleet re-grounding (attention banner, vitals,
   fleet table, 24h digest). `--json` for the uncapped payload.
 
-Worker questions (`questions` table, pending > claimed > answered):
+Worker questions (`questions` table, pending > claimed > answered;
+pending may also fold to terminal `expired` - item_20):
 
 - Workers post them with `bridge ask --session <sid> --task <id>
   "text"`. Each accepted ask also writes you a `directive`
   notification ("[question #N pending from <sid> task <tid>] ..."),
   relayed to your mailbox like any other mail - you do not need to
   poll `list_pending_questions`; drain, then claim and answer through
-  the library API (there is no dedicated `bridge` subcommand):
+  the library API (there is no dedicated `bridge` subcommand).
+  `bridge ask` refuses with `no_orchestrator` when you are dead or
+  absent - workers can never post a question into a void.
+- A pending question you never claim within `PENDING_TIMEOUT_SECONDS`
+  (3600s) expires in the daemon janitor pass (terminal `expired`);
+  the worker is notified and may re-ask. While a task carries an
+  unresolved question, `recover_stale` renews the task lease instead
+  of requeueing - the worker's attempts do not burn on your latency.
 
   ```bash
   PYTHONPATH=<sessions-bridge>/src python3 - <<'PY'
@@ -85,9 +93,9 @@ Worker questions (`questions` table, pending > claimed > answered):
       if not db.claim_question(q["id"], me):
           continue                       # lost the CAS - skip
       answer = "<imperative directive>"  # after the committee protocol
-      db.answer_question(q["id"], answer, claimant=me)
-      db.notify(q["session_id"], "question_answer", answer,
-                task_id=q["task_id"], question_id=q["id"])
+      # notify_worker commits the worker's question_answer outbox row
+      # inside the answer transaction - no crash window (item_20)
+      db.answer_question(q["id"], answer, claimant=me, notify_worker=True)
   PY
   ```
 
@@ -96,8 +104,8 @@ Worker questions (`questions` table, pending > claimed > answered):
   and changed hands cannot be answered into somebody else's slot.
   A claim older than `CLAIM_TIMEOUT_SECONDS` (300s) is stale;
   `db.janitor_questions()` releases stale claims back to pending
-  preserving `question_id` - call it in your loop, nothing calls it
-  automatically.
+  preserving `question_id` - the daemon runs it every pass, so an
+  abandoned claim never wedges the question.
 - Answered questions reach the worker through the notifications
   outbox > daemon relay > fs mailbox > watcher, inside the same open
   turn. `bridge ask` is fire-and-forget for the worker: it keeps
@@ -335,6 +343,7 @@ From `src/session_bridge/state/contract.py` and `state/db.py`:
 | --- | --- | --- |
 | `MAX_QUESTIONS_PER_TASK` | 3 | question budget per task; beyond it the prompt is broken - escalate |
 | `CLAIM_TIMEOUT_SECONDS` | 300 | stale question claims return to pending (janitor) |
+| `PENDING_TIMEOUT_SECONDS` | 3600 | unclaimed pending questions expire and the worker is notified (janitor) |
 | `TURN_TTL_CYCLES` | 10 | watcher cycles before the managed turn rotates |
 | `WATCHER_TTL_SECONDS` | 7200 | watcher subagent lifetime inside one turn |
 | `HEARTBEAT_INTERVAL_SECONDS` | 60 | expected heartbeat cadence |

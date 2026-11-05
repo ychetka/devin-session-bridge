@@ -625,12 +625,16 @@ def _wake_pass(db_path, state_directory, now: int, policy: WakePolicy) -> None:
 
 
 def _question_janitor_pass(db_path, state_directory) -> None:
-    """Release question claims that outlived CLAIM_TIMEOUT_SECONDS.
+    """Janitor question claims and pending TTL (CLAIM/PENDING timeouts).
 
-    Runs every pass - it is a single guarded UPDATE, cheap when idle.
-    A question claimed by an orchestrator that died mid-deliberation
-    returns to ``pending`` (same id, no re-ask) instead of hanging
-    forever; released ids land in the decision log.
+    Runs every pass - two guarded UPDATEs, cheap when idle. A question
+    claimed by an orchestrator that died mid-deliberation returns to
+    ``pending`` (same id, no re-ask) instead of hanging forever;
+    released ids land in the decision log. A pending question never
+    claimed within PENDING_TIMEOUT_SECONDS expires (item_20) - the
+    orchestrator it was routed to is unreachable - and the asking
+    worker is notified through the outbox so its pending slot frees
+    and the wait ends visibly instead of wedging the task.
     """
     released = db.janitor_questions(path=db_path)
     if released:
@@ -638,6 +642,15 @@ def _question_janitor_pass(db_path, state_directory) -> None:
             state_directory,
             "question_claims_released",
             detail=f"released={len(released)} ids={released}",
+        )
+    for row in db.expire_pending_questions(path=db_path):
+        # the expiry notice committed inside the same transaction -
+        # the daemon only journals the event here
+        _decision(
+            state_directory,
+            "question_pending_expired",
+            row["session_id"],
+            f"question={row['id']} task={row['task_id']} worker notified",
         )
 
 

@@ -861,6 +861,8 @@ def test_item13e1_register_worker_defaults(env, capsys):
 
 
 def test_item13e1_ask_posts_question_and_refusals(env, capsys):
+    # item_20: ask needs an active orchestrator to route to
+    db.register("orc", "/repo/ctl", role="orchestrator", path=env.db)
     tid = _task(env)
     rc, out = _run(
         ["ask", "--session", SID, "--task", str(tid), "which branch?", "--json"],
@@ -1016,6 +1018,7 @@ def test_item13e1_reply_not_found_and_bad_directive(env, capsys):
 
 
 def test_item13e1_reply_override_answers_claimed_question(env, capsys):
+    db.register("orc", "/repo/ctl", role="orchestrator", path=env.db)
     tid = _task(env)
     res = db.ask("w1", tid, "which branch?", path=env.db)
     qid = res.question_id
@@ -1036,6 +1039,7 @@ def test_item13e1_reply_override_answers_claimed_question(env, capsys):
 
 
 def test_item13e1_reply_answers_pending_question(env, capsys):
+    db.register("orc", "/repo/ctl", role="orchestrator", path=env.db)
     tid = _task(env)
     res = db.ask("w1", tid, "which branch?", path=env.db)
     eid = _escalation(env, task_id=tid, question_id=res.question_id)
@@ -1296,6 +1300,7 @@ def test_item13g_gwt1_heartbeat_is_not_a_takeover(env, capsys):
 
 
 def test_item13g_gwt2_questions_claim_and_answer_binding(env, capsys):
+    db.register("orc1", "/repo/ctl", role="orchestrator", path=env.db)
     tid = _task(env)
     qid = db.ask(SID, tid, "which branch?", path=env.db).question_id
     # claim binds the claimant
@@ -1337,6 +1342,7 @@ def test_item13g_gwt2_questions_claim_and_answer_binding(env, capsys):
 
 
 def test_item13g_questions_list_filters_and_pending_only(env, capsys):
+    db.register("orc1", "/repo/ctl", role="orchestrator", path=env.db)
     t1 = _task(env, sid="w1")
     t2 = _task(env, sid="w2")
     q1 = db.ask("w1", t1, "q one", path=env.db).question_id
@@ -1355,6 +1361,7 @@ def test_item13g_questions_list_filters_and_pending_only(env, capsys):
 
 
 def test_item13g_questions_answer_pending_and_unknown(env, capsys):
+    db.register("orc1", "/repo/ctl", role="orchestrator", path=env.db)
     tid = _task(env)
     qid = db.ask(SID, tid, "q?", path=env.db).question_id
     # a pending question cannot be answered - claim comes first

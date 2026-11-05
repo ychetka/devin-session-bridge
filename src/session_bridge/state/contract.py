@@ -322,6 +322,11 @@ MAX_QUESTIONS_PER_TASK: Final[int] = 3
 # A claim older than this is stale; the janitor releases it back to
 # pending, preserving question_id (no duplicate re-ask).
 CLAIM_TIMEOUT_SECONDS: Final[int] = 300
+# A pending question never claimed within this window expires:
+# the orchestrator it was routed to is unreachable, so the janitor
+# folds it to terminal ``expired`` and notifies the worker - an
+# unclaimed wait can never wedge a task forever (item_20).
+PENDING_TIMEOUT_SECONDS: Final[int] = 3600
 # Re-arm cycles a managed worker turn survives before rotating
 # (end_turn + SessionStart hook re-arms); bounds parent context growth.
 TURN_TTL_CYCLES: Final[int] = 10
@@ -335,12 +340,16 @@ class QuestionState(str, Enum):
 
     ``claimed > pending`` exists only on the janitor path: a stale
     claim returns the row to pending with the same question_id, so a
-    claim timeout never produces a duplicate re-ask.
+    claim timeout never produces a duplicate re-ask. ``pending >
+    expired`` is the second janitor edge: a question never claimed
+    within PENDING_TIMEOUT_SECONDS expires - terminal, so the
+    worker's pending slot frees and it may re-ask (item_20).
     """
 
     PENDING = "pending"
     CLAIMED = "claimed"
     ANSWERED = "answered"
+    EXPIRED = "expired"
 
 
 # Regular path, driven by ask/claim/answer. A claim is a single atomic
@@ -350,13 +359,17 @@ QUESTION_TRANSITIONS: Final[dict] = {
     QuestionState.PENDING: frozenset({QuestionState.CLAIMED}),
     QuestionState.CLAIMED: frozenset({QuestionState.ANSWERED}),
     QuestionState.ANSWERED: frozenset(),
+    QuestionState.EXPIRED: frozenset(),
 }
 
-# Edge reserved for the janitor: releases a claim whose claimed_at is
-# older than CLAIM_TIMEOUT_SECONDS back to pending. The same question_id
-# persists - a timeout never creates a new row.
+# Edges reserved for the janitor: releases a claim whose claimed_at is
+# older than CLAIM_TIMEOUT_SECONDS back to pending (the same
+# question_id persists - a timeout never creates a new row), and folds
+# a pending question older than PENDING_TIMEOUT_SECONDS to terminal
+# expired (item_20 - an unclaimed wait cannot wedge a task forever).
 QUESTION_JANITOR_TRANSITIONS: Final[dict] = {
     QuestionState.CLAIMED: frozenset({QuestionState.PENDING}),
+    QuestionState.PENDING: frozenset({QuestionState.EXPIRED}),
 }
 
 
@@ -427,21 +440,24 @@ class Question(BaseModel):
     def _state_fields_coherent(self) -> "Question":
         """Keep the state column and its phase fields in lockstep.
 
-        PENDING carries no claim/answer fields; CLAIMED requires
-        ``claimed_by`` + ``claimed_at`` and still has no answer fields;
-        ANSWERED requires ``answer`` + ``answered_at`` and keeps the
-        claim fields (the row passed through claimed). The janitor
-        path stays expressible: ``release_claim`` clears the claim
-        fields when it returns a stale CLAIMED row to PENDING.
+        PENDING and EXPIRED carry no claim/answer fields; CLAIMED
+        requires ``claimed_by`` + ``claimed_at`` and still has no
+        answer fields; ANSWERED requires ``answer`` + ``answered_at``
+        and keeps the claim fields (the row passed through claimed).
+        The janitor path stays expressible: ``release_claim`` clears
+        the claim fields when it returns a stale CLAIMED row to
+        PENDING, and a PENDING row expires with empty claim fields.
         """
-        if self.state is QuestionState.PENDING:
+        if self.state in (QuestionState.PENDING, QuestionState.EXPIRED):
             leftovers = [
                 name
                 for name in ("claimed_by", "claimed_at", "answer", "answered_at")
                 if getattr(self, name) is not None
             ]
             if leftovers:
-                raise ValueError(f"pending question must not carry {', '.join(leftovers)}")
+                raise ValueError(
+                    f"{self.state.value} question must not carry {', '.join(leftovers)}"
+                )
         elif self.state is QuestionState.CLAIMED:
             if self.claimed_by is None or self.claimed_at is None:
                 raise ValueError("claimed question requires claimed_by and claimed_at")

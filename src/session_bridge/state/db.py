@@ -55,6 +55,7 @@ from .contract import (
     LIVE_STATUSES,
     MAX_ATTEMPTS,
     MAX_QUESTIONS_PER_TASK,
+    PENDING_TIMEOUT_SECONDS,
     WRITER_RETRIES,
     AuditEventKind,
     NotificationKind,
@@ -758,12 +759,40 @@ def recover_stale(*, path=None) -> list[int]:
     Covers ``running`` and ``dispatch_decided`` rows; lazy recovery:
     safe and cheap to call on any read path, returns the ids this call
     actually transitioned.
+
+    Question-waiter protection (item_20): a task whose worker is
+    blocked on an unresolved question (pending or claimed) is
+    legitimately waiting on the orchestrator, not wedged - burning
+    its lease would burn an attempt for the orchestrator's silence.
+    Those leases are renewed in the same transaction before the stale
+    scan, so the task re-enters recovery only once the question
+    resolves (answered) or the janitor expires it.
     """
     ts = _now()
+    lease_until = ts + LEASE_SECONDS
 
     def op():
         con = connect(path)
         try:
+            con.execute(
+                "UPDATE tasks SET lease_expires_at=?, lease_renewed_at=?,"
+                " updated_at=?"
+                " WHERE status IN (?, ?)"
+                " AND lease_expires_at IS NOT NULL AND lease_expires_at<?"
+                " AND EXISTS ("
+                "  SELECT 1 FROM questions q"
+                "  WHERE q.task_id=tasks.id AND q.state IN (?, ?))",
+                (
+                    lease_until,
+                    ts,
+                    ts,
+                    TaskStatus.RUNNING.value,
+                    TaskStatus.DISPATCH_DECIDED.value,
+                    ts,
+                    QuestionState.PENDING.value,
+                    QuestionState.CLAIMED.value,
+                ),
+            )
             rows = con.execute(
                 "SELECT id FROM tasks WHERE status IN (?, ?)"
                 " AND lease_expires_at IS NOT NULL AND lease_expires_at<?",
@@ -1529,7 +1558,9 @@ class AskResult:
     MAX_QUESTIONS_PER_TASK questions counting every state (the
     escalation to the human lives above this layer - here it is only
     the refusal), ``"pending_exists"`` when another pending question
-    already holds the task's slot.
+    already holds the task's slot, ``"no_orchestrator"`` when no
+    active orchestrator exists to route the question to (item_20 -
+    accepting it would drop the question into a void nobody reads).
     """
 
     accepted: bool
@@ -1540,12 +1571,17 @@ class AskResult:
 def ask(session_id: str, task_id: int, text: str, *, path=None) -> AskResult:
     """Post a worker question for ``task_id``; returns an ``AskResult``.
 
-    Two refusals, both structured in the result: the per-task question
-    budget (MAX_QUESTIONS_PER_TASK across all states) and a second
-    pending question on the same task. The pending guard is atomic -
-    the ``ux_questions_pending_task`` partial unique index turns a
+    Three refusals, all structured in the result: the per-task
+    question budget (MAX_QUESTIONS_PER_TASK across all states), a
+    second pending question on the same task, and the absence of an
+    active orchestrator. The pending guard is atomic - the
+    ``ux_questions_pending_task`` partial unique index turns a
     concurrent double-ask into an IntegrityError for the loser, so no
-    SELECT-then-INSERT race can produce two pending rows.
+    SELECT-then-INSERT race can produce two pending rows. The route
+    check, the question row and its DIRECTIVE notification commit in
+    one BEGIN IMMEDIATE transaction (the register pattern), so a
+    question only exists when its delivery path exists - a crash
+    between the two inserts can never produce an invisible question.
     """
     if not text:
         raise ValueError("ask requires question text")
@@ -1554,44 +1590,51 @@ def ask(session_id: str, task_id: int, text: str, *, path=None) -> AskResult:
     def op():
         con = connect(path)
         try:
-            count = con.execute(
-                "SELECT COUNT(*) AS c FROM questions WHERE task_id=?",
-                (task_id,),
-            ).fetchone()["c"]
-            if count >= MAX_QUESTIONS_PER_TASK:
-                return AskResult(accepted=False, reason="question_limit")
+            con.execute("BEGIN IMMEDIATE")
             try:
-                cur = con.execute(
-                    "INSERT INTO questions(task_id,session_id,text,state,asked_at)"
-                    " VALUES(?,?,?,?,?)",
+                count = con.execute(
+                    "SELECT COUNT(*) AS c FROM questions WHERE task_id=?",
+                    (task_id,),
+                ).fetchone()["c"]
+                if count >= MAX_QUESTIONS_PER_TASK:
+                    con.execute("ROLLBACK")
+                    return AskResult(accepted=False, reason="question_limit")
+                # Route check first (item_20): the pending question is
+                # surfaced in the orchestrator's mailbox via a DIRECTIVE
+                # notification. role='orchestrator' is a CAS singleton
+                # (register refuses a second live holder) - LIMIT 1 is
+                # the whole active set. Without an active holder the
+                # question would sit invisible in the questions table
+                # forever, so refuse instead of accept-and-drop.
+                orch = con.execute(
+                    "SELECT session_id FROM sessions"
+                    " WHERE role=? AND status=? AND session_id<>?"
+                    " ORDER BY updated_at DESC LIMIT 1",
                     (
-                        task_id,
+                        SessionRole.ORCHESTRATOR.value,
+                        SessionStatus.ACTIVE.value,
                         session_id,
-                        text,
-                        QuestionState.PENDING.value,
-                        ts,
                     ),
-                )
-            except sqlite3.IntegrityError:
-                return AskResult(accepted=False, reason="pending_exists")
-            question_id = cur.lastrowid
-            # Surface the pending question in the orchestrator's mailbox
-            # (item_17): without it worker replies sit invisible in the
-            # questions table until someone polls it by hand. Same
-            # transaction - a relayed notice always has its question row.
-            # role='orchestrator' is a CAS singleton (register refuses a
-            # second live holder) - LIMIT 1 is the whole active set
-            orch = con.execute(
-                "SELECT session_id FROM sessions"
-                " WHERE role=? AND status=? AND session_id<>?"
-                " ORDER BY updated_at DESC LIMIT 1",
-                (
-                    SessionRole.ORCHESTRATOR.value,
-                    SessionStatus.ACTIVE.value,
-                    session_id,
-                ),
-            ).fetchone()
-            if orch is not None:
+                ).fetchone()
+                if orch is None:
+                    con.execute("ROLLBACK")
+                    return AskResult(accepted=False, reason="no_orchestrator")
+                try:
+                    cur = con.execute(
+                        "INSERT INTO questions(task_id,session_id,text,state,asked_at)"
+                        " VALUES(?,?,?,?,?)",
+                        (
+                            task_id,
+                            session_id,
+                            text,
+                            QuestionState.PENDING.value,
+                            ts,
+                        ),
+                    )
+                except sqlite3.IntegrityError:
+                    con.execute("ROLLBACK")
+                    return AskResult(accepted=False, reason="pending_exists")
+                question_id = cur.lastrowid
                 con.execute(
                     "INSERT INTO notifications"
                     "(session_id,kind,body,task_id,question_id,created_at)"
@@ -1606,7 +1649,12 @@ def ask(session_id: str, task_id: int, text: str, *, path=None) -> AskResult:
                         ts,
                     ),
                 )
-            return AskResult(accepted=True, question_id=question_id)
+                con.execute("COMMIT")
+                return AskResult(accepted=True, question_id=question_id)
+            except BaseException:
+                if con.in_transaction:
+                    con.execute("ROLLBACK")
+                raise
         finally:
             con.close()
 
@@ -1650,6 +1698,7 @@ def answer_question(
     answer_text: str,
     *,
     claimant: str | None = None,
+    notify_worker: bool = False,
     path=None,
 ) -> bool:
     """CAS ``claimed > answered``; stores the answer verbatim.
@@ -1659,6 +1708,12 @@ def answer_question(
     optionally binds the CAS to ``claimed_by``: an orchestrator whose
     claim was released and re-taken by a successor (janitor timeout)
     loses the CAS instead of answering into somebody else's slot.
+
+    ``notify_worker=True`` additionally commits the QUESTION_ANSWER
+    outbox row to the asking session inside the same transaction
+    (item_20 review): without it a crash between the answer and a
+    caller-side notify leaves the answer invisible to the worker -
+    the same accept-and-drop class as the ask path.
     """
     if answer_text is None:
         raise ValueError("answer_question requires answer text")
@@ -1668,19 +1723,47 @@ def answer_question(
     def op():
         con = connect(path)
         try:
-            sql = "UPDATE questions SET state=?, answer=?, answered_at=? WHERE id=? AND state=?"
-            args: list = [
-                QuestionState.ANSWERED.value,
-                answer_text,
-                ts,
-                question_id,
-                QuestionState.CLAIMED.value,
-            ]
-            if claimant is not None:
-                sql += " AND claimed_by=?"
-                args.append(claimant)
-            cur = con.execute(sql, args)
-            return cur.rowcount == 1
+            con.execute("BEGIN IMMEDIATE")
+            try:
+                sql = "UPDATE questions SET state=?, answer=?, answered_at=? WHERE id=? AND state=?"
+                args: list = [
+                    QuestionState.ANSWERED.value,
+                    answer_text,
+                    ts,
+                    question_id,
+                    QuestionState.CLAIMED.value,
+                ]
+                if claimant is not None:
+                    sql += " AND claimed_by=?"
+                    args.append(claimant)
+                cur = con.execute(sql, args)
+                if cur.rowcount != 1:
+                    con.execute("ROLLBACK")
+                    return False
+                if notify_worker:
+                    q = con.execute(
+                        "SELECT session_id, task_id FROM questions WHERE id=?",
+                        (question_id,),
+                    ).fetchone()
+                    con.execute(
+                        "INSERT INTO notifications"
+                        "(session_id,kind,body,task_id,question_id,created_at)"
+                        " VALUES(?,?,?,?,?,?)",
+                        (
+                            q["session_id"],
+                            NotificationKind.QUESTION_ANSWER.value,
+                            answer_text,
+                            q["task_id"],
+                            question_id,
+                            ts,
+                        ),
+                    )
+                con.execute("COMMIT")
+                return True
+            except BaseException:
+                if con.in_transaction:
+                    con.execute("ROLLBACK")
+                raise
         finally:
             con.close()
 
@@ -1732,6 +1815,68 @@ def janitor_questions(*, path=None) -> list[int]:
                 ),
             ).fetchall()
             return [r["id"] for r in rows]
+        finally:
+            con.close()
+
+    return _retry(op)
+
+
+def expire_pending_questions(*, path=None) -> list:
+    """Fold pending questions older than PENDING_TIMEOUT_SECONDS to
+    ``expired``; returns the expired rows (id/task_id/session_id).
+
+    The second janitor edge (item_20): a question the orchestrator
+    never claimed is routed to nobody reachable - expiring it frees
+    the task's pending slot so the worker may re-ask inside its
+    budget. Each expiry commits its ``question_answer`` expiry notice
+    to the worker's outbox in the same transaction, so an expired
+    question can never lose its "wait ended" delivery to a crash
+    between the UPDATE and a caller-side notify (review, PR #45).
+    ``expired`` is terminal: the row stays as the audit trail but
+    never re-enters pending.
+    """
+    validate_question_transition(QuestionState.PENDING, QuestionState.EXPIRED, janitor=True)
+    ts = _now()
+    cutoff = ts - PENDING_TIMEOUT_SECONDS
+
+    def op():
+        con = connect(path)
+        try:
+            con.execute("BEGIN IMMEDIATE")
+            try:
+                rows = con.execute(
+                    "UPDATE questions SET state=?"
+                    " WHERE state=? AND asked_at<?"
+                    " RETURNING id, task_id, session_id",
+                    (
+                        QuestionState.EXPIRED.value,
+                        QuestionState.PENDING.value,
+                        cutoff,
+                    ),
+                ).fetchall()
+                for r in rows:
+                    con.execute(
+                        "INSERT INTO notifications"
+                        "(session_id,kind,body,task_id,question_id,created_at)"
+                        " VALUES(?,?,?,?,?,?)",
+                        (
+                            r["session_id"],
+                            NotificationKind.QUESTION_ANSWER.value,
+                            f"[question #{r['id']} expired - no answer within"
+                            f" {PENDING_TIMEOUT_SECONDS}s; the orchestrator"
+                            " never claimed it. Re-ask via `bridge ask` or"
+                            " close the task with `bridge finish --fail`.]",
+                            r["task_id"],
+                            r["id"],
+                            ts,
+                        ),
+                    )
+                con.execute("COMMIT")
+                return [dict(r) for r in rows]
+            except BaseException:
+                if con.in_transaction:
+                    con.execute("ROLLBACK")
+                raise
         finally:
             con.close()
 
