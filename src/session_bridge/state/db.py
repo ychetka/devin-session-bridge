@@ -1652,7 +1652,8 @@ def ask(session_id: str, task_id: int, text: str, *, path=None) -> AskResult:
                 con.execute("COMMIT")
                 return AskResult(accepted=True, question_id=question_id)
             except BaseException:
-                con.execute("ROLLBACK")
+                if con.in_transaction:
+                    con.execute("ROLLBACK")
                 raise
         finally:
             con.close()
@@ -1697,6 +1698,7 @@ def answer_question(
     answer_text: str,
     *,
     claimant: str | None = None,
+    notify_worker: bool = False,
     path=None,
 ) -> bool:
     """CAS ``claimed > answered``; stores the answer verbatim.
@@ -1706,6 +1708,12 @@ def answer_question(
     optionally binds the CAS to ``claimed_by``: an orchestrator whose
     claim was released and re-taken by a successor (janitor timeout)
     loses the CAS instead of answering into somebody else's slot.
+
+    ``notify_worker=True`` additionally commits the QUESTION_ANSWER
+    outbox row to the asking session inside the same transaction
+    (item_20 review): without it a crash between the answer and a
+    caller-side notify leaves the answer invisible to the worker -
+    the same accept-and-drop class as the ask path.
     """
     if answer_text is None:
         raise ValueError("answer_question requires answer text")
@@ -1715,19 +1723,47 @@ def answer_question(
     def op():
         con = connect(path)
         try:
-            sql = "UPDATE questions SET state=?, answer=?, answered_at=? WHERE id=? AND state=?"
-            args: list = [
-                QuestionState.ANSWERED.value,
-                answer_text,
-                ts,
-                question_id,
-                QuestionState.CLAIMED.value,
-            ]
-            if claimant is not None:
-                sql += " AND claimed_by=?"
-                args.append(claimant)
-            cur = con.execute(sql, args)
-            return cur.rowcount == 1
+            con.execute("BEGIN IMMEDIATE")
+            try:
+                sql = "UPDATE questions SET state=?, answer=?, answered_at=? WHERE id=? AND state=?"
+                args: list = [
+                    QuestionState.ANSWERED.value,
+                    answer_text,
+                    ts,
+                    question_id,
+                    QuestionState.CLAIMED.value,
+                ]
+                if claimant is not None:
+                    sql += " AND claimed_by=?"
+                    args.append(claimant)
+                cur = con.execute(sql, args)
+                if cur.rowcount != 1:
+                    con.execute("ROLLBACK")
+                    return False
+                if notify_worker:
+                    q = con.execute(
+                        "SELECT session_id, task_id FROM questions WHERE id=?",
+                        (question_id,),
+                    ).fetchone()
+                    con.execute(
+                        "INSERT INTO notifications"
+                        "(session_id,kind,body,task_id,question_id,created_at)"
+                        " VALUES(?,?,?,?,?,?)",
+                        (
+                            q["session_id"],
+                            NotificationKind.QUESTION_ANSWER.value,
+                            answer_text,
+                            q["task_id"],
+                            question_id,
+                            ts,
+                        ),
+                    )
+                con.execute("COMMIT")
+                return True
+            except BaseException:
+                if con.in_transaction:
+                    con.execute("ROLLBACK")
+                raise
         finally:
             con.close()
 
@@ -1838,7 +1874,8 @@ def expire_pending_questions(*, path=None) -> list:
                 con.execute("COMMIT")
                 return [dict(r) for r in rows]
             except BaseException:
-                con.execute("ROLLBACK")
+                if con.in_transaction:
+                    con.execute("ROLLBACK")
                 raise
         finally:
             con.close()

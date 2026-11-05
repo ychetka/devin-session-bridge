@@ -93,9 +93,9 @@ pending may also fold to terminal `expired` - item_20):
       if not db.claim_question(q["id"], me):
           continue                       # lost the CAS - skip
       answer = "<imperative directive>"  # after the committee protocol
-      db.answer_question(q["id"], answer, claimant=me)
-      db.notify(q["session_id"], "question_answer", answer,
-                task_id=q["task_id"], question_id=q["id"])
+      # notify_worker commits the worker's question_answer outbox row
+      # inside the answer transaction - no crash window (item_20)
+      db.answer_question(q["id"], answer, claimant=me, notify_worker=True)
   PY
   ```
 
