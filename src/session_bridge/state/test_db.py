@@ -17,6 +17,7 @@ from session_bridge.state.contract import (
     LEASE_SECONDS,
     MAX_ATTEMPTS,
     MAX_QUESTIONS_PER_TASK,
+    PENDING_TIMEOUT_SECONDS,
     AuditEventKind,
     NotificationKind,
     SessionMode,
@@ -966,6 +967,8 @@ def test_item13b1_migration_concurrent_init(tmp_path):
 
 
 def _ask(db_path, session_id="w1", task_id=1, text="which branch?"):
+    # item_20: ask() refuses without an active orchestrator - seed one
+    db.register("orch-seed", "/repo/ctl", role=SessionRole.ORCHESTRATOR, path=db_path)
     res = db.ask(session_id, task_id, text, path=db_path)
     assert res.accepted is True
     assert res.question_id is not None
@@ -1773,9 +1776,97 @@ def test_item17_gwt6_ask_notifies_active_orchestrator(db_path):
     assert "w1" in row["body"] and str(tid) in row["body"]
 
 
-def test_item17_ask_without_orchestrator_still_accepted(db_path):
-    """No orchestrator registered -> question accepted, no notification."""
+def test_item20_gwt1_ask_without_orchestrator_refused(db_path):
+    """[ITEM-20.GWT-1] no active orchestrator -> the ask is refused,
+    no question row and no notification exist - never accept-and-drop."""
     tid = db.enqueue("w1", "work", path=db_path)
     r = db.ask("w1", tid, "q", path=db_path)
-    assert r.accepted
+    assert r.accepted is False
+    assert r.reason == "no_orchestrator"
+    assert r.question_id is None
+    assert db.pending_questions_count(tid, path=db_path) == 0
     assert _notifications(db_path, "w1") == []
+    # a dead orchestrator does not count as a route either
+    db.register("orc", "/repo/ctl", role=SessionRole.ORCHESTRATOR, path=db_path)
+    db.set_session_status("orc", SessionStatus.DEAD, path=db_path)
+    r = db.ask("w1", tid, "q", path=db_path)
+    assert r.accepted is False
+    assert r.reason == "no_orchestrator"
+    # the asker itself holding the role is excluded from its own route
+    db.register("orc", "/repo/ctl", role=SessionRole.ORCHESTRATOR, force=True, path=db_path)
+    r = db.ask("orc", tid, "q to self", path=db_path)
+    assert r.accepted is False
+    assert r.reason == "no_orchestrator"
+
+
+# --- item_20: question lifecycle hardening -----------------------------------
+
+
+def test_item20_gwt3_expire_pending_questions_frees_slot(db_path):
+    """[ITEM-20.GWT-3] pending older than PENDING_TIMEOUT_SECONDS ->
+    terminal expired, the task's pending slot frees for a re-ask."""
+    qid = _ask(db_path, task_id=5)
+    # a fresh pending question survives the sweep
+    assert db.expire_pending_questions(path=db_path) == []
+    _exec(
+        db_path,
+        "UPDATE questions SET asked_at=? WHERE id=?",
+        (int(time.time()) - PENDING_TIMEOUT_SECONDS - 5, qid),
+    )
+    rows = db.expire_pending_questions(path=db_path)
+    assert [r["id"] for r in rows] == [qid]
+    assert rows[0]["task_id"] == 5
+    assert rows[0]["session_id"] == "w1"
+    row = db.get_question(qid, path=db_path)
+    assert row["state"] == "expired"
+    # expired is terminal: a second pass is a no-op
+    assert db.expire_pending_questions(path=db_path) == []
+    # the freed slot lets the worker re-ask within its budget
+    assert db.ask("w1", 5, "again?", path=db_path).accepted
+
+
+def test_item20_gwt4_pending_question_protects_task_lease(db_path):
+    """[ITEM-20.GWT-4] a running task blocked on a pending question
+    gets its expired lease renewed by recover_stale, not requeued -
+    and recovery resumes once the question resolves."""
+    tid = _enqueue_running(db_path, "w1", "w1")
+    qid = _ask(db_path, session_id="w1", task_id=tid)
+    _expire(db_path, tid)
+    assert db.recover_stale(path=db_path) == []
+    row = db.get_task(tid, path=db_path)
+    assert row["status"] == "running"
+    assert row["attempt"] == 0
+    assert row["lease_expires_at"] > int(time.time())
+    assert row["lease_renewed_at"] is not None
+    # once the question resolves the protection lifts: the next
+    # expired lease recovers normally
+    assert db.claim_question(qid, "orch-seed", path=db_path)
+    assert db.answer_question(qid, "main", claimant="orch-seed", path=db_path)
+    _expire(db_path, tid)
+    assert db.recover_stale(path=db_path) == [tid]
+    assert db.get_task(tid, path=db_path)["status"] == "queued"
+
+
+def test_item20_gwt5_claimed_question_protects_task_lease(db_path):
+    """[ITEM-20.GWT-5] a claimed (in-deliberation) question protects
+    the task lease the same way as a pending one."""
+    tid = _enqueue_running(db_path, "w1", "w1")
+    qid = _ask(db_path, session_id="w1", task_id=tid)
+    assert db.claim_question(qid, "orch-seed", path=db_path)
+    _expire(db_path, tid)
+    assert db.recover_stale(path=db_path) == []
+    assert db.get_task(tid, path=db_path)["status"] == "running"
+
+
+def test_item20_answered_expired_questions_do_not_protect(db_path):
+    """Only unresolved questions protect: answered and expired
+    questions leave the lease recoverable."""
+    tid = _enqueue_running(db_path, "w1", "w1")
+    qid = _ask(db_path, session_id="w1", task_id=tid)
+    _exec(
+        db_path,
+        "UPDATE questions SET state='expired' WHERE id=?",
+        (qid,),
+    )
+    _expire(db_path, tid)
+    assert db.recover_stale(path=db_path) == [tid]

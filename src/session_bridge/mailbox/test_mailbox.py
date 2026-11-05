@@ -288,6 +288,19 @@ def test_item15_gwt2_drain_instructions_complete(qdir):
     assert "latency" in text.lower()
 
 
+def test_item20_gwt6_duty_text_bans_interactive_dialogs(qdir):
+    """[ITEM-20.GWT-6] the managed duty forbids interactive question
+    widgets and routes every question through `bridge ask`."""
+    text = mailbox_duty_text(SID, queue_dir=qdir)
+    assert "MUST NOT open interactive question dialogs" in text
+    assert "ask_user_question" in text
+    assert "bridge ask" in text
+    assert f"--session\n{SID}" in text  # the ask command names the sid
+    assert "question_answer" in text
+    # the expiry notice path is documented in the kind table
+    assert "expired" in text
+
+
 def test_item15_gwt3_resident_path_not_regressed(qdir):
     text = mailbox_duty_text(SID, queue_dir=qdir)
     # resident still arms a background subagent with the verbatim loop

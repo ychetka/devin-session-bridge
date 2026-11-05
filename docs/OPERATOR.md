@@ -119,6 +119,20 @@ Storage layout (state dir = the directory holding `state.db`, default
    source is derivable (`questions.claimed_by` for answers, the
    asking session for worker-ask directives).
 
+   Question lifecycle (item_20): `bridge ask` refuses with
+   `no_orchestrator` when no active orchestrator exists - a question
+   is never accepted into a void. A pending question the orchestrator
+   never claimed within `PENDING_TIMEOUT_SECONDS` (3600s) expires in
+   the daemon janitor pass (terminal `expired`); the worker is
+   notified through the outbox (`question_answer`, expiry note) and
+   its pending slot frees for a re-ask. While a task carries an
+   unresolved (pending/claimed) question, `recover_stale` renews its
+   lease instead of requeueing - waiting on the orchestrator never
+   burns the worker's attempts. The managed duty forbids interactive
+   question widgets (`ask_user_question` and any UI dialog) - every
+   question goes through `bridge ask`; nobody answers a UI dialog
+   and the turn would park forever.
+
 6. Declare the repo's protected paths (e.g. `migrations/`, `auth/`,
    `.github/`) to the orchestrator in the task text or repo rules.
    There is no `bridge register` flag for this in the current CLI -
@@ -574,7 +588,7 @@ Global flags: `--db PATH` (`SESSIONS_BRIDGE_DB`), `--queue-dir DIR`
 | `bridge arm <sid>` | enroll the session into managed mode; also clears a leftover `queue_paused` flag so tasks stay claimable. |
 | `bridge disarm <sid>` / `bridge disarm --all` | leave managed mode + send a `disarm` mailbox notice. |
 | `bridge register <sid> [--role worker\|orchestrator] [--workspace DIR] [--force]` | join the bus and stamp the heartbeat; orchestrator is a CAS singleton. |
-| `bridge ask --session SID --task ID "text"` | post a worker question; refused when another question is pending (`pending_exists`) or the task hit the 3-question budget (`question_limit`). |
+| `bridge ask --session SID --task ID "text"` | post a worker question; refused when another question is pending (`pending_exists`), the task hit the 3-question budget (`question_limit`), or no active orchestrator exists (`no_orchestrator`). |
 | `bridge ack --session SID [--up-to N]` | advance the session's mailbox ack watermark. |
 | `bridge heartbeat <sid>` | refresh the session's liveness record (bumps the heartbeat generation; no takeover semantics). |
 | `bridge questions list [--session SID] [--task ID]` | list pending worker questions. |

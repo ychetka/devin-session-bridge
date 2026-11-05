@@ -1679,6 +1679,12 @@ def _cmd_ask(args) -> int:
         if result.reason == "pending_exists":
             error = f"task {args.task} already has a pending question"
             instruction = "do not retry: wait for the pending question to be answered"
+        elif result.reason == "no_orchestrator":
+            error = "no active orchestrator on the bus - the question has nowhere to go"
+            instruction = (
+                "do not retry: escalate to the human or wait for an"
+                " orchestrator to register, then re-ask"
+            )
         else:
             error = (
                 f"task {args.task} exhausted the question budget"

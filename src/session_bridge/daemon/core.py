@@ -625,12 +625,16 @@ def _wake_pass(db_path, state_directory, now: int, policy: WakePolicy) -> None:
 
 
 def _question_janitor_pass(db_path, state_directory) -> None:
-    """Release question claims that outlived CLAIM_TIMEOUT_SECONDS.
+    """Janitor question claims and pending TTL (CLAIM/PENDING timeouts).
 
-    Runs every pass - it is a single guarded UPDATE, cheap when idle.
-    A question claimed by an orchestrator that died mid-deliberation
-    returns to ``pending`` (same id, no re-ask) instead of hanging
-    forever; released ids land in the decision log.
+    Runs every pass - two guarded UPDATEs, cheap when idle. A question
+    claimed by an orchestrator that died mid-deliberation returns to
+    ``pending`` (same id, no re-ask) instead of hanging forever;
+    released ids land in the decision log. A pending question never
+    claimed within PENDING_TIMEOUT_SECONDS expires (item_20) - the
+    orchestrator it was routed to is unreachable - and the asking
+    worker is notified through the outbox so its pending slot frees
+    and the wait ends visibly instead of wedging the task.
     """
     released = db.janitor_questions(path=db_path)
     if released:
@@ -638,6 +642,26 @@ def _question_janitor_pass(db_path, state_directory) -> None:
             state_directory,
             "question_claims_released",
             detail=f"released={len(released)} ids={released}",
+        )
+    for row in db.expire_pending_questions(path=db_path):
+        # question_answer kind: it terminates a pending wait - the
+        # body says the wait expired rather than carrying an answer
+        db.notify(
+            row["session_id"],
+            NotificationKind.QUESTION_ANSWER,
+            f"[question #{row['id']} expired - no answer within"
+            f" {db.PENDING_TIMEOUT_SECONDS}s; the orchestrator never"
+            " claimed it. Re-ask via `bridge ask` or close the task"
+            " with `bridge finish --fail`.]",
+            task_id=row["task_id"],
+            question_id=row["id"],
+            path=db_path,
+        )
+        _decision(
+            state_directory,
+            "question_pending_expired",
+            row["session_id"],
+            f"question={row['id']} task={row['task_id']} worker notified",
         )
 
 

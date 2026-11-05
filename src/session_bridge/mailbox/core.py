@@ -274,6 +274,18 @@ You are a managed sessions-bridge worker. Tasks, question answers and
 orchestrator directives arrive as files in your mailbox directory:
 {mdir}
 
+HARD RULE - questions go through the bus, never through the UI:
+managed sessions MUST NOT open interactive question dialogs
+(ask_user_question or any multiple-choice/UI question widget) -
+nobody sits behind your window, so the dialog parks your turn
+forever with nobody to answer it. EVERY question to the
+orchestrator goes through `bridge ask <task_id> --session
+{session_id} "<text>"` only; the answer arrives in this mailbox
+as question_answer. If a question blocks you, ask on the bus
+and END your turn - the answer is delivered by a wake, never
+in-turn. Waiting inside a turn for a dialog or a human reply is
+a protocol violation.
+
 Pick your watcher mode NOW - the choice is yours, by context:
 if a live human may be sitting behind this session (Desktop/GUI
 interactive), use DRAIN mode; if you are an autonomous worker, use
@@ -307,6 +319,10 @@ latency for a free input line.
      `--fail --note "<why>"` on failure). Repeat `bridge claim`
      on long tasks to renew the lease.
    - question_answer: apply the answer to your pending question.
+     An "expired" notice means no answer arrived in time: the
+     pending slot is free - re-ask via `bridge ask` or close the
+     task with `bridge finish <task_id> --session {session_id}
+     --fail`.
    - directive: obey the orchestrator directive.
    - heartbeat_tick: liveness poke - no work needed.
    - disarm: managed mode is off - do NOT re-arm a watcher; resume
