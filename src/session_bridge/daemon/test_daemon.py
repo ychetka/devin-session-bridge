@@ -971,3 +971,15 @@ def test_item102c_gwt4_tick_still_wakes_stale_hb(env, monkeypatch):
 
     assert daemon.run(env.db, env.qdir, once=True, notify_send=env.notifier) == daemon.RUN_OK
     assert calls == [SID]
+
+
+def test_item102c_gwt5_acked_actionable_mail_does_not_rewake(env, monkeypatch):
+    """[ITEM-102C.GWT-5] fresh-hb session whose actionable mail is
+    already acked -> not a candidate: the re-wake loop boundary."""
+    _managed_fresh(env)
+    _unacked(env, SID, NotificationKind.DIRECTIVE)
+    db.ack_notifications(SID, path=env.db)
+    calls = _wake_calls(env, monkeypatch)
+
+    assert daemon.run(env.db, env.qdir, once=True, notify_send=env.notifier) == daemon.RUN_OK
+    assert calls == []
