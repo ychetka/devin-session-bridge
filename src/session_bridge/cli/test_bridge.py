@@ -348,7 +348,7 @@ def test_item21_gwt5_status_shows_wake_and_activity(env, capsys):
 
 def test_item21_wake_cell_failed_reason_prefix():
     """failed:<reason> outcomes render compactly, not as 'faile'."""
-    assert bridge._wake_cell({"wake_outcome": "failed:no_session"}) == "f:no_s"
+    assert bridge._wake_cell({"wake_outcome": "failed:no_session"}) == "f:no_se"
     assert bridge._wake_cell({"wake_outcome": "sent"}) == "sent"
 
 

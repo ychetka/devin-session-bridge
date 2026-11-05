@@ -226,6 +226,12 @@ CREATE TABLE IF NOT EXISTS notifications (
 CREATE INDEX IF NOT EXISTS ix_notifications_unrelayed
   ON notifications(relayed_at) WHERE relayed_at IS NULL;
 
+-- Backs the per-session ack watermark lookup (last_ack_at) - the
+-- table is append-only and never purged, so an unindexed per-sid
+-- MAX() would degrade linearly with fleet mail volume.
+CREATE INDEX IF NOT EXISTS ix_notifications_session
+  ON notifications(session_id);
+
 -- Recurring schedules (schema v3, item_14). Each enabled row is a
 -- persistent task source: the daemon materializes a due row into a
 -- regular queued task + task_dispatch outbox notification, then

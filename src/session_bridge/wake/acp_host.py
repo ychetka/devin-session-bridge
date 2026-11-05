@@ -60,6 +60,7 @@ __all__ = [
     "PROMPT_CONFIRM_SECONDS",
     "REPLAY_CAP",
     "REPLAY_TIMEOUT_SECONDS",
+    "SESSION_ABSENT",
     "WakeError",
     "find_lockfile",
     "nudge_text",
@@ -102,6 +103,12 @@ PROMPT_CONFIRM_SECONDS = 15.0
 #: prompted". Anything else except an explicit idle value is treated
 #: conservatively as busy.
 _IDLE_STATUS = {"finished", "idle", "created"}
+
+#: verify_sessions marker for a sid missing from session/list -
+#: distinct from None, which means "listed but no statusEnum meta".
+#: The daemon dead-marks only on the absent marker; a statusless
+#: listing is unconfirmed evidence, not proof the session is gone.
+SESSION_ABSENT = "__absent__"
 
 _READ_CHUNK = 65536
 
@@ -476,10 +483,13 @@ def verify_sessions(
     Post-inject verification: after a ``sent_unconfirmed`` wake the
     daemon re-checks each session's statusEnum - a session that went
     busy since the prompt proves the wake actually landed a turn; a
-    still-idle (or absent) one grows the durable unconfirmed streak.
+    still-idle or statusless one grows the durable unconfirmed streak,
+    an absent one feeds the no_session dead-marking path instead.
 
-    Returns ``{sid: statusEnum|None}`` - None means the session was
-    absent from session/list entirely. Raises WakeError on any attach
+    Returns ``{sid: statusEnum|None|SESSION_ABSENT}`` - SESSION_ABSENT
+    means the sid was missing from session/list entirely (the daemon's
+    no_session dead-marking input); None means the session was listed
+    but carried no statusEnum meta. Raises WakeError on any attach
     or protocol failure: the caller treats the whole batch as
     unverified (streaks untouched), never as unconfirmed.
     """
@@ -513,7 +523,7 @@ def verify_sessions(
             status_by_sid = {
                 item.get("sessionId"): _session_status(item) for item in listing.get("sessions", [])
             }
-            return {sid: status_by_sid.get(sid) for sid in session_ids}
+            return {sid: status_by_sid.get(sid, SESSION_ABSENT) for sid in session_ids}
         finally:
             try:
                 sock.close()

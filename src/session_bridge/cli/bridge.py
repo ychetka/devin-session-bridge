@@ -1136,10 +1136,13 @@ def _status_snapshot(args) -> dict:
     for r in srows:
         t = latest.pop(r["sid"], None)
         # managed liveness (item_21): turn-activity recency - the
-        # freshest of heartbeat, session update, last ack and task
-        # update. Stale hb between drain-mode turns is by design, so
-        # heartbeat alone would report a working managed session dead.
-        act_sources = [r["seen"], r["supdated"], r["last_ack"]]
+        # freshest of heartbeat, last ack and task update. Stale hb
+        # between drain-mode turns is by design, so heartbeat alone
+        # would report a working managed session dead. sessions.updated_at
+        # is deliberately excluded: daemon bookkeeping (arm, park,
+        # dead-mark) writes it too and would fake a fresh SEEN right
+        # after dead-marking (item_21 r2).
+        act_sources = [r["seen"], r["last_ack"]]
         if t is not None:
             act_sources.append(t["updated_at"])
         activity = max((v for v in act_sources if v is not None), default=None)
@@ -1294,7 +1297,7 @@ def _wake_cell(r) -> str:
     if not outcome:
         return "-"
     if outcome.startswith("failed:"):
-        cell = "f:" + outcome[7:11]
+        cell = "f:" + outcome[7:12]
     else:
         cell = {
             "sent": "sent",

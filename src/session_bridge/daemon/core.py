@@ -57,6 +57,7 @@ from session_bridge.state.contract import (
     SessionStatus,
 )
 from session_bridge.wake import (
+    SESSION_ABSENT,
     WakeError,
     WakePolicy,
     find_lockfile,
@@ -690,8 +691,8 @@ def _verify_unconfirmed_wakes(db_path, state_directory, sids, policy, notify) ->
         return
     now = int(time.time())
     for sid in sids:
-        status = statuses.get(sid)
-        if status is None:
+        status = statuses.get(sid, SESSION_ABSENT)
+        if status == SESSION_ABSENT:
             # absent on the re-check is the same evidence as a failed
             # session/list lookup: feed the no_session streak so a
             # dead tab counts toward dead-marking (item_21 review)
@@ -700,8 +701,10 @@ def _verify_unconfirmed_wakes(db_path, state_directory, sids, policy, notify) ->
                 _mark_dead_no_session(db_path, state_directory, sid, ns_streak)
                 continue  # dead-marked - the unconfirmed bump is moot
         else:
+            # listed but possibly statusless (None) - present evidence,
+            # never dead-mark input
             policy.record_session_seen(sid)
-        alive = status is not None and not status_is_idle(status)
+        alive = status is not None and status != SESSION_ABSENT and not status_is_idle(status)
         if not alive:
             # idle on the list, but a fresh ack watermark is equally
             # strong turn evidence: the drain turn opened and closed

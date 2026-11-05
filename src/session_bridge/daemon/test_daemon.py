@@ -843,11 +843,26 @@ def test_item21_absent_on_verify_feeds_no_session_streak(env, monkeypatch):
     """Review fix: absent on the re-check counts toward dead-marking,
     same as a failed session/list lookup."""
     _managed_with_mail(env)
-    monkeypatch.setattr(daemon, "verify_sessions", lambda sids, **k: dict.fromkeys(sids))
+    monkeypatch.setattr(
+        daemon,
+        "verify_sessions",
+        lambda sids, **k: dict.fromkeys(sids, daemon.SESSION_ABSENT),
+    )
     policy = daemon.WakePolicy()
     for _ in range(daemon._NO_SESSION_DEAD_STREAK):
         daemon._verify_unconfirmed_wakes(env.db, env.sdir, [SID], policy, None)
     assert db.get_session(SID, path=env.db)["status"] == SessionStatus.DEAD.value
+
+
+def test_item21_statusless_listing_is_unconfirmed_not_absent(env, monkeypatch):
+    """A session listed without statusEnum meta grows the unconfirmed
+    streak but must never feed no_session dead-marking (item_21 r2)."""
+    _managed_with_mail(env)
+    monkeypatch.setattr(daemon, "verify_sessions", lambda sids, **k: dict.fromkeys(sids))
+    policy = daemon.WakePolicy()
+    daemon._verify_unconfirmed_wakes(env.db, env.sdir, [SID], policy, None)
+    assert db.get_wake_state(SID, path=env.db)["unconfirmed_streak"] == 1
+    assert db.get_session(SID, path=env.db)["status"] == SessionStatus.ACTIVE.value
 
 
 def test_item21_alive_outcome_resets_escalated_episode(env, monkeypatch):

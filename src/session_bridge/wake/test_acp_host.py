@@ -28,6 +28,7 @@ from session_bridge.state.contract import (
     Transport,
 )
 from session_bridge.wake import (
+    SESSION_ABSENT,
     WakeError,
     WakePolicy,
     find_lockfile,
@@ -447,9 +448,21 @@ def test_verify_sessions_returns_status_map():
         ]
     )
     out = verify_sessions([SID, "other", "ghost"], lock_data=host.lock_data())
-    assert out == {SID: "finished", "other": "working", "ghost": None}
+    assert out == {SID: "finished", "other": "working", "ghost": SESSION_ABSENT}
     # one attach, one session/list - not per-session attaches
     assert host.methods().count("session/list") == 1
+
+
+def test_verify_sessions_listed_statusless_is_not_absent():
+    """A session present in the list but missing statusEnum meta reads
+    as None - distinct from the SESSION_ABSENT marker (item_21 r2)."""
+    host = FakeAcpHost(
+        sessions=[
+            {"sessionId": SID, "cwd": "/tmp/ws", "_meta": {}},
+        ]
+    )
+    out = verify_sessions([SID], lock_data=host.lock_data())
+    assert out == {SID: None}
 
 
 def test_verify_sessions_attach_failure_is_wake_error():
