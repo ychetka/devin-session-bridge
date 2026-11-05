@@ -1843,6 +1843,12 @@ def test_item22_gwt3_wait_refusals(env, capsys):
     assert rc == ExitCode.CONFLICT
     rc, _ = _run(["wait", "9999", "--session", SID, "--json"], capsys)
     assert rc == ExitCode.NOT_FOUND
+    # own task but the session is not managed -> the mode gate fires
+    db.set_session_mode(SID, SessionMode.UNMANAGED, path=env.db)
+    rc, out = _run(["wait", str(tid), "--session", SID, "--json"], capsys)
+    assert rc == ExitCode.CONFLICT
+    assert "not managed" in out["error"]
+    db.set_session_mode(SID, SessionMode.MANAGED, path=env.db)
 
     assert _run(["claim", str(tid), "--session", SID, "--json"], capsys)[0] == ExitCode.OK
     # foreign owner holds the lease now
