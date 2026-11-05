@@ -644,19 +644,8 @@ def _question_janitor_pass(db_path, state_directory) -> None:
             detail=f"released={len(released)} ids={released}",
         )
     for row in db.expire_pending_questions(path=db_path):
-        # question_answer kind: it terminates a pending wait - the
-        # body says the wait expired rather than carrying an answer
-        db.notify(
-            row["session_id"],
-            NotificationKind.QUESTION_ANSWER,
-            f"[question #{row['id']} expired - no answer within"
-            f" {db.PENDING_TIMEOUT_SECONDS}s; the orchestrator never"
-            " claimed it. Re-ask via `bridge ask` or close the task"
-            " with `bridge finish --fail`.]",
-            task_id=row["task_id"],
-            question_id=row["id"],
-            path=db_path,
-        )
+        # the expiry notice committed inside the same transaction -
+        # the daemon only journals the event here
         _decision(
             state_directory,
             "question_pending_expired",
