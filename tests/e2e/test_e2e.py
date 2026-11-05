@@ -334,9 +334,12 @@ class _E2EWorld:
         PID whose argv[0] basename is "devin"."""
         exe = self.tmp / "devin"
         if not exe.exists():
-            exe.symlink_to(shutil.which("sleep"))
+            # python, not a renamed sleep: multicall coreutils builds
+            # (rust coreutils on ubuntu-26.04 runners) refuse to exec
+            # under a foreign argv[0] name
+            exe.symlink_to(sys.executable)
         proc = subprocess.Popen(
-            [str(exe), "300"],
+            [str(exe), "-c", "import time; time.sleep(300)"],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
