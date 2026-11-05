@@ -1942,6 +1942,71 @@ def _cmd_finish(args) -> int:
     return _emit(args, resp, ExitCode.OK, f"task {tid}: {'done' if ok else 'failed'}")
 
 
+def _cmd_wait(args) -> int:
+    """``bridge wait <task_id> --session <sid> [--reason T]`` (item_22).
+
+    External-wait signal: the claiming managed session declares "still
+    alive, blocked on something out-of-band" - CI, a PR review, a
+    partner consult. Lease-owner CAS extends the lease by one
+    LEASE_SECONDS and lands the reason in the task note. Without it a
+    long wait reads exactly like a dead worker: task 87 failed on
+    ``lease expired`` mid review-cycle. Repeat the call while waiting;
+    a dead claimer simply stops renewing and the task requeues.
+    """
+    tid = args.task_id
+    sid = args.session
+    task = db.get_task(tid, path=args.db)
+    if task is None:
+        resp = JsonResponse(session=sid, status="not_found", error=f"task {tid} not found")
+        return _emit(args, resp, ExitCode.NOT_FOUND, f"not found: task {tid}")
+    if task["session_id"] != sid:
+        resp = JsonResponse(
+            session=sid,
+            status="conflict",
+            error=f"task {tid} belongs to {task['session_id']}, not {sid}",
+        )
+        return _emit(args, resp, ExitCode.CONFLICT, f"conflict: task {tid} is not yours")
+    if _session_mode(sid, args) != SessionMode.MANAGED.value:
+        resp = JsonResponse(
+            session=sid,
+            status="conflict",
+            error=(
+                f"{sid} is not managed; unmanaged leases renew inside"
+                " their transport worker, not via wait"
+            ),
+        )
+        return _emit(args, resp, ExitCode.CONFLICT, f"conflict: {sid} is not managed")
+    owner = _managed_owner(sid, tid)
+    if not db.wait_task(tid, owner, args.reason, path=args.db):
+        resp = JsonResponse(
+            session=sid,
+            status=task["status"],
+            error=(
+                f"wait refused: task {tid} is {task['status']}"
+                f" (lease_owner={task['lease_owner']}); only the claiming"
+                " session can wait on a running task"
+            ),
+        )
+        return _emit(
+            args,
+            resp,
+            ExitCode.CONFLICT,
+            f"conflict: wait refused for task {tid}",
+        )
+    row = db.get_task(tid, path=args.db)
+    resp = JsonResponse(
+        session=sid,
+        status="running",
+        data={"task_id": tid, "lease_expires_at": row["lease_expires_at"]},
+    )
+    return _emit(
+        args,
+        resp,
+        ExitCode.OK,
+        f"task {tid}: lease renewed (waiting)",
+    )
+
+
 def _cmd_heartbeat(args) -> int:
     """``bridge heartbeat <sid>``: the liveness metronome (item_13g).
 
@@ -2852,6 +2917,21 @@ def _parse_args(argv) -> argparse.Namespace:
     sp.add_argument("--note", default=None, help="optional completion note")
     _add_json(sp)
 
+    # item_22: declare an external wait - one LEASE_SECONDS renewal per
+    # call, CAS-bound to the claimer's lease_owner
+    sp = sub.add_parser(
+        "wait",
+        help="renew your running task's lease while blocked externally",
+    )
+    sp.add_argument("task_id", type=int)
+    sp.add_argument("--session", required=True, help="waiting session id")
+    sp.add_argument(
+        "--reason",
+        default=None,
+        help="what you are waiting on (lands in the task note)",
+    )
+    _add_json(sp)
+
     sp = sub.add_parser(
         "questions",
         help="orchestrator question queue: list / claim / answer",
@@ -2963,6 +3043,7 @@ _HANDLERS = {
     Command.WORK.value: _cmd_work,
     "arm": _cmd_arm,
     "wake": _cmd_wake,
+    "wait": _cmd_wait,
     "disarm": _cmd_disarm,
     "daemon": _cmd_daemon,
     "register": _cmd_register,

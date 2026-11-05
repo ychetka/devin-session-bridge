@@ -133,6 +133,17 @@ Storage layout (state dir = the directory holding `state.db`, default
    question goes through `bridge ask`; nobody answers a UI dialog
    and the turn would park forever.
 
+   External waits (item_22): a claim that never renews dies on
+   `lease expired` exactly like a dead worker - long PR-review or CI
+   waits burned leases silently. `bridge wait <id> --session <sid>
+   [--reason "<what>"]` is the claimer's out-of-band wait signal: a
+   lease-owner CAS (same guard as claim/finish) extends the lease by
+   one `LEASE_SECONDS` per call and lands the reason in the task
+   note. It is bounded on purpose - a dead claimer simply stops
+   renewing and the task requeues within one lease period. Repeat it
+   while the wait lasts; `claim` on an owned running task renews the
+   same way without a reason.
+
 6. Declare the repo's protected paths (e.g. `migrations/`, `auth/`,
    `.github/`) to the orchestrator in the task text or repo rules.
    There is no `bridge register` flag for this in the current CLI -
@@ -614,6 +625,7 @@ Global flags: `--db PATH` (`SESSIONS_BRIDGE_DB`), `--queue-dir DIR`
 | `bridge push <sid> --task "..."` / `--file <path>` | enqueue a task; pump picks the transport: managed session > outbox notification (mailbox) + `dispatch_decided` mark, locked session > hook queue, idle session > acp push worker. |
 | `bridge claim <task_id> --session SID` | managed worker claims its delivered task: `queued`/`dispatch_decided` > `running` + lease. Idempotent - a repeat claim on the session's own running task renews the lease (long-task heartbeat). Refusals: wrong session, task already claimed/running/done/failed, `queue_paused`. |
 | `bridge finish <task_id> --session SID [--fail] [--note T]` | close the managed lifecycle: `running` > `done` (or `failed` with `--fail`), CAS'd on the claiming session's deterministic lease owner. |
+| `bridge wait <task_id> --session SID [--reason T]` | external-wait signal (item_22): the claiming session renews its lease by one `LEASE_SECONDS` while blocked out-of-band (CI, reviews, partner consults) and the reason lands in the task note. Same owner CAS as claim/finish; a dead claimer stops renewing and the task requeues within one lease period. |
 | `bridge status` | fleet view above. |
 | `bridge inspect <sid\|task_id>` | full task detail + next action. |
 | `bridge clear <sid>` | drop the session's queued task. |
