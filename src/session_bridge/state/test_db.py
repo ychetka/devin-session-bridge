@@ -2,9 +2,9 @@
 
 import json
 import multiprocessing
-import shutil
 import sqlite3
 import subprocess
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 
@@ -405,11 +405,19 @@ def test_item04_sessions_db_lookup(tmp_path, monkeypatch):
 
 
 def _named_exe(tmp_path, name):
-    """A ``sleep`` binary reachable under ``name`` via symlink, so the
-    spawned process's argv[0] basename is exactly ``name``."""
+    """A long-running executable reachable under ``name`` via symlink,
+    so the spawned process's argv[0] basename is exactly ``name``.
+
+    Links to the Python interpreter rather than ``sleep``: multicall
+    coreutils builds (rust coreutils on ubuntu-26.04 runners) refuse to
+    exec under a foreign argv[0] name. Python does not care.
+    """
     exe = tmp_path / name
-    exe.symlink_to(shutil.which("sleep"))
+    exe.symlink_to(sys.executable)
     return str(exe)
+
+
+_PY_SLEEP = ["-c", "import time; time.sleep(30)"]
 
 
 def _spawn_cmdline(argv, marker):
@@ -445,7 +453,7 @@ def test_item04_is_locked(tmp_path, monkeypatch):
     assert db.is_locked("dead") == (False, dead_pid)
 
     # live process whose argv[0] basename is 'devin' -> locked
-    proc = _spawn_cmdline([_named_exe(tmp_path, "devin"), "30"], b"devin")
+    proc = _spawn_cmdline([_named_exe(tmp_path, "devin"), *_PY_SLEEP], b"devin")
     (locks / "live.lock").write_text(str(proc.pid))
     try:
         assert db.is_locked("live") == (True, proc.pid)
@@ -458,7 +466,7 @@ def test_item04_is_locked(tmp_path, monkeypatch):
     # 'devin' anywhere else in the cmdline is not enough: a basename
     # that merely mentions devin must not lock (PID-reuse guard)
     lookalike = _named_exe(tmp_path, "devin-checkout")
-    proc2 = _spawn_cmdline([lookalike, "30"], b"devin-checkout")
+    proc2 = _spawn_cmdline([lookalike, *_PY_SLEEP], b"devin-checkout")
     (locks / "lookalike.lock").write_text(str(proc2.pid))
     try:
         assert db.is_locked("lookalike") == (False, proc2.pid)
