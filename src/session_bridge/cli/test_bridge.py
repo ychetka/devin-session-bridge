@@ -297,7 +297,7 @@ def test_item07_gwt5_status_human_table(env, capsys):
     assert rc == ExitCode.OK
     table = capsys.readouterr().out
     header = next(line for line in table.splitlines() if "STATE" in line)
-    for col in ("SID", "REPO", "TASK", "STATE", "Q", "FAIL", "SEEN", "WAKE"):
+    for col in ("SID", "REPO", "TASK", "TSTAT", "STATE", "Q", "FAIL", "SEEN", "WAKE"):
         assert col in header
     # the pushed-but-never-registered session shows as a fleet row
     assert any(line.startswith("*s1") for line in table.splitlines())
@@ -346,7 +346,7 @@ def test_item21_gwt5_status_shows_wake_and_activity(env, capsys):
     assert db.get_task(tid, path=env.db) is not None
 
 
-def test_item23_tstat_shows_done_lifecycle_not_idle(env, capsys):
+def test_item23_gwt1_tstat_done_lifecycle_not_idle(env, capsys):
     """[ITEM-23.GWT-1] the live misread: latest task done, STATE=idle
     (session reading) but TSTAT shows done - the row disambiguates
     without inspect."""
@@ -364,7 +364,7 @@ def test_item23_tstat_shows_done_lifecycle_not_idle(env, capsys):
     assert " idle " in line  # STATE still reports the idle session
 
 
-def test_item23_tstat_queued_vs_done_disambiguation(env, capsys):
+def test_item23_gwt2_tstat_queued_vs_done_disambiguation(env, capsys):
     """[ITEM-23.GWT-2] TSTAT makes the lifecycle explicit on every row:
     queued stays queued in both cells, done no longer hides behind
     the STATE idle alias."""
@@ -376,12 +376,13 @@ def test_item23_tstat_queued_vs_done_disambiguation(env, capsys):
     # keep it queued through the status call - pump would otherwise
     # dispatch the queued task for the unmanaged session mid-view
     db.session_pause(SID, True, path=env.db)
+    # s2's task lands done: enqueue keeps the insert invariants, the
+    # update just jumps it to the terminal state - CLI claim/finish
+    # would dispatch mid-view for the unmanaged session
+    tid2 = _task(env, sid="s2")
     con = db.connect(env.db)
     try:
-        con.execute(
-            "INSERT INTO tasks(session_id,task_text,status,created_at,updated_at)"
-            " VALUES('s2','t','done',1,1)"
-        )
+        con.execute("UPDATE tasks SET status='done' WHERE id=?", (tid2,))
         con.commit()
     finally:
         con.close()
@@ -1247,7 +1248,7 @@ def test_item13e2_gwt2_healthy_fleet_compact_view(env, capsys):
     assert "daemon: running (pid " in text
     assert "orchestrator: orc1 active (hb " in text
     header = next(line for line in lines if "STATE" in line)
-    for col in ("SID", "REPO", "TASK", "STATE", "Q", "FAIL", "SEEN", "WAKE"):
+    for col in ("SID", "REPO", "TASK", "TSTAT", "STATE", "Q", "FAIL", "SEEN", "WAKE"):
         assert col in header
     # orchestrator sorts first, worker row carries task + budgets
     assert lines[lines.index(header) + 1].startswith("orc1")

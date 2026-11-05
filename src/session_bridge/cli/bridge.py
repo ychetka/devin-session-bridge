@@ -1328,7 +1328,9 @@ def _wake_cell(r) -> str:
 def _task_state_cell(r) -> str:
     """Compact lifecycle of the latest task for TSTAT (item_23)."""
     st = r.get("task_status")
-    return _TASK_STATE_CELL.get(st, "-") if st else "-"
+    if not st:
+        return "-"
+    return _TASK_STATE_CELL.get(st, _cut(st, 6))
 
 
 def _fleet_row_line(r) -> str:

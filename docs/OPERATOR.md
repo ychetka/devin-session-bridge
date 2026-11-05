@@ -594,7 +594,7 @@ Fleet table, one row per session:
 | `SID` | session id; a leading `*` marks a session that never registered (seen only through a pushed task). |
 | `REPO` | basename of the session `cwd`, else its title. |
 | `TASK` | `#<id> <label>` of the session's latest task (`-` when none). |
-| `TSTAT` | compact lifecycle of that latest task: `queued`, `disp` (= `dispatch_decided`), `run` (= `running`), `wait` (= `awaiting_user`), `done`, `fail`, `paus`; `-` when there is no task. Machine-readable equivalent: `task_status` in `--json` fleet rows. |
+| `TSTAT` | compact lifecycle of that latest task: `queued`, `disp` (= `dispatch_decided`), `run` (= `running`), `wait` (= `awaiting_user`), `done`, `fail` (= `failed`), `paus` (= `paused`); `-` when there is no task. Machine-readable equivalent: `task_status` in `--json` fleet rows. |
 | `STATE` | session-level reading: `dead` for a daemon-marked session; `idle` when nothing is running (a `done` task means idle - `TSTAT` carries the task's actual end state); otherwise the latest task's status - `queued`, `dispatch` (= `dispatch_decided`), `running`, `awaiting` (= `awaiting_user`), `paused`, `failed`. |
 | `Q` | questions asked on the task, `n/3` (`MAX_QUESTIONS_PER_TASK`). |
 | `FAIL` | task attempt counter, `n/2` (`MAX_ATTEMPTS`). |
