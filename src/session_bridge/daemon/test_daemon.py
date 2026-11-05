@@ -698,3 +698,141 @@ def test_item19_header_newlines_sanitized(env):
     head = daemon.relay_payload(row).split("\n\n", 1)[0]
     assert len([ln for ln in head.splitlines() if ln.startswith("from:")]) == 0
     assert "session_id: evil from: forged" in head.splitlines()
+
+
+# --- item_21: post-inject wake verification + durable streak --------------------
+
+
+def _managed_with_mail(env, sid=SID):
+    """A managed session, stale hb, mail in the fs queue = wake candidate."""
+    res = db.register(sid, "/repo/ws", path=env.db)
+    assert res.accepted
+    db.set_session_mode(sid, SessionMode.MANAGED, path=env.db)
+    _stale_heartbeat(env.db, sid)
+    nid = db.notify(sid, NotificationKind.DIRECTIVE, "steer", path=env.db)
+    db.mark_relayed(nid, path=env.db)
+
+
+def _fake_unconfirmed(env, monkeypatch, statuses):
+    """wake_session -> sent_unconfirmed; verify -> scripted statusEnum."""
+    monkeypatch.setattr(daemon, "wake_session", lambda *a, **k: "sent_unconfirmed")
+    monkeypatch.setattr(
+        daemon,
+        "verify_sessions",
+        lambda sids, **k: {s: statuses.get(s) for s in sids},
+    )
+
+
+def test_item21_gwt1_unconfirmed_then_busy_verifies(env, monkeypatch):
+    """[ITEM-21.GWT-1] unconfirmed + verify busy -> confirmed, streak reset."""
+    _managed_with_mail(env)
+    _fake_unconfirmed(env, monkeypatch, {SID: "working"})
+
+    assert daemon.run(env.db, env.qdir, once=True, notify_send=env.notifier) == daemon.RUN_OK
+
+    ws = db.get_wake_state(SID, path=env.db)
+    assert ws["last_outcome"] == "verified"
+    assert ws["unconfirmed_streak"] == 0
+    assert env.sent == []
+    assert any(d["event"] == "wake_verified" for d in _decisions(env))
+
+
+def test_item21_gwt2_unconfirmed_then_idle_grows_streak(env, monkeypatch):
+    """[ITEM-21.GWT-2] unconfirmed + verify still idle -> durable streak 1."""
+    _managed_with_mail(env)
+    _fake_unconfirmed(env, monkeypatch, {SID: "finished"})
+
+    assert daemon.run(env.db, env.qdir, once=True, notify_send=env.notifier) == daemon.RUN_OK
+
+    ws = db.get_wake_state(SID, path=env.db)
+    assert ws["last_outcome"] == "sent_unconfirmed"
+    assert ws["unconfirmed_streak"] == 1
+    assert env.sent == []
+    assert any(
+        d["event"] == "wake_unconfirmed" and "streak=1" in (d.get("detail") or "")
+        for d in _decisions(env)
+    )
+
+
+def test_item21_gwt3_streak_threshold_escalates_once(env, monkeypatch):
+    """[ITEM-21.GWT-3] streak hits N -> one notify-send, then silent."""
+    _managed_with_mail(env)
+    _fake_unconfirmed(env, monkeypatch, {SID: "finished"})
+    db.bump_wake_streak(SID, path=env.db)  # episode already at 2
+    db.bump_wake_streak(SID, path=env.db)
+
+    assert daemon.run(env.db, env.qdir, once=True, notify_send=env.notifier) == daemon.RUN_OK
+
+    ws = db.get_wake_state(SID, path=env.db)
+    assert ws["unconfirmed_streak"] == 3
+    assert ws["escalated"] == 1
+    assert len(env.sent) == 1
+    assert "WAKE UNCONFIRMED" in env.sent[0][0]
+    assert SID in env.sent[0][1]
+
+    # the streak keeps growing but the episode stays escalated-once
+    assert daemon.run(env.db, env.qdir, once=True, notify_send=env.notifier) == daemon.RUN_OK
+    assert len(env.sent) == 1
+    assert db.get_wake_state(SID, path=env.db)["unconfirmed_streak"] == 4
+
+
+def test_item21_gwt4_streak_survives_daemon_restart(env, monkeypatch):
+    """[ITEM-21.GWT-4] two run() calls = restart boundary; durable row keeps count."""
+    _managed_with_mail(env)
+    _fake_unconfirmed(env, monkeypatch, {SID: "finished"})
+
+    assert daemon.run(env.db, env.qdir, once=True) == daemon.RUN_OK
+    assert daemon.run(env.db, env.qdir, once=True) == daemon.RUN_OK
+
+    assert db.get_wake_state(SID, path=env.db)["unconfirmed_streak"] == 2
+
+
+def test_item21_verify_attach_failure_leaves_streak(env, monkeypatch):
+    """An unverifiable batch is not unconfirmed: streaks untouched."""
+    _managed_with_mail(env)
+    monkeypatch.setattr(daemon, "wake_session", lambda *a, **k: "sent_unconfirmed")
+
+    def boom(sids, **k):
+        raise daemon.WakeError("wake_host_down", "host gone")
+
+    monkeypatch.setattr(daemon, "verify_sessions", boom)
+
+    assert daemon.run(env.db, env.qdir, once=True, notify_send=env.notifier) == daemon.RUN_OK
+
+    ws = db.get_wake_state(SID, path=env.db)
+    assert ws["last_outcome"] == "sent_unconfirmed"
+    assert ws["unconfirmed_streak"] == 0
+    assert env.sent == []
+    assert any(d["event"] == "wake_verify_failed" for d in _decisions(env))
+
+
+def test_item21_confirmed_wake_skips_verification(env, monkeypatch):
+    """A fully sent wake needs no post-inject verify at all."""
+    _managed_with_mail(env)
+    monkeypatch.setattr(daemon, "wake_session", lambda *a, **k: "sent")
+    calls = []
+    monkeypatch.setattr(daemon, "verify_sessions", lambda *a, **k: calls.append(a))
+
+    assert daemon.run(env.db, env.qdir, once=True) == daemon.RUN_OK
+
+    assert calls == []
+    ws = db.get_wake_state(SID, path=env.db)
+    assert ws["last_outcome"] == "sent"
+    assert ws["unconfirmed_streak"] == 0
+
+
+def test_item21_alive_outcome_resets_escalated_episode(env, monkeypatch):
+    """A verified wake after an escalated streak opens a fresh episode."""
+    _managed_with_mail(env)
+    db.record_wake_outcome(SID, "sent_unconfirmed", path=env.db)
+    for _ in range(3):
+        db.bump_wake_streak(SID, path=env.db)
+    db.set_wake_escalated(SID, path=env.db)
+    _fake_unconfirmed(env, monkeypatch, {SID: "working"})
+
+    assert daemon.run(env.db, env.qdir, once=True, notify_send=env.notifier) == daemon.RUN_OK
+
+    ws = db.get_wake_state(SID, path=env.db)
+    assert ws["last_outcome"] == "verified"
+    assert ws["unconfirmed_streak"] == 0
+    assert ws["escalated"] == 0

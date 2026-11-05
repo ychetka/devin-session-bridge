@@ -33,6 +33,8 @@ from session_bridge.wake import (
     find_lockfile,
     nudge_text,
     pid_alive,
+    status_is_idle,
+    verify_sessions,
     wake_session,
 )
 
@@ -427,6 +429,42 @@ def test_wake_prompt_unconfirmed_still_reports():
 def test_nudge_text_mentions_sid_and_ack():
     text = nudge_text("abc-1")
     assert "abc-1" in text and "bridge ack" in text and "msg_" in text
+
+
+# --- verify_sessions (item_21) ---------------------------------------------------
+
+
+def test_verify_sessions_returns_status_map():
+    """One shared attach answers statusEnum for the whole batch."""
+    host = FakeAcpHost(
+        sessions=[
+            IDLE_SESSION,
+            {
+                "sessionId": "other",
+                "cwd": "/tmp/ws2",
+                "_meta": {"cognition.ai/statusEnum": "working"},
+            },
+        ]
+    )
+    out = verify_sessions([SID, "other", "ghost"], lock_data=host.lock_data())
+    assert out == {SID: "finished", "other": "working", "ghost": None}
+    # one attach, one session/list - not per-session attaches
+    assert host.methods().count("session/list") == 1
+
+
+def test_verify_sessions_attach_failure_is_wake_error():
+    """A dead host raises, it does not report fake idle statuses."""
+    host = FakeAcpHost(sessions=[IDLE_SESSION], hello_error="unauthorized")
+    with pytest.raises(WakeError) as exc:
+        verify_sessions([SID], lock_data=host.lock_data())
+    assert exc.value.reason == "unauthorized"
+
+
+def test_status_is_idle_values():
+    assert status_is_idle("finished")
+    assert status_is_idle("idle")
+    assert not status_is_idle("working")
+    assert not status_is_idle(None)
 
 
 # --- WakePolicy ----------------------------------------------------------------

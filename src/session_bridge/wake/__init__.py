@@ -12,6 +12,8 @@ from session_bridge.wake.acp_host import (
     find_lockfile,
     nudge_text,
     pid_alive,
+    status_is_idle,
+    verify_sessions,
     wake_session,
 )
 from session_bridge.wake.policy import WakePolicy
@@ -25,5 +27,7 @@ __all__ = [
     "find_lockfile",
     "nudge_text",
     "pid_alive",
+    "status_is_idle",
+    "verify_sessions",
     "wake_session",
 ]

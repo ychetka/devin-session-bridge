@@ -248,6 +248,19 @@ CREATE TABLE IF NOT EXISTS schedules (
 CREATE INDEX IF NOT EXISTS ix_schedules_due
   ON schedules(next_run_at) WHERE enabled=1;
 
+-- Durable wake-transport state per session (item_21): the last
+-- outcome the daemon recorded, the post-inject unconfirmed streak
+-- and the once-per-episode escalation flag. Survives daemon restarts
+-- - the in-memory WakePolicy pacing deliberately does not.
+CREATE TABLE IF NOT EXISTS wake_state (
+  session_id TEXT PRIMARY KEY,
+  last_outcome TEXT,
+  last_outcome_at INTEGER,
+  unconfirmed_streak INTEGER NOT NULL DEFAULT 0,
+  escalated INTEGER NOT NULL DEFAULT 0,
+  updated_at INTEGER NOT NULL
+);
+
 PRAGMA user_version=1;
 """
 
@@ -2147,6 +2160,129 @@ def ack_notifications(session_id: str, up_to_id: int | None = None, *, path=None
                 args.append(up_to_id)
             cur = con.execute(sql, args)
             return cur.rowcount
+        finally:
+            con.close()
+
+    return _retry(op)
+
+
+# --- wake transport state (item_21) ---------------------------------------------
+
+# Outcomes that prove the session is alive and turning - they reset
+# both the unconfirmed streak and the per-episode escalation flag.
+# "sent_unconfirmed" and "failed:<reason>" prove nothing either way
+# and leave both counters untouched.
+_WAKE_ALIVE_OUTCOMES = frozenset({"sent", "busy", "verified"})
+
+
+def record_wake_outcome(session_id: str, outcome: str, *, path=None) -> None:
+    """Upsert the session's last wake outcome.
+
+    A liveness-proving outcome (``sent``/``busy``/``verified``) resets
+    the unconfirmed streak and the escalation flag - a fresh episode
+    may escalate again. Any other outcome only refreshes the
+    last-outcome fields, preserving a streak already in flight.
+    """
+    ts = _now()
+    alive = 1 if outcome in _WAKE_ALIVE_OUTCOMES else 0
+
+    def op():
+        con = connect(path)
+        try:
+            con.execute(
+                "INSERT INTO wake_state"
+                "(session_id,last_outcome,last_outcome_at,"
+                " unconfirmed_streak,escalated,updated_at)"
+                " VALUES(?,?,?,0,0,?)"
+                " ON CONFLICT(session_id) DO UPDATE SET"
+                " last_outcome=excluded.last_outcome,"
+                " last_outcome_at=excluded.last_outcome_at,"
+                " updated_at=excluded.updated_at,"
+                " unconfirmed_streak=CASE WHEN ?=1 THEN 0"
+                "  ELSE unconfirmed_streak END,"
+                " escalated=CASE WHEN ?=1 THEN 0 ELSE escalated END",
+                (session_id, outcome, ts, ts, alive, alive),
+            )
+        finally:
+            con.close()
+
+    _retry(op)
+
+
+def bump_wake_streak(session_id: str, *, path=None) -> tuple[int, int]:
+    """unconfirmed_streak += 1 in one statement; returns (streak, escalated).
+
+    The daemon escalates once the streak crosses
+    WAKE_UNCONFIRMED_ESCALATE_STREAK while ``escalated`` is still 0 -
+    one notify-send per streak episode, not per pass.
+    """
+    ts = _now()
+
+    def op():
+        con = connect(path)
+        try:
+            con.execute(
+                "INSERT INTO wake_state"
+                "(session_id,unconfirmed_streak,escalated,updated_at)"
+                " VALUES(?,1,0,?)"
+                " ON CONFLICT(session_id) DO UPDATE SET"
+                " unconfirmed_streak=unconfirmed_streak+1,"
+                " updated_at=excluded.updated_at",
+                (session_id, ts),
+            )
+            row = con.execute(
+                "SELECT unconfirmed_streak, escalated FROM wake_state WHERE session_id=?",
+                (session_id,),
+            ).fetchone()
+            return int(row["unconfirmed_streak"]), int(row["escalated"])
+        finally:
+            con.close()
+
+    return _retry(op)
+
+
+def set_wake_escalated(session_id: str, *, path=None) -> None:
+    """Mark the human escalation sent for the current streak episode."""
+    ts = _now()
+
+    def op():
+        con = connect(path)
+        try:
+            con.execute(
+                "UPDATE wake_state SET escalated=1, updated_at=? WHERE session_id=?",
+                (ts, session_id),
+            )
+        finally:
+            con.close()
+
+    _retry(op)
+
+
+def get_wake_state(session_id: str, *, path=None):
+    """One wake_state row as a dict, or None when never recorded."""
+
+    def op():
+        con = connect(path)
+        try:
+            row = con.execute(
+                "SELECT * FROM wake_state WHERE session_id=?", (session_id,)
+            ).fetchone()
+            return dict(row) if row is not None else None
+        finally:
+            con.close()
+
+    return _retry(op)
+
+
+def list_wake_state(*, path=None) -> dict:
+    """All wake_state rows keyed by session_id - status/JSON snapshot."""
+
+    def op():
+        con = connect(path)
+        try:
+            return {
+                r["session_id"]: dict(r) for r in con.execute("SELECT * FROM wake_state").fetchall()
+            }
         finally:
             con.close()
 

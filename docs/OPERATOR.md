@@ -148,11 +148,21 @@ worker-only fleet shows `daemon: stopped` and `orchestrator: none`):
 $ bridge status
 daemon: running (pid 8123, hb 2s)
 orchestrator: <orc-sid> active (hb 14s)
-SID              REPO             TASK                 STATE       Q FAIL    HB
-<orc-sid>        ai_controller    -                    idle        -    -   14s
-<sid>            worker-repo      -                    idle        -    -   30s
+SID              REPO             TASK                 STATE       Q FAIL  SEEN WAKE
+<orc-sid>        ai_controller    -                    idle        -    -   14s sent
+<sid>            worker-repo      -                    idle        -    -   30s -
 24h: done 0 | auto-decisions 0 | escalations 0
 ```
+
+`SEEN` is the liveness cell: heartbeat age for unmanaged sessions,
+turn-activity recency for managed ones (the freshest of heartbeat,
+session/task updates and mailbox acks - a managed session between
+drain-mode turns is stale-hb by design, so bare heartbeat age would
+lie). `WAKE` shows the last recorded wake outcome (`sent`, `busy`,
+`verif`, `unc` = sent_unconfirmed) plus the unconfirmed streak
+(`uncx3`) and `!` once the human escalation fired. `--json` carries
+the full fields (`wake_outcome`, `wake_streak`, `wake_escalated`,
+`wake_age_seconds`, `activity_age_seconds`).
 
 ## Playbook 2 - start / restart the orchestrator
 
@@ -318,7 +328,9 @@ Daemon files in the state dir:
   per decision: `daemon_start`, `relayed`, `relay_error`,
   `orchestrator_dead`, `worker_dead`, `pass_error`, `lock_refused`,
   `daemon_stop`, `wake_sent`, `wake_skipped_busy`, `wake_failed`,
-  `wake_breaker_open`, `wake_pass_deadline`.
+  `wake_breaker_open`, `wake_pass_deadline`, `wake_verified`,
+  `wake_unconfirmed`, `wake_unconfirmed_escalated`,
+  `wake_verify_failed`.
 - `logs/daemon.log` - the detached daemon's stderr (decision lines are
   echoed there too).
 
@@ -403,6 +415,28 @@ serialized inside each process and the daemon is single-instance
 via its flock - a manual `bridge wake` could overlap a daemon
 attach, and the acp-host arbitrates concurrent clients (two short
 nudges at worst).
+
+Post-inject verification (item_21): a `sent_unconfirmed` wake only
+proves the prompt bytes were written, not that a turn opened - a
+closed tab or dead agent accepts the prompt into nothing while mail
+accumulates invisibly. After the candidate loop the daemon re-checks
+every unconfirmed session on one shared `session/list` attach:
+
+- statusEnum busy (`working`, ...) - the turn opened; the wake
+  records `verified`, the streak resets (`wake_verified` decision);
+- statusEnum still idle or the session absent - the durable
+  `wake_state.unconfirmed_streak` grows (`wake_unconfirmed`);
+- the verification attach itself fails - `wake_verify_failed`, every
+  streak untouched: unverified is never unconfirmed.
+
+The streak lives in the `wake_state` table, so a daemon restart
+keeps it - unlike the in-memory pacing streaks. Once the streak
+reaches `WAKE_UNCONFIRMED_ESCALATE_STREAK` (default 3) the daemon
+fires one `notify-send -u critical` per streak episode
+(`wake_unconfirmed_escalated` decision); the `escalated` flag in
+`wake_state` suppresses repeats until a live outcome opens a fresh
+episode. `bridge status` surfaces the outcome, streak and flag in
+the `WAKE` column and `--json` fleet rows.
 
 Security boundary: the lockfile token is a same-uid bearer
 credential - Devin writes `acp-host-*.lock` mode 0600 inside the

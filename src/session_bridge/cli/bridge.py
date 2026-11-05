@@ -1074,10 +1074,19 @@ def _status_snapshot(args) -> dict:
         srows = con.execute(
             "SELECT s.session_id AS sid, s.cwd AS cwd, s.title AS title,"
             " s.role AS role, s.mode AS mode, s.status AS status,"
-            " wh.last_seen_at AS seen"
+            " s.updated_at AS supdated,"
+            " wh.last_seen_at AS seen,"
+            " ws.last_outcome AS wake_outcome,"
+            " ws.unconfirmed_streak AS wake_streak,"
+            " ws.escalated AS wake_escalated,"
+            " ws.last_outcome_at AS wake_at,"
+            " (SELECT MAX(n.ack_at) FROM notifications n"
+            "   WHERE n.session_id=s.session_id) AS last_ack"
             " FROM sessions s"
             " LEFT JOIN worker_heartbeats wh"
             "   ON wh.session_id=s.session_id"
+            " LEFT JOIN wake_state ws"
+            "   ON ws.session_id=s.session_id"
             " ORDER BY s.session_id"
         ).fetchall()
         latest = {
@@ -1126,6 +1135,14 @@ def _status_snapshot(args) -> dict:
     orchestrator = None
     for r in srows:
         t = latest.pop(r["sid"], None)
+        # managed liveness (item_21): turn-activity recency - the
+        # freshest of heartbeat, session update, last ack and task
+        # update. Stale hb between drain-mode turns is by design, so
+        # heartbeat alone would report a working managed session dead.
+        act_sources = [r["seen"], r["supdated"], r["last_ack"]]
+        if t is not None:
+            act_sources.append(t["updated_at"])
+        activity = max((v for v in act_sources if v is not None), default=None)
         row = {
             "session_id": r["sid"],
             "registered": True,
@@ -1139,6 +1156,11 @@ def _status_snapshot(args) -> dict:
             "attempt": t["attempt"] if t is not None else None,
             "questions": qcounts.get(t["id"], 0) if t is not None else None,
             "heartbeat_age_seconds": _age(now, r["seen"]),
+            "activity_age_seconds": _age(now, activity),
+            "wake_outcome": r["wake_outcome"],
+            "wake_age_seconds": _age(now, r["wake_at"]),
+            "wake_streak": int(r["wake_streak"] or 0),
+            "wake_escalated": bool(r["wake_escalated"]),
         }
         row["state"] = _fleet_state(r["status"], t)
         fleet.append(row)
@@ -1159,6 +1181,11 @@ def _status_snapshot(args) -> dict:
             "attempt": t["attempt"],
             "questions": qcounts.get(t["id"], 0),
             "heartbeat_age_seconds": None,
+            "activity_age_seconds": None,
+            "wake_outcome": None,
+            "wake_age_seconds": None,
+            "wake_streak": 0,
+            "wake_escalated": False,
             "state": _fleet_state(None, t),
         }
         fleet.append(row)
@@ -1246,6 +1273,35 @@ def _attention_lines(snap) -> list[str]:
     return lines
 
 
+def _fleet_seen_age(r) -> int | None:
+    """The liveness cell: activity recency for managed, hb for unmanaged.
+
+    A managed drain-mode session is stale-hb between turns by design -
+    its turn-activity recency is the honest liveness metric (item_21).
+    """
+    if r["mode"] == SessionMode.MANAGED.value:
+        return r["activity_age_seconds"]
+    return r["heartbeat_age_seconds"]
+
+
+def _wake_cell(r) -> str:
+    """Compact last-wake cell: outcome, streak count, escalation mark."""
+    outcome = r.get("wake_outcome")
+    if not outcome:
+        return "-"
+    cell = {
+        "sent": "sent",
+        "busy": "busy",
+        "verified": "verif",
+        "sent_unconfirmed": "unc",
+    }.get(outcome, outcome[:5])
+    if r.get("wake_streak"):
+        cell += f"x{r['wake_streak']}"
+    if r.get("wake_escalated"):
+        cell += "!"
+    return _cut(cell, 7)
+
+
 def _fleet_row_line(r) -> str:
     # a leading "*" marks a session that never registered on the bus
     # (seen only through a pushed task)
@@ -1259,7 +1315,7 @@ def _fleet_row_line(r) -> str:
     return (
         f"{_cut(sid, 16):<16} {_cut(r['repo'], 16):<16} {_cut(task, 20):<20}"
         f" {_cut(r['state'], 8):<8} {q:>4} {fail:>4}"
-        f" {_fmt_age(r['heartbeat_age_seconds']):>5}"
+        f" {_fmt_age(_fleet_seen_age(r)):>5} {_wake_cell(r):<7}"
     )
 
 
@@ -1293,7 +1349,8 @@ def _render_status(snap) -> str:
         lines.append("(no active sessions)")
     else:
         lines.append(
-            f"{'SID':<16} {'REPO':<16} {'TASK':<20} {'STATE':<8} {'Q':>4} {'FAIL':>4} {'HB':>5}"
+            f"{'SID':<16} {'REPO':<16} {'TASK':<20} {'STATE':<8}"
+            f" {'Q':>4} {'FAIL':>4} {'SEEN':>5} {'WAKE':<7}"
         )
         # rows get what the budget leaves after banner + vitals +
         # header + the digest footer
