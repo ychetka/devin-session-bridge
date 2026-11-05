@@ -346,6 +346,57 @@ def test_item21_gwt5_status_shows_wake_and_activity(env, capsys):
     assert db.get_task(tid, path=env.db) is not None
 
 
+def test_item23_tstat_shows_done_lifecycle_not_idle(env, capsys):
+    """[ITEM-23.GWT-1] the live misread: latest task done, STATE=idle
+    (session reading) but TSTAT shows done - the row disambiguates
+    without inspect."""
+    res = db.register(SID, "/repo/ws", path=env.db)
+    assert res.accepted
+    db.set_session_mode(SID, SessionMode.MANAGED, path=env.db)
+    tid = _task(env)
+    assert _run(["claim", str(tid), "--session", SID, "--json"], capsys)[0] == ExitCode.OK
+    assert _run(["finish", str(tid), "--session", SID, "--json"], capsys)[0] == ExitCode.OK
+
+    rc = bridge.main(["status"])
+    assert rc == ExitCode.OK
+    line = next(ln for ln in capsys.readouterr().out.splitlines() if ln.startswith(SID))
+    assert " done " in line  # TSTAT
+    assert " idle " in line  # STATE still reports the idle session
+
+
+def test_item23_tstat_queued_vs_done_disambiguation(env, capsys):
+    """[ITEM-23.GWT-2] TSTAT makes the lifecycle explicit on every row:
+    queued stays queued in both cells, done no longer hides behind
+    the STATE idle alias."""
+    res = db.register(SID, "/repo/ws", path=env.db)
+    assert res.accepted
+    res2 = db.register("s2", "/repo/ws2", path=env.db)
+    assert res2.accepted
+    _task(env)  # queued, unclaimed for SID
+    # keep it queued through the status call - pump would otherwise
+    # dispatch the queued task for the unmanaged session mid-view
+    db.session_pause(SID, True, path=env.db)
+    con = db.connect(env.db)
+    try:
+        con.execute(
+            "INSERT INTO tasks(session_id,task_text,status,created_at,updated_at)"
+            " VALUES('s2','t','done',1,1)"
+        )
+        con.commit()
+    finally:
+        con.close()
+    rc = bridge.main(["status"])
+    assert rc == ExitCode.OK
+    lines = {
+        ln.split()[0]: ln
+        for ln in capsys.readouterr().out.splitlines()
+        if ln.startswith((SID, "s2"))
+    }
+    assert " queued " in lines[SID]
+    assert " done " in lines["s2"]
+    assert " idle " in lines["s2"]  # done still reads idle in STATE
+
+
 def test_item21_wake_cell_failed_reason_prefix():
     """failed:<reason> outcomes render compactly, not as 'faile'."""
     assert bridge._wake_cell({"wake_outcome": "failed:no_session"}) == "f:no_se"
