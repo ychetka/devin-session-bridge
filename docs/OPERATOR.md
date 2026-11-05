@@ -133,6 +133,17 @@ Storage layout (state dir = the directory holding `state.db`, default
    question goes through `bridge ask`; nobody answers a UI dialog
    and the turn would park forever.
 
+   External waits (item_22): a claim that never renews dies on
+   `lease expired` exactly like a dead worker - long PR-review or CI
+   waits burned leases silently. `bridge wait <id> --session <sid>
+   [--reason "<what>"]` is the claimer's out-of-band wait signal: a
+   lease-owner CAS (same guard as claim/finish) extends the lease by
+   one `LEASE_SECONDS` per call and lands the reason in the task
+   note. It is bounded on purpose - a dead claimer simply stops
+   renewing and the task requeues within one lease period. Repeat it
+   while the wait lasts; `claim` on an owned running task renews the
+   same way without a reason.
+
 6. Declare the repo's protected paths (e.g. `migrations/`, `auth/`,
    `.github/`) to the orchestrator in the task text or repo rules.
    There is no `bridge register` flag for this in the current CLI -

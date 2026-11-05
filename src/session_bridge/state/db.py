@@ -667,6 +667,42 @@ def renew_lease(task_id: int, owner: str, *, path=None) -> bool:
     return _retry(op)
 
 
+def wait_task(task_id: int, owner: str, note: str | None = None, *, path=None) -> bool:
+    """Claimer-side external-wait signal (item_22).
+
+    Same CAS guard as :func:`renew_lease` - only the session holding
+    the lease can declare the wait - but one explicit call instead of
+    an implicit re-claim heartbeat, so the reason can land in ``note``
+    for operator visibility. Bounded: a single call extends at most
+    one LEASE_SECONDS, so a dead worker stops renewing and the task
+    still requeues within one lease period.
+    """
+    ts = _now()
+
+    def op():
+        con = connect(path)
+        try:
+            cur = con.execute(
+                "UPDATE tasks SET lease_expires_at=?, lease_renewed_at=?,"
+                " note=COALESCE(?,note), updated_at=?"
+                " WHERE id=? AND status=? AND lease_owner=?",
+                (
+                    ts + LEASE_SECONDS,
+                    ts,
+                    note,
+                    ts,
+                    task_id,
+                    TaskStatus.RUNNING.value,
+                    owner,
+                ),
+            )
+            return cur.rowcount == 1
+        finally:
+            con.close()
+
+    return _retry(op)
+
+
 def release_lease(
     task_id: int,
     owner: str | None = None,

@@ -318,6 +318,12 @@ latency for a free input line.
      `bridge finish <task_id> --session {session_id}` (or
      `--fail --note "<why>"` on failure). Repeat `bridge claim`
      on long tasks to renew the lease.
+     EXTERNAL WAITS: while blocked on something out-of-band (CI, a
+     PR review, a partner consult, an orchestrator reply), call
+     `bridge wait <task_id> --session {session_id} --reason "<what>"`
+     periodically - it renews your lease and records WHY you are
+     parked. A claim that never renews dies on `lease expired`
+     exactly like a dead worker.
    - question_answer: apply the answer to your pending question.
      An "expired" notice means no answer arrived in time: the
      pending slot is free - re-ask via `bridge ask` or close the

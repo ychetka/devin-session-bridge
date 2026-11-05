@@ -1789,6 +1789,96 @@ def test_item18_gwt5_duty_text_instructs_claim_finish():
     assert "bridge finish <task_id> --session" in text
 
 
+# --- item_22: bridge wait (external-wait lease signal) ------------------------
+
+
+def test_item22_gwt1_wait_renews_own_lease_with_reason(env, capsys):
+    """[ITEM-22.GWT-1] wait on own running task extends the lease and
+    records the reason in the task note."""
+    db.set_session_mode(SID, SessionMode.MANAGED, path=env.db)
+    tid = _task(env)
+    assert _run(["claim", str(tid), "--session", SID, "--json"], capsys)[0] == ExitCode.OK
+    con = db.connect(env.db)
+    try:
+        con.execute("UPDATE tasks SET lease_expires_at=? WHERE id=?", (1, tid))
+        con.commit()
+    finally:
+        con.close()
+    rc, out = _run(
+        ["wait", str(tid), "--session", SID, "--reason", "PR review", "--json"],
+        capsys,
+    )
+    assert rc == ExitCode.OK
+    assert out["status"] == "running"
+    row = db.get_task(tid, path=env.db)
+    assert row["lease_expires_at"] > 1
+    assert row["note"] == "PR review"
+    assert row["lease_renewed_at"] is not None
+
+
+def test_item22_gwt2_wait_protects_task_from_recover_stale(env, capsys):
+    """[ITEM-22.GWT-2] an about-to-expire task whose claimer waits
+    survives recover_stale untouched (the live casualty shape:
+    long review rounds burning the lease)."""
+    db.set_session_mode(SID, SessionMode.MANAGED, path=env.db)
+    tid = _task(env)
+    assert _run(["claim", str(tid), "--session", SID, "--json"], capsys)[0] == ExitCode.OK
+    con = db.connect(env.db)
+    try:
+        con.execute("UPDATE tasks SET lease_expires_at=? WHERE id=?", (1, tid))
+        con.commit()
+    finally:
+        con.close()
+    assert _run(["wait", str(tid), "--session", SID, "--json"], capsys)[0] == ExitCode.OK
+    assert db.recover_stale(path=env.db) == []
+    assert db.get_task(tid, path=env.db)["status"] == TaskStatus.RUNNING.value
+
+
+def test_item22_gwt3_wait_refusals(env, capsys):
+    """[ITEM-22.GWT-3] wait refuses: foreign session, unmanaged claimer,
+    foreign lease owner, terminal task."""
+    db.set_session_mode(SID, SessionMode.MANAGED, path=env.db)
+    tid = _task(env)
+    rc, _ = _run(["wait", str(tid), "--session", "other-sid", "--json"], capsys)
+    assert rc == ExitCode.CONFLICT
+    rc, _ = _run(["wait", "9999", "--session", SID, "--json"], capsys)
+    assert rc == ExitCode.NOT_FOUND
+
+    assert _run(["claim", str(tid), "--session", SID, "--json"], capsys)[0] == ExitCode.OK
+    # foreign owner holds the lease now
+    con = db.connect(env.db)
+    try:
+        con.execute("UPDATE tasks SET lease_owner=? WHERE id=?", ("acp-9-1", tid))
+        con.commit()
+    finally:
+        con.close()
+    rc, out = _run(["wait", str(tid), "--session", SID, "--json"], capsys)
+    assert rc == ExitCode.CONFLICT
+    assert out["status"] == TaskStatus.RUNNING.value
+    # terminal task refuses
+    con = db.connect(env.db)
+    try:
+        con.execute(
+            "UPDATE tasks SET status=?, lease_owner=? WHERE id=?",
+            (TaskStatus.RUNNING.value, f"bridge-{SID}-{tid}", tid),
+        )
+        con.commit()
+    finally:
+        con.close()
+    assert _run(["finish", str(tid), "--session", SID, "--json"], capsys)[0] == ExitCode.OK
+    rc, _ = _run(["wait", str(tid), "--session", SID, "--json"], capsys)
+    assert rc == ExitCode.CONFLICT
+
+
+def test_item22_gwt4_duty_text_mandates_wait():
+    """[ITEM-22.GWT-4] the managed duty teaches the external-wait call."""
+    from session_bridge.mailbox.core import mailbox_duty_text
+
+    text = mailbox_duty_text("s1")
+    assert "bridge wait <task_id> --session" in text
+    assert "EXTERNAL WAITS" in text
+
+
 def test_item18_no_redispatch_after_ack(env, capsys):
     """[ITEM-18.regression] the reported storm: acked dispatch +
     unclaimed task must NOT re-notify - the task left queued."""
