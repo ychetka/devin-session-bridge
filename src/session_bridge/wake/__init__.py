@@ -8,10 +8,13 @@ from session_bridge.wake.acp_host import (
     ATTACH_LOCK,
     DEFAULT_AGENT_ID,
     DEFAULT_LOCK_DIR,
+    SESSION_ABSENT,
     WakeError,
     find_lockfile,
     nudge_text,
     pid_alive,
+    status_is_idle,
+    verify_sessions,
     wake_session,
 )
 from session_bridge.wake.policy import WakePolicy
@@ -20,10 +23,13 @@ __all__ = [
     "ATTACH_LOCK",
     "DEFAULT_AGENT_ID",
     "DEFAULT_LOCK_DIR",
+    "SESSION_ABSENT",
     "WakeError",
     "WakePolicy",
     "find_lockfile",
     "nudge_text",
     "pid_alive",
+    "status_is_idle",
+    "verify_sessions",
     "wake_session",
 ]

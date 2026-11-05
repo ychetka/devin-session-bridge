@@ -297,10 +297,81 @@ def test_item07_gwt5_status_human_table(env, capsys):
     assert rc == ExitCode.OK
     table = capsys.readouterr().out
     header = next(line for line in table.splitlines() if "STATE" in line)
-    for col in ("SID", "REPO", "TASK", "STATE", "Q", "FAIL", "HB"):
+    for col in ("SID", "REPO", "TASK", "STATE", "Q", "FAIL", "SEEN", "WAKE"):
         assert col in header
     # the pushed-but-never-registered session shows as a fleet row
     assert any(line.startswith("*s1") for line in table.splitlines())
+
+
+# --- item_21: status surfaces wake outcome + managed activity age --------------
+
+
+def test_item21_gwt5_status_shows_wake_and_activity(env, capsys):
+    """[ITEM-21.GWT-5] managed row: SEEN is activity recency, WAKE shows
+    the last outcome + streak; --json carries the raw fields."""
+    res = db.register(SID, "/repo/ws", path=env.db)
+    assert res.accepted
+    db.set_session_mode(SID, SessionMode.MANAGED, path=env.db)
+    # stale heartbeat - the metric the OLD cell would show - but a
+    # fresh task update: the session is demonstrably turning
+    db.heartbeat(SID, path=env.db)
+    stale = int(time.time()) - db.HEARTBEAT_STALE_SECONDS - 50
+    con = db.connect(env.db)
+    try:
+        con.execute(
+            "UPDATE worker_heartbeats SET last_seen_at=? WHERE session_id=?",
+            (stale, SID),
+        )
+        con.commit()
+    finally:
+        con.close()
+    tid = _task(env)
+    db.record_wake_outcome(SID, "sent_unconfirmed", path=env.db)
+    db.bump_wake_streak(SID, path=env.db)
+    db.bump_wake_streak(SID, path=env.db)
+
+    rc, out = _run(["status", "--json"], capsys)
+    assert rc == ExitCode.OK
+    row = next(r for r in out["data"]["fleet"] if r["session_id"] == SID)
+    assert row["wake_outcome"] == "sent_unconfirmed"
+    assert row["wake_streak"] == 2
+    assert row["heartbeat_age_seconds"] > db.HEARTBEAT_STALE_SECONDS
+    # task.updated_at is fresh, so the managed activity age is small
+    assert row["activity_age_seconds"] < row["heartbeat_age_seconds"]
+
+    rc = bridge.main(["status"])
+    assert rc == ExitCode.OK
+    line = next(ln for ln in capsys.readouterr().out.splitlines() if ln.startswith(SID))
+    assert "uncx2" in line
+    assert db.get_task(tid, path=env.db) is not None
+
+
+def test_item21_wake_cell_failed_reason_prefix():
+    """failed:<reason> outcomes render compactly, not as 'faile'."""
+    assert bridge._wake_cell({"wake_outcome": "failed:no_session"}) == "f:no_se"
+    assert bridge._wake_cell({"wake_outcome": "sent"}) == "sent"
+
+
+def test_item21_managed_orchestrator_vitals_uses_seen(env, capsys):
+    """A managed orchestrator's vitals line reports activity recency,
+    not the by-design-stale heartbeat."""
+    res = db.register("orc1", "/repo/ctl", role="orchestrator", path=env.db)
+    assert res.accepted
+    db.set_session_mode("orc1", SessionMode.MANAGED, path=env.db)
+    rc = bridge.main(["status"])
+    assert rc == ExitCode.OK
+    line = next(ln for ln in capsys.readouterr().out.splitlines() if ln.startswith("orchestrator:"))
+    assert "orc1 active (seen " in line
+
+
+def test_item21_unmanaged_keeps_heartbeat_age(env, capsys):
+    """Unmanaged rows still report bare heartbeat age in SEEN."""
+    res = db.register(SID, "/repo/ws", path=env.db)
+    assert res.accepted  # unmanaged by default
+    rc, out = _run(["status", "--json"], capsys)
+    assert rc == ExitCode.OK
+    row = next(r for r in out["data"]["fleet"] if r["session_id"] == SID)
+    assert row["mode"] == SessionMode.UNMANAGED.value
 
 
 # --- GWT-6: push on an unknown session -> not_found, task preserved -----------
@@ -1125,7 +1196,7 @@ def test_item13e2_gwt2_healthy_fleet_compact_view(env, capsys):
     assert "daemon: running (pid " in text
     assert "orchestrator: orc1 active (hb " in text
     header = next(line for line in lines if "STATE" in line)
-    for col in ("SID", "REPO", "TASK", "STATE", "Q", "FAIL", "HB"):
+    for col in ("SID", "REPO", "TASK", "STATE", "Q", "FAIL", "SEEN", "WAKE"):
         assert col in header
     # orchestrator sorts first, worker row carries task + budgets
     assert lines[lines.index(header) + 1].startswith("orc1")

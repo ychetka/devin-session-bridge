@@ -333,6 +333,12 @@ TURN_TTL_CYCLES: Final[int] = 10
 # Lifetime of the mailbox watcher inside one turn; bounds watcher
 # transcript growth only, independent of TURN_TTL_CYCLES.
 WATCHER_TTL_SECONDS: Final[int] = 7200
+# Consecutive post-inject verification failures (wake prompt written
+# but the session is still idle on the shared session/list re-check)
+# before the daemon escalates to the human once per streak episode
+# (item_21). The streak lives in the durable wake_state table - it
+# survives daemon restarts, unlike the in-memory pacing streak.
+WAKE_UNCONFIRMED_ESCALATE_STREAK: Final[int] = 3
 
 
 class QuestionState(str, Enum):

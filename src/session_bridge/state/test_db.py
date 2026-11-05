@@ -1878,3 +1878,45 @@ def test_item20_answered_expired_questions_do_not_protect(db_path):
     )
     _expire(db_path, tid)
     assert db.recover_stale(path=db_path) == [tid]
+
+
+# --- item_21: durable wake_state ------------------------------------------
+
+
+def test_item21_wake_state_outcome_lifecycle(db_path):
+    """record + bump + escalate + reset in one coherent episode."""
+    db.record_wake_outcome("s1", "sent_unconfirmed", path=db_path)
+    ws = db.get_wake_state("s1", path=db_path)
+    assert ws["last_outcome"] == "sent_unconfirmed"
+    assert ws["unconfirmed_streak"] == 0
+
+    assert db.bump_wake_streak("s1", path=db_path) == (1, 0)
+    assert db.bump_wake_streak("s1", path=db_path) == (2, 0)
+    db.set_wake_escalated("s1", path=db_path)
+    ws = db.get_wake_state("s1", path=db_path)
+    assert ws["escalated"] == 1
+
+    # a liveness-proving outcome closes the episode
+    db.record_wake_outcome("s1", "verified", path=db_path)
+    ws = db.get_wake_state("s1", path=db_path)
+    assert ws["last_outcome"] == "verified"
+    assert ws["unconfirmed_streak"] == 0
+    assert ws["escalated"] == 0
+
+
+def test_item21_wake_outcome_preserves_streak(db_path):
+    """Non-alive outcomes journal the outcome without touching the streak."""
+    db.bump_wake_streak("s1", path=db_path)
+    db.bump_wake_streak("s1", path=db_path)
+    db.record_wake_outcome("s1", "failed:timeout", path=db_path)
+    ws = db.get_wake_state("s1", path=db_path)
+    assert ws["last_outcome"] == "failed:timeout"
+    assert ws["unconfirmed_streak"] == 2
+
+
+def test_item21_list_wake_state(db_path):
+    db.record_wake_outcome("s1", "sent", path=db_path)
+    db.record_wake_outcome("s2", "sent_unconfirmed", path=db_path)
+    rows = db.list_wake_state(path=db_path)
+    assert set(rows) == {"s1", "s2"}
+    assert rows["s2"]["last_outcome"] == "sent_unconfirmed"

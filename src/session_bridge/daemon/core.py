@@ -50,12 +50,21 @@ import time
 from session_bridge.mailbox import write_message
 from session_bridge.state import db
 from session_bridge.state.contract import (
+    WAKE_UNCONFIRMED_ESCALATE_STREAK,
     NotificationKind,
     SessionMode,
     SessionRole,
     SessionStatus,
 )
-from session_bridge.wake import WakeError, WakePolicy, find_lockfile, wake_session
+from session_bridge.wake import (
+    SESSION_ABSENT,
+    WakeError,
+    WakePolicy,
+    find_lockfile,
+    status_is_idle,
+    verify_sessions,
+    wake_session,
+)
 
 __all__ = [
     "DECISION_LOG_FILENAME",
@@ -538,7 +547,7 @@ def _wake_candidates(db_path, now: int):
         con.close()
 
 
-def _wake_pass(db_path, state_directory, now: int, policy: WakePolicy) -> None:
+def _wake_pass(db_path, state_directory, now: int, policy: WakePolicy, notify=None) -> None:
     """Nudge idle managed sessions that have mail waiting (item_16).
 
     Runs after the relay pass so the same pass can already wake a
@@ -547,8 +556,17 @@ def _wake_pass(db_path, state_directory, now: int, policy: WakePolicy) -> None:
     mailbox stays the only data channel, so a lost or double wake is
     harmless. Pacing (per-session cooldown, per-host circuit breaker)
     lives in ``policy``; outcome events land in the decision log.
+
+    Post-inject verification (item_21): sessions whose wake returned
+    ``sent_unconfirmed`` are re-checked on one shared session/list
+    attach after the candidate loop. A session that turned busy proves
+    the nudge landed a turn; a still-idle one bumps the durable
+    wake_state streak, and a streak crossing
+    WAKE_UNCONFIRMED_ESCALATE_STREAK escalates to the human once per
+    episode via ``notify``.
     """
     deadline = time.monotonic() + _WAKE_PASS_DEADLINE_SECONDS
+    unverified: list[str] = []
     for row in _wake_candidates(db_path, now):
         if time.monotonic() >= deadline:
             _decision(
@@ -583,26 +601,11 @@ def _wake_pass(db_path, state_directory, now: int, policy: WakePolicy) -> None:
             if e.reason == "no_session":
                 streak = policy.record_no_session(sid)
                 if streak >= _NO_SESSION_DEAD_STREAK:
-                    # absent from session/list over enough attempts =
-                    # really gone (closed tab) - the managed dead path;
-                    # kills its live task like the unmanaged sweep does
-                    if db.set_session_status(sid, SessionStatus.DEAD, path=db_path):
-                        task = db.get_live_task(sid, path=db_path)
-                        outcome = "no live task"
-                        if task is not None:
-                            result = db.requeue_dead_worker(
-                                task["id"], note=requeue_note(task["id"]), path=db_path
-                            )
-                            outcome = (
-                                f"task={task['id']} -> {result.value if result else 'unchanged'}"
-                            )
-                        _decision(
-                            state_directory,
-                            "worker_dead",
-                            sid,
-                            f"reason=no_session_streak streak={streak} {outcome}",
-                        )
+                    _mark_dead_no_session(db_path, state_directory, sid, streak)
             _decision(state_directory, "wake_failed", sid, f"reason={e.reason} {e}")
+            # a failed wake proves nothing either way - journal it
+            # without touching the unconfirmed streak
+            db.record_wake_outcome(sid, f"failed:{e.reason}", path=db_path)
             if opened:
                 _decision(
                     state_directory,
@@ -614,14 +617,139 @@ def _wake_pass(db_path, state_directory, now: int, policy: WakePolicy) -> None:
         policy.record_session_seen(sid)
         if outcome == "busy":
             _decision(state_directory, "wake_skipped_busy", sid)
+            # a busy session is demonstrably turning - proof of life,
+            # resets any unconfirmed episode in flight
+            db.record_wake_outcome(sid, "busy", path=db_path)
+            policy.record_confirmed(sid)
             continue
+        db.record_wake_outcome(sid, outcome, path=db_path)
         if outcome == "sent_unconfirmed":
             # prompt written but unconfirmed - retry sooner than the
-            # full cooldown so a silently missed nudge self-heals
+            # full cooldown so a silently missed nudge self-heals;
+            # the post-pass verification decides the durable streak
+            unverified.append(sid)
             policy.record_retry_soon(sid)
         else:
             policy.record_confirmed(sid)
         _decision(state_directory, "wake_sent", sid, f"outcome={outcome}")
+
+    if unverified:
+        _verify_unconfirmed_wakes(db_path, state_directory, unverified, policy, notify)
+
+
+def _mark_dead_no_session(db_path, state_directory, sid, streak: int) -> None:
+    """no_session streak reached the dead threshold.
+
+    Absent from session/list over enough attempts = really gone
+    (closed tab) - the managed dead path; kills its live task like
+    the unmanaged sweep does.
+    """
+    if db.set_session_status(sid, SessionStatus.DEAD, path=db_path):
+        task = db.get_live_task(sid, path=db_path)
+        outcome = "no live task"
+        if task is not None:
+            result = db.requeue_dead_worker(task["id"], note=requeue_note(task["id"]), path=db_path)
+            outcome = f"task={task['id']} -> {result.value if result else 'unchanged'}"
+        _decision(
+            state_directory,
+            "worker_dead",
+            sid,
+            f"reason=no_session_streak streak={streak} {outcome}",
+        )
+
+
+# A fresh-enough ack watermark proves the drain turn ran even when the
+# re-check finds the session idle again - acks only move inside live
+# turns. Covers the "nudge landed, turn opened and closed before
+# verify" window a point-in-time statusEnum cannot see (item_21
+# review). Generous on purpose: a session that acked within the last
+# two minutes is demonstrably reachable.
+_VERIFY_ACK_GRACE_SECONDS = 120
+
+
+def _verify_status_label(status) -> str:
+    """Human-readable status for decision-log details - the raw
+    SESSION_ABSENT sentinel and bare None must not leak verbatim."""
+    if status == SESSION_ABSENT:
+        return "absent"
+    return status if status is not None else "none"
+
+
+def _verify_unconfirmed_wakes(db_path, state_directory, sids, policy, notify) -> None:
+    """Re-check ``sent_unconfirmed`` sessions on one shared attach.
+
+    One session/list answers for the whole batch (item_21): a session
+    that went busy since its nudge proves the prompt landed a turn -
+    durable outcome ``verified``, streak and escalation reset. A
+    still-idle or absent session grows its durable wake_state streak;
+    crossing WAKE_UNCONFIRMED_ESCALATE_STREAK notifies the human once
+    per episode (the ``escalated`` flag survives a daemon restart, so
+    it cannot re-notify after one). A failed verification attach
+    leaves every streak untouched - unverified is not unconfirmed.
+    """
+    lock_data = find_lockfile()
+    try:
+        statuses = verify_sessions(sids, lock_data=lock_data)
+    except WakeError as e:
+        _decision(
+            state_directory,
+            "wake_verify_failed",
+            detail=f"sessions={len(sids)} reason={e.reason} {e}",
+        )
+        return
+    now = int(time.time())
+    for sid in sids:
+        status = statuses.get(sid, SESSION_ABSENT)
+        absent = status == SESSION_ABSENT
+        # the ack watermark is read before the no_session accounting:
+        # a fresh ack proves a live drain turn even when session/list
+        # raced and reported the session absent (item_21 r3)
+        ack = db.last_ack_at(sid, path=db_path)
+        ack_fresh = ack is not None and now - int(ack) <= _VERIFY_ACK_GRACE_SECONDS
+        if absent and not ack_fresh:
+            # absent on the re-check is the same evidence as a failed
+            # session/list lookup: feed the no_session streak so a
+            # dead tab counts toward dead-marking (item_21 review)
+            ns_streak = policy.record_no_session(sid)
+            if ns_streak >= _NO_SESSION_DEAD_STREAK:
+                _mark_dead_no_session(db_path, state_directory, sid, ns_streak)
+                continue  # dead-marked - the unconfirmed bump is moot
+        else:
+            # listed (possibly statusless), or absent but provably
+            # live via a fresh ack - either way not no_session evidence
+            policy.record_session_seen(sid)
+        alive = ack_fresh or (not absent and status is not None and not status_is_idle(status))
+        if alive:
+            db.record_wake_outcome(sid, "verified", path=db_path)
+            policy.record_confirmed(sid)
+            _decision(
+                state_directory,
+                "wake_verified",
+                sid,
+                f"status={_verify_status_label(status)}",
+            )
+            continue
+        streak, escalated = db.bump_wake_streak(sid, path=db_path)
+        if streak >= WAKE_UNCONFIRMED_ESCALATE_STREAK and not escalated and notify is not None:
+            notify(
+                "sessions-bridge WAKE UNCONFIRMED",
+                f"{sid}: {streak} consecutive wakes left the session idle"
+                " - it may be unreachable (closed tab or dead agent)",
+            )
+            db.set_wake_escalated(sid, path=db_path)
+            _decision(
+                state_directory,
+                "wake_unconfirmed_escalated",
+                sid,
+                f"streak={streak} status={_verify_status_label(status)}",
+            )
+        else:
+            _decision(
+                state_directory,
+                "wake_unconfirmed",
+                sid,
+                f"streak={streak} status={_verify_status_label(status)}",
+            )
 
 
 def _question_janitor_pass(db_path, state_directory) -> None:
@@ -726,7 +854,7 @@ def run(
                 now = int(time.time())
                 _schedule_pass(db_path, state_directory, now)
                 _relay_pass(db_path, queue_dir, state_directory)
-                _wake_pass(db_path, state_directory, now, wake_policy)
+                _wake_pass(db_path, state_directory, now, wake_policy, notify)
                 _sweep_pass(db_path, state_directory, notify, now)
                 _question_janitor_pass(db_path, state_directory)
             except Exception as e:

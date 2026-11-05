@@ -60,10 +60,13 @@ __all__ = [
     "PROMPT_CONFIRM_SECONDS",
     "REPLAY_CAP",
     "REPLAY_TIMEOUT_SECONDS",
+    "SESSION_ABSENT",
     "WakeError",
     "find_lockfile",
     "nudge_text",
     "pid_alive",
+    "status_is_idle",
+    "verify_sessions",
     "wake_session",
 ]
 
@@ -100,6 +103,12 @@ PROMPT_CONFIRM_SECONDS = 15.0
 #: prompted". Anything else except an explicit idle value is treated
 #: conservatively as busy.
 _IDLE_STATUS = {"finished", "idle", "created"}
+
+#: verify_sessions marker for a sid missing from session/list -
+#: distinct from None, which means "listed but no statusEnum meta".
+#: The daemon dead-marks only on the absent marker; a statusless
+#: listing is unconfirmed evidence, not proof the session is gone.
+SESSION_ABSENT = "__absent__"
 
 _READ_CHUNK = 65536
 
@@ -267,11 +276,24 @@ def _session_status(entry: dict):
     return meta.get("cognition.ai/statusEnum")
 
 
+def status_is_idle(status: str | None) -> bool:
+    """True when a session/list statusEnum is an explicit idle value."""
+    return status in _IDLE_STATUS
+
+
 def _is_busy(entry: dict | None) -> bool:
     """Conservative busy check: only an explicit idle status wakes."""
     if entry is None:
         return True  # unknown session - do not inject blind
-    return _session_status(entry) not in _IDLE_STATUS
+    return not status_is_idle(_session_status(entry))
+
+
+def _initialize_params() -> dict:
+    return {
+        "protocolVersion": 1,
+        "clientCapabilities": {"fs": {"readTextFile": False, "writeTextFile": False}},
+        "clientInfo": {"name": "sessions-bridge-wake", "version": "0"},
+    }
 
 
 def _attach(lock_data: dict, agent_id: str):
@@ -351,16 +373,7 @@ def wake_session(
                 return _await_response(chan, req, timeout, cap)
 
             try:
-                call(
-                    "initialize",
-                    {
-                        "protocolVersion": 1,
-                        "clientCapabilities": {
-                            "fs": {"readTextFile": False, "writeTextFile": False}
-                        },
-                        "clientInfo": {"name": "sessions-bridge-wake", "version": "0"},
-                    },
-                )
+                call("initialize", _initialize_params())
                 chan.send({"jsonrpc": "2.0", "method": "initialized", "params": {}})
 
                 listing = call("session/list", {})
@@ -451,6 +464,66 @@ def wake_session(
                         raise WakeError("rpc_error", f"session/prompt: {detail}")
                     return "sent"
             return "sent_unconfirmed"
+        finally:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+
+def verify_sessions(
+    session_ids,
+    *,
+    lock_data: dict | None = None,
+    lock_dir: str | None = None,
+    agent_id: str = DEFAULT_AGENT_ID,
+) -> dict:
+    """One shared attach + session/list for a batch of sessions (item_21).
+
+    Post-inject verification: after a ``sent_unconfirmed`` wake the
+    daemon re-checks each session's statusEnum - a session that went
+    busy since the prompt proves the wake actually landed a turn; a
+    still-idle or statusless one grows the durable unconfirmed streak,
+    an absent one feeds the no_session dead-marking path instead.
+
+    Returns ``{sid: statusEnum|None|SESSION_ABSENT}`` - SESSION_ABSENT
+    means the sid was missing from session/list entirely (the daemon's
+    no_session dead-marking input); None means the session was listed
+    but carried no statusEnum meta. Raises WakeError on any attach
+    or protocol failure: the caller treats the whole batch as
+    unverified (streaks untouched), never as unconfirmed.
+    """
+    if lock_data is None:
+        lock_data = find_lockfile(lock_dir)
+    if lock_data is None:
+        raise WakeError("wake_host_down", "no acp-host lockfile found")
+
+    with ATTACH_LOCK:
+        chan = _attach(lock_data, agent_id)
+        sock = chan._sock
+        try:
+            req = 0
+
+            def call(method, params=None, timeout=_REQUEST_TIMEOUT, cap=256):
+                nonlocal req
+                req += 1
+                _rpc(chan, req, method, params)
+                return _await_response(chan, req, timeout, cap)
+
+            try:
+                call("initialize", _initialize_params())
+                chan.send({"jsonrpc": "2.0", "method": "initialized", "params": {}})
+                listing = call("session/list", {})
+            except WakeError as e:
+                # host-level failures before the list completes - the
+                # caller's breaker accounting relies on the mapping
+                if e.reason == "rpc_error":
+                    raise WakeError("attach_failed", str(e)) from e
+                raise
+            status_by_sid = {
+                item.get("sessionId"): _session_status(item) for item in listing.get("sessions", [])
+            }
+            return {sid: status_by_sid.get(sid, SESSION_ABSENT) for sid in session_ids}
         finally:
             try:
                 sock.close()
