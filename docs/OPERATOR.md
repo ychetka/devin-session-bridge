@@ -654,6 +654,7 @@ Global flags: `--db PATH` (`SESSIONS_BRIDGE_DB`), `--queue-dir DIR`
 | `bridge escalate show` | list open escalations. |
 | `bridge escalate reply <id> A\|B\|defer\|abort\|override:<text>` | resolve an escalation (see Playbook 3). |
 | `bridge daemon start\|stop\|status\|once\|run` | supervisor lifecycle (see above). |
+| `bridge --version` / `bridge version` | true deployed version + source path (item_102a): reads the checkout's pyproject.toml when running from a `src/` tree - editable installs carry stale dist-info and `pip show` lies. `--json` carries it under `data.version`. |
 
 ## Session heartbeats
 

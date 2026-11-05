@@ -43,6 +43,7 @@ due rows into regular queued tasks.
 """
 
 import argparse
+import importlib.metadata
 import json
 import os
 import re
@@ -53,6 +54,7 @@ import sys
 import tempfile
 import threading
 import time
+from pathlib import Path
 
 from session_bridge.acp.client import AcpClient
 from session_bridge.acp.contract import AcpError
@@ -2772,6 +2774,51 @@ def _add_json(sp: argparse.ArgumentParser) -> None:
     sp.add_argument("--json", action="store_true", help="emit the JsonResponse envelope")
 
 
+def _version_string() -> str:
+    """True deployed version (item_102a).
+
+    Editable installs carry stale dist-info (`pip show` said 0.2.7
+    while the checkout sat at v0.2.8), so when running out of a
+    ``src/`` tree the version is read from the repo's pyproject.toml;
+    packaged installs fall back to importlib.metadata. The source
+    path is always appended so the report is self-describing.
+    """
+    here = Path(__file__).resolve()
+    # src/session_bridge/cli/bridge.py -> repo root; guard the walk so
+    # an odd layout can never break parser construction for every command
+    pyproject = here.parents[3] / "pyproject.toml" if len(here.parents) > 3 else None
+    if pyproject is not None and "src" in here.parts and pyproject.is_file():
+        try:
+            in_project = False
+            for line in pyproject.read_text().splitlines():
+                line = line.strip()
+                if line.startswith("["):
+                    in_project = line == "[project]"
+                    continue
+                if in_project:
+                    m = re.fullmatch(r'version\s*=\s*"([^"]+)"', line)
+                    if m:
+                        return f"{m.group(1)} (editable, src: {pyproject.parent})"
+        except OSError:
+            pass
+    try:
+        ver = importlib.metadata.version("session-bridge")
+    except importlib.metadata.PackageNotFoundError:
+        ver = "unknown"
+    src_hint = here.parents[2] if len(here.parents) > 2 else here
+    return f"{ver} (src: {src_hint})"
+
+
+def _cmd_version(args) -> int:
+    ver = _version_string()
+    return _emit(
+        args,
+        JsonResponse(status="ok", data={"version": ver}),
+        ExitCode.OK,
+        human=f"session-bridge {ver}",
+    )
+
+
 def _parse_args(argv) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         prog="bridge",
@@ -2788,8 +2835,17 @@ def _parse_args(argv) -> argparse.Namespace:
         default=os.environ.get("SESSIONS_BRIDGE_QUEUE_DIR"),
         help="trigger directory (default: <state.db dir>/queue)",
     )
+    p.add_argument(
+        "--version",
+        action="version",
+        version=f"session-bridge {_version_string()}",
+        help="show the true deployed version and exit",
+    )
     _add_json(p)
     sub = p.add_subparsers(dest="command", required=True)
+
+    sp = sub.add_parser("version", help="show the true deployed version")
+    _add_json(sp)
 
     sp = sub.add_parser(Command.PUSH.value, help="enqueue a task")
     sp.add_argument("session_id")
@@ -3077,11 +3133,16 @@ _HANDLERS = {
     "questions": _cmd_questions,
     "escalate": _cmd_escalate,
     "schedule": _cmd_schedule,
+    "version": _cmd_version,
 }
 
 
 def main(argv=None) -> int:
     args = _parse_args(argv)
+    if args.command == "version":
+        # pure diagnostic: no state db init - a broken db must never
+        # block the deployed-version report (PR54 r1 warning)
+        return _cmd_version(args)
     try:
         db.init(args.db)
     except Exception as e:
