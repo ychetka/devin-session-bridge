@@ -511,15 +511,22 @@ _NO_SESSION_DEAD_STREAK = 3
 
 
 def _wake_candidates(db_path, now: int):
-    """Active managed sessions, heartbeat stale, with mail or live work.
+    """Active managed sessions the mailbox alone cannot reach, in two
+    legs.
 
-    These are the sessions the mailbox alone cannot reach: no turn is
-    open (heartbeat stale, or never heartbeated) while mail waits in
-    the fs queue, so the daemon gives them a nudge prompt through the
-    acp-host (item_16). A live task also qualifies (item_17): it keeps
-    the liveness probe - and thus no_session death detection - running
-    even when the outbox is empty. Dead sessions are excluded so a
-    no_session-marked session is not probed forever.
+    Stale-heartbeat leg (item_16/17): no turn is open (heartbeat stale
+    or never seen) while mail waits or a live task exists - the live
+    task keeps the liveness probe, and thus no_session death
+    detection, running even when the outbox is empty.
+
+    Actionable-mail leg (item_102c): any unacked relayed notification
+    with kind != heartbeat_tick qualifies whatever the heartbeat age -
+    a DRAIN session idle at the prompt opens no turn on its own, so
+    directives would sit until a human typed. heartbeat_tick alone
+    never qualifies a fresh-heartbeat session.
+
+    Dead sessions are excluded so a no_session-marked session is not
+    probed forever.
     """
     cutoff = now - db.HEARTBEAT_STALE_SECONDS
     con = db.connect(db_path)
@@ -529,19 +536,30 @@ def _wake_candidates(db_path, now: int):
             " FROM sessions s"
             " LEFT JOIN worker_heartbeats wh ON wh.session_id=s.session_id"
             " WHERE s.mode=? AND s.status='active'"
-            " AND (wh.last_seen_at IS NULL OR wh.last_seen_at<=?)"
-            " AND (EXISTS (SELECT 1 FROM notifications n"
-            "              WHERE n.session_id=s.session_id"
-            "                AND n.relayed_at IS NOT NULL"
-            "                AND n.ack_at IS NULL)"
+            " AND ((wh.last_seen_at IS NULL OR wh.last_seen_at<=?)"
+            "      AND (EXISTS (SELECT 1 FROM notifications n"
+            "                    WHERE n.session_id=s.session_id"
+            "                      AND n.relayed_at IS NOT NULL"
+            "                      AND n.ack_at IS NULL)"
             # a live task is also wake-worthy mail: it keeps liveness
             # probing (and thus no_session death detection) alive even
             # when the outbox is empty (item_17 review)
             "      OR EXISTS (SELECT 1 FROM tasks t"
             "                 WHERE t.session_id=s.session_id"
             "                   AND t.status IN ('queued','dispatch_decided',"
-            "                                    'running','awaiting_user')))",
-            (SessionMode.MANAGED.value, cutoff),
+            "                                    'running','awaiting_user')))"
+            # actionable mail (item_102c) wakes even a fresh-heartbeat
+            # DRAIN session: idle at the prompt it never opens a turn
+            # on its own, so the directive would sit until a human
+            # typed. heartbeat_tick alone stays non-waking here - its
+            # liveness-poke role only matters on the stale-hb path
+            # above. A busy session answers `busy` - harmless.
+            "      OR EXISTS (SELECT 1 FROM notifications n"
+            "                 WHERE n.session_id=s.session_id"
+            "                   AND n.relayed_at IS NOT NULL"
+            "                   AND n.ack_at IS NULL"
+            "                   AND n.kind != ?))",
+            (SessionMode.MANAGED.value, cutoff, NotificationKind.HEARTBEAT_TICK.value),
         ).fetchall()
     finally:
         con.close()

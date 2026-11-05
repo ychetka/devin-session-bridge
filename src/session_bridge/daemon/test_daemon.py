@@ -899,3 +899,87 @@ def test_item21_alive_outcome_resets_escalated_episode(env, monkeypatch):
     assert ws["last_outcome"] == "verified"
     assert ws["unconfirmed_streak"] == 0
     assert ws["escalated"] == 0
+
+
+# --- item_102c: actionable mail wakes fresh-heartbeat DRAIN sessions --------------
+
+
+def _wake_calls(env, monkeypatch):
+    """Record wake_session call sids; verify is a no-op (outcome 'sent')."""
+    calls = []
+    monkeypatch.setattr(daemon, "wake_session", lambda sid, *a, **k: calls.append(sid) or "sent")
+    monkeypatch.setattr(daemon, "verify_sessions", lambda sids, **k: {})
+    return calls
+
+
+def _managed_fresh(env, sid=SID):
+    """Managed session with a FRESH heartbeat - the DRAIN-idle-at-prompt
+    case: the session is alive at the UI but opens no turn on its own."""
+    res = db.register(sid, "/repo/ws", path=env.db)
+    assert res.accepted
+    db.set_session_mode(sid, SessionMode.MANAGED, path=env.db)
+    db.heartbeat(sid, path=env.db)
+
+
+def _unacked(env, sid, kind):
+    nid = db.notify(sid, kind, "body", path=env.db)
+    db.mark_relayed(nid, path=env.db)
+
+
+def test_item102c_gwt1_directive_wakes_fresh_hb_drain(env, monkeypatch):
+    """[ITEM-102C.GWT-1] fresh-hb managed session + unacked directive ->
+    wake candidate (the live DRAIN defect)."""
+    _managed_fresh(env)
+    _unacked(env, SID, NotificationKind.DIRECTIVE)
+    calls = _wake_calls(env, monkeypatch)
+
+    assert daemon.run(env.db, env.qdir, once=True, notify_send=env.notifier) == daemon.RUN_OK
+    assert calls == [SID]
+
+
+def test_item102c_gwt2_tick_alone_does_not_wake_fresh_hb(env, monkeypatch):
+    """[ITEM-102C.GWT-2] fresh-hb session + only a heartbeat_tick ->
+    not a candidate: the tick is a liveness poke, not actionable mail."""
+    _managed_fresh(env)
+    _unacked(env, SID, NotificationKind.HEARTBEAT_TICK)
+    calls = _wake_calls(env, monkeypatch)
+
+    assert daemon.run(env.db, env.qdir, once=True, notify_send=env.notifier) == daemon.RUN_OK
+    assert calls == []
+
+
+def test_item102c_gwt3_live_task_alone_keeps_fresh_hb_calm(env, monkeypatch):
+    """[ITEM-102C.GWT-3] fresh-hb session + a live task but no mail ->
+    not a candidate: the task path is a stale-hb liveness probe only."""
+    _managed_fresh(env)
+    db.enqueue(SID, "do the thing", path=env.db)
+    calls = _wake_calls(env, monkeypatch)
+
+    assert daemon.run(env.db, env.qdir, once=True, notify_send=env.notifier) == daemon.RUN_OK
+    assert calls == []
+
+
+def test_item102c_gwt4_tick_still_wakes_stale_hb(env, monkeypatch):
+    """[ITEM-102C.GWT-4] stale-hb session + only a heartbeat_tick ->
+    still a candidate: the liveness probe path is unchanged."""
+    res = db.register(SID, "/repo/ws", path=env.db)
+    assert res.accepted
+    db.set_session_mode(SID, SessionMode.MANAGED, path=env.db)
+    _stale_heartbeat(env.db, SID)
+    _unacked(env, SID, NotificationKind.HEARTBEAT_TICK)
+    calls = _wake_calls(env, monkeypatch)
+
+    assert daemon.run(env.db, env.qdir, once=True, notify_send=env.notifier) == daemon.RUN_OK
+    assert calls == [SID]
+
+
+def test_item102c_gwt5_acked_actionable_mail_does_not_rewake(env, monkeypatch):
+    """[ITEM-102C.GWT-5] fresh-hb session whose actionable mail is
+    already acked -> not a candidate: the re-wake loop boundary."""
+    _managed_fresh(env)
+    _unacked(env, SID, NotificationKind.DIRECTIVE)
+    db.ack_notifications(SID, path=env.db)
+    calls = _wake_calls(env, monkeypatch)
+
+    assert daemon.run(env.db, env.qdir, once=True, notify_send=env.notifier) == daemon.RUN_OK
+    assert calls == []
