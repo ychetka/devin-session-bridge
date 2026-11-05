@@ -1244,8 +1244,12 @@ def _status_snapshot(args) -> dict:
             "orchestrator": {
                 "session_id": orchestrator["session_id"] if orchestrator else None,
                 "status": orchestrator["session_status"] if orchestrator else None,
+                "mode": orchestrator["mode"] if orchestrator else None,
                 "heartbeat_age_seconds": (
                     orchestrator["heartbeat_age_seconds"] if orchestrator else None
+                ),
+                "activity_age_seconds": (
+                    orchestrator["activity_age_seconds"] if orchestrator else None
                 ),
             },
         },
@@ -1289,12 +1293,15 @@ def _wake_cell(r) -> str:
     outcome = r.get("wake_outcome")
     if not outcome:
         return "-"
-    cell = {
-        "sent": "sent",
-        "busy": "busy",
-        "verified": "verif",
-        "sent_unconfirmed": "unc",
-    }.get(outcome, outcome[:5])
+    if outcome.startswith("failed:"):
+        cell = "f:" + outcome[7:11]
+    else:
+        cell = {
+            "sent": "sent",
+            "busy": "busy",
+            "verified": "verif",
+            "sent_unconfirmed": "unc",
+        }.get(outcome, outcome[:5])
     if r.get("wake_streak"):
         cell += f"x{r['wake_streak']}"
     if r.get("wake_escalated"):
@@ -1340,10 +1347,14 @@ def _render_status(snap) -> str:
     if o["session_id"] is None:
         lines.append("orchestrator: none")
     else:
-        lines.append(
-            f"orchestrator: {o['session_id']} {o['status']}"
-            f" (hb {_fmt_age(o['heartbeat_age_seconds'])})"
-        )
+        # managed orchestrators idle between drain turns are stale-hb
+        # by design - report turn-activity recency like the fleet's
+        # SEEN column does (item_21 review)
+        if o.get("mode") == SessionMode.MANAGED.value:
+            seen, label = o["activity_age_seconds"], "seen"
+        else:
+            seen, label = o["heartbeat_age_seconds"], "hb"
+        lines.append(f"orchestrator: {o['session_id']} {o['status']} ({label} {_fmt_age(seen)})")
     fleet = snap["fleet"]
     if not fleet:
         lines.append("(no active sessions)")

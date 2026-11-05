@@ -2289,6 +2289,29 @@ def list_wake_state(*, path=None) -> dict:
     return _retry(op)
 
 
+def last_ack_at(session_id: str, *, path=None):
+    """Newest ``notifications.ack_at`` for the session, or None.
+
+    The drain watermark is turn evidence: an ack can only move inside
+    a live session turn, so the wake verification uses its freshness
+    to tell "nudge never landed" apart from "turn opened, drained and
+    closed before the statusEnum re-check" (item_21 review).
+    """
+
+    def op():
+        con = connect(path)
+        try:
+            row = con.execute(
+                "SELECT MAX(ack_at) AS a FROM notifications WHERE session_id=?",
+                (session_id,),
+            ).fetchone()
+            return row["a"]
+        finally:
+            con.close()
+
+    return _retry(op)
+
+
 # --- recurring schedules (item_14, schema v3) ----------------------------------
 
 

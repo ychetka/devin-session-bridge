@@ -346,6 +346,24 @@ def test_item21_gwt5_status_shows_wake_and_activity(env, capsys):
     assert db.get_task(tid, path=env.db) is not None
 
 
+def test_item21_wake_cell_failed_reason_prefix():
+    """failed:<reason> outcomes render compactly, not as 'faile'."""
+    assert bridge._wake_cell({"wake_outcome": "failed:no_session"}) == "f:no_s"
+    assert bridge._wake_cell({"wake_outcome": "sent"}) == "sent"
+
+
+def test_item21_managed_orchestrator_vitals_uses_seen(env, capsys):
+    """A managed orchestrator's vitals line reports activity recency,
+    not the by-design-stale heartbeat."""
+    res = db.register("orc1", "/repo/ctl", role="orchestrator", path=env.db)
+    assert res.accepted
+    db.set_session_mode("orc1", SessionMode.MANAGED, path=env.db)
+    rc = bridge.main(["status"])
+    assert rc == ExitCode.OK
+    line = next(ln for ln in capsys.readouterr().out.splitlines() if ln.startswith("orchestrator:"))
+    assert "orc1 active (seen " in line
+
+
 def test_item21_unmanaged_keeps_heartbeat_age(env, capsys):
     """Unmanaged rows still report bare heartbeat age in SEEN."""
     res = db.register(SID, "/repo/ws", path=env.db)

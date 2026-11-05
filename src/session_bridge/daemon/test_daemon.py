@@ -821,6 +821,35 @@ def test_item21_confirmed_wake_skips_verification(env, monkeypatch):
     assert ws["unconfirmed_streak"] == 0
 
 
+def test_item21_fresh_ack_proves_turn_despite_idle_status(env, monkeypatch):
+    """Review fix: a fast drain turn closes before verify - the ack
+    watermark is the turn evidence statusEnum can no longer show."""
+    _managed_with_mail(env)
+    db.ack_notifications(SID, path=env.db)  # watermark just moved
+    # a fresh unacked mail keeps the session wake-worthy
+    nid2 = db.notify(SID, NotificationKind.DIRECTIVE, "new mail", path=env.db)
+    db.mark_relayed(nid2, path=env.db)
+    _fake_unconfirmed(env, monkeypatch, {SID: "finished"})
+
+    assert daemon.run(env.db, env.qdir, once=True, notify_send=env.notifier) == daemon.RUN_OK
+
+    ws = db.get_wake_state(SID, path=env.db)
+    assert ws["last_outcome"] == "verified"
+    assert ws["unconfirmed_streak"] == 0
+    assert env.sent == []
+
+
+def test_item21_absent_on_verify_feeds_no_session_streak(env, monkeypatch):
+    """Review fix: absent on the re-check counts toward dead-marking,
+    same as a failed session/list lookup."""
+    _managed_with_mail(env)
+    monkeypatch.setattr(daemon, "verify_sessions", lambda sids, **k: dict.fromkeys(sids))
+    policy = daemon.WakePolicy()
+    for _ in range(daemon._NO_SESSION_DEAD_STREAK):
+        daemon._verify_unconfirmed_wakes(env.db, env.sdir, [SID], policy, None)
+    assert db.get_session(SID, path=env.db)["status"] == SessionStatus.DEAD.value
+
+
 def test_item21_alive_outcome_resets_escalated_episode(env, monkeypatch):
     """A verified wake after an escalated streak opens a fresh episode."""
     _managed_with_mail(env)

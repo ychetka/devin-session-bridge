@@ -600,25 +600,7 @@ def _wake_pass(db_path, state_directory, now: int, policy: WakePolicy, notify=No
             if e.reason == "no_session":
                 streak = policy.record_no_session(sid)
                 if streak >= _NO_SESSION_DEAD_STREAK:
-                    # absent from session/list over enough attempts =
-                    # really gone (closed tab) - the managed dead path;
-                    # kills its live task like the unmanaged sweep does
-                    if db.set_session_status(sid, SessionStatus.DEAD, path=db_path):
-                        task = db.get_live_task(sid, path=db_path)
-                        outcome = "no live task"
-                        if task is not None:
-                            result = db.requeue_dead_worker(
-                                task["id"], note=requeue_note(task["id"]), path=db_path
-                            )
-                            outcome = (
-                                f"task={task['id']} -> {result.value if result else 'unchanged'}"
-                            )
-                        _decision(
-                            state_directory,
-                            "worker_dead",
-                            sid,
-                            f"reason=no_session_streak streak={streak} {outcome}",
-                        )
+                    _mark_dead_no_session(db_path, state_directory, sid, streak)
             _decision(state_directory, "wake_failed", sid, f"reason={e.reason} {e}")
             # a failed wake proves nothing either way - journal it
             # without touching the unconfirmed streak
@@ -654,6 +636,36 @@ def _wake_pass(db_path, state_directory, now: int, policy: WakePolicy, notify=No
         _verify_unconfirmed_wakes(db_path, state_directory, unverified, policy, notify)
 
 
+def _mark_dead_no_session(db_path, state_directory, sid, streak: int) -> None:
+    """no_session streak reached the dead threshold.
+
+    Absent from session/list over enough attempts = really gone
+    (closed tab) - the managed dead path; kills its live task like
+    the unmanaged sweep does.
+    """
+    if db.set_session_status(sid, SessionStatus.DEAD, path=db_path):
+        task = db.get_live_task(sid, path=db_path)
+        outcome = "no live task"
+        if task is not None:
+            result = db.requeue_dead_worker(task["id"], note=requeue_note(task["id"]), path=db_path)
+            outcome = f"task={task['id']} -> {result.value if result else 'unchanged'}"
+        _decision(
+            state_directory,
+            "worker_dead",
+            sid,
+            f"reason=no_session_streak streak={streak} {outcome}",
+        )
+
+
+# A fresh-enough ack watermark proves the drain turn ran even when the
+# re-check finds the session idle again - acks only move inside live
+# turns. Covers the "nudge landed, turn opened and closed before
+# verify" window a point-in-time statusEnum cannot see (item_21
+# review). Generous on purpose: a session that acked within the last
+# two minutes is demonstrably reachable.
+_VERIFY_ACK_GRACE_SECONDS = 120
+
+
 def _verify_unconfirmed_wakes(db_path, state_directory, sids, policy, notify) -> None:
     """Re-check ``sent_unconfirmed`` sessions on one shared attach.
 
@@ -676,12 +688,36 @@ def _verify_unconfirmed_wakes(db_path, state_directory, sids, policy, notify) ->
             detail=f"sessions={len(sids)} reason={e.reason} {e}",
         )
         return
+    now = int(time.time())
     for sid in sids:
         status = statuses.get(sid)
-        if status is not None and not status_is_idle(status):
+        if status is None:
+            # absent on the re-check is the same evidence as a failed
+            # session/list lookup: feed the no_session streak so a
+            # dead tab counts toward dead-marking (item_21 review)
+            ns_streak = policy.record_no_session(sid)
+            if ns_streak >= _NO_SESSION_DEAD_STREAK:
+                _mark_dead_no_session(db_path, state_directory, sid, ns_streak)
+                continue  # dead-marked - the unconfirmed bump is moot
+        else:
+            policy.record_session_seen(sid)
+        alive = status is not None and not status_is_idle(status)
+        if not alive:
+            # idle on the list, but a fresh ack watermark is equally
+            # strong turn evidence: the drain turn opened and closed
+            # before this re-check
+            ack = db.last_ack_at(sid, path=db_path)
+            if ack is not None and now - int(ack) <= _VERIFY_ACK_GRACE_SECONDS:
+                alive = True
+        if alive:
             db.record_wake_outcome(sid, "verified", path=db_path)
             policy.record_confirmed(sid)
-            _decision(state_directory, "wake_verified", sid, f"status={status}")
+            _decision(
+                state_directory,
+                "wake_verified",
+                sid,
+                f"status={status if status is not None else 'ack'}",
+            )
             continue
         streak, escalated = db.bump_wake_streak(sid, path=db_path)
         if streak >= WAKE_UNCONFIRMED_ESCALATE_STREAK and not escalated and notify is not None:
