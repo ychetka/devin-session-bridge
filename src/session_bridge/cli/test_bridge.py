@@ -10,6 +10,7 @@ tmp_path via ``SESSIONS_BRIDGE_DB``.
 import io
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -396,6 +397,40 @@ def test_item23_gwt2_tstat_queued_vs_done_disambiguation(env, capsys):
     assert " queued " in lines[SID]
     assert " done " in lines["s2"]
     assert " idle " in lines["s2"]  # done still reads idle in STATE
+
+
+def test_item102a_gwt1_version_reports_checkout_version(env, capsys):
+    """[ITEM-102A.GWT-1] `bridge version` reports the pyproject version
+    of the source checkout (stale dist-info is bypassed) plus the
+    source path; --version flag and --json agree."""
+    rc = bridge.main(["version"])
+    assert rc == ExitCode.OK
+    out = capsys.readouterr().out
+    assert "session-bridge" in out
+    assert "(editable, src: " in out
+    # the version must match the repo's pyproject, not dist-info
+    pyproject = Path(bridge.__file__).resolve().parents[3] / "pyproject.toml"
+    ver = next(
+        re.fullmatch(r'version\s*=\s*"([^"]+)"', ln.strip()).group(1)
+        for ln in pyproject.read_text().splitlines()
+        if re.fullmatch(r'version\s*=\s*"([^"]+)"', ln.strip())
+    )
+    assert ver in out
+    rc, outj = _run(["version", "--json"], capsys)
+    assert rc == ExitCode.OK
+    assert outj["data"]["version"].startswith(ver)
+
+
+def test_item102a_gwt2_version_flag(capsys):
+    """[ITEM-102A.GWT-2] `bridge --version` exits 0 without needing a
+    subcommand or a state db."""
+    try:
+        bridge.main(["--version"])
+    except SystemExit as e:
+        assert e.code == 0
+    out = capsys.readouterr().out
+    assert "session-bridge" in out
+    assert "editable" in out or "src:" in out
 
 
 def test_item21_wake_cell_failed_reason_prefix():
