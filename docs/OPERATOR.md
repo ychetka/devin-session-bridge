@@ -360,13 +360,19 @@ Each pass (~5s, with up to ~1s startup jitter):
    `queue/<sid>/msg_<id>.txt` file (atomic write), then `relayed_at`
    is CAS-marked. Delivery is at-least-once; consumers dedup by
    notification id.
-2. Wake: managed+armed sessions with a stale heartbeat (or none) and
-   either unacked relayed mail or a live task get a nudge prompt
-   through the acp-host wake transport (see below) - this is what
-   closes the delivery loop for idle sessions, and the live-task leg
-   keeps the liveness probe running so a managed session's death is
-   still detected when its outbox is empty. A session mid-turn is
-   never prompted. Dead sessions are not candidates.
+2. Wake: managed+armed sessions get a nudge prompt through the
+   acp-host wake transport (see below) when either (a) their
+   heartbeat is stale (or absent) and they carry unacked relayed
+   mail or a live task - this closes the delivery loop for idle
+   sessions, and the live-task leg keeps the liveness probe running
+   so a managed session's death is still detected when its outbox is
+   empty - or (b) any unacked actionable mail
+   (kind != `heartbeat_tick`) waits, whatever the heartbeat age
+   (item_102c): a DRAIN session idle at the prompt never opens a turn
+   on its own, so directives and answers would otherwise sit until a
+   human typed. A `heartbeat_tick` alone never wakes a
+   fresh-heartbeat session. A session mid-turn is never prompted.
+   Dead sessions are not candidates.
 3. Sweep: **unmanaged** sessions whose `worker_heartbeats.last_seen_at`
    is older than `HEARTBEAT_STALE_SECONDS` (120s) flip to
    `status='dead'`. Managed sessions are excluded: between turns a

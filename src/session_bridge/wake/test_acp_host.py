@@ -581,12 +581,17 @@ def test_item16_gwt2_missing_lockfile(env, tmp_path, monkeypatch):
 
 
 def test_item16_gwt3_fresh_heartbeat_no_wake(env, tmp_path, monkeypatch):
-    """[ITEM-16.GWT-3] fresh heartbeat -> no attach attempted."""
+    """[ITEM-16.GWT-3] fresh heartbeat -> no attach attempted.
+
+    item_102c narrowed the guarantee: actionable mail now wakes a
+    fresh-heartbeat DRAIN session, so this test seeds only a
+    heartbeat_tick - the kind that must never wake on its own."""
     host = FakeAcpHost(sessions=[IDLE_SESSION])
     _lockdir(tmp_path, host, monkeypatch)
     _session(env.db, SID, managed=True)
     _heartbeat(env.db, SID, age=10)  # fresh
-    _relayed_mail(env.db, SID)
+    nid = db.notify(SID, NotificationKind.HEARTBEAT_TICK, "tick", path=env.db)
+    db.mark_relayed(nid, path=env.db)
 
     daemon._wake_pass(env.db, env.sdir, int(time.time()), WakePolicy())
 

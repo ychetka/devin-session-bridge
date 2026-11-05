@@ -529,19 +529,30 @@ def _wake_candidates(db_path, now: int):
             " FROM sessions s"
             " LEFT JOIN worker_heartbeats wh ON wh.session_id=s.session_id"
             " WHERE s.mode=? AND s.status='active'"
-            " AND (wh.last_seen_at IS NULL OR wh.last_seen_at<=?)"
-            " AND (EXISTS (SELECT 1 FROM notifications n"
-            "              WHERE n.session_id=s.session_id"
-            "                AND n.relayed_at IS NOT NULL"
-            "                AND n.ack_at IS NULL)"
+            " AND ((wh.last_seen_at IS NULL OR wh.last_seen_at<=?)"
+            "      AND (EXISTS (SELECT 1 FROM notifications n"
+            "                    WHERE n.session_id=s.session_id"
+            "                      AND n.relayed_at IS NOT NULL"
+            "                      AND n.ack_at IS NULL)"
             # a live task is also wake-worthy mail: it keeps liveness
             # probing (and thus no_session death detection) alive even
             # when the outbox is empty (item_17 review)
             "      OR EXISTS (SELECT 1 FROM tasks t"
             "                 WHERE t.session_id=s.session_id"
             "                   AND t.status IN ('queued','dispatch_decided',"
-            "                                    'running','awaiting_user')))",
-            (SessionMode.MANAGED.value, cutoff),
+            "                                    'running','awaiting_user')))"
+            # actionable mail (item_102c) wakes even a fresh-heartbeat
+            # DRAIN session: idle at the prompt it never opens a turn
+            # on its own, so the directive would sit until a human
+            # typed. heartbeat_tick alone stays non-waking here - its
+            # liveness-poke role only matters on the stale-hb path
+            # above. A busy session answers `busy` - harmless.
+            "      OR EXISTS (SELECT 1 FROM notifications n"
+            "                 WHERE n.session_id=s.session_id"
+            "                   AND n.relayed_at IS NOT NULL"
+            "                   AND n.ack_at IS NULL"
+            "                   AND n.kind != ?))",
+            (SessionMode.MANAGED.value, cutoff, NotificationKind.HEARTBEAT_TICK.value),
         ).fetchall()
     finally:
         con.close()
