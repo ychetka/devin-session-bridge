@@ -854,6 +854,25 @@ def test_item21_absent_on_verify_feeds_no_session_streak(env, monkeypatch):
     assert db.get_session(SID, path=env.db)["status"] == SessionStatus.DEAD.value
 
 
+def test_item21_absent_with_fresh_ack_is_live_not_dead(env, monkeypatch):
+    """A fresh ack proves the turn ran even when session/list raced and
+    reported the session absent - no_session must not accumulate
+    against a provably-live session (item_21 r3)."""
+    _managed_with_mail(env)
+    db.ack_notifications(SID, path=env.db)
+    monkeypatch.setattr(
+        daemon,
+        "verify_sessions",
+        lambda sids, **k: dict.fromkeys(sids, daemon.SESSION_ABSENT),
+    )
+    policy = daemon.WakePolicy()
+    for _ in range(daemon._NO_SESSION_DEAD_STREAK + 1):
+        daemon._verify_unconfirmed_wakes(env.db, env.sdir, [SID], policy, None)
+    ws = db.get_wake_state(SID, path=env.db)
+    assert ws["last_outcome"] == "verified"
+    assert db.get_session(SID, path=env.db)["status"] == SessionStatus.ACTIVE.value
+
+
 def test_item21_statusless_listing_is_unconfirmed_not_absent(env, monkeypatch):
     """A session listed without statusEnum meta grows the unconfirmed
     streak but must never feed no_session dead-marking (item_21 r2)."""

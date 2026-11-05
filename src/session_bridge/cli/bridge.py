@@ -1074,7 +1074,6 @@ def _status_snapshot(args) -> dict:
         srows = con.execute(
             "SELECT s.session_id AS sid, s.cwd AS cwd, s.title AS title,"
             " s.role AS role, s.mode AS mode, s.status AS status,"
-            " s.updated_at AS supdated,"
             " wh.last_seen_at AS seen,"
             " ws.last_outcome AS wake_outcome,"
             " ws.unconfirmed_streak AS wake_streak,"

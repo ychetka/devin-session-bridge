@@ -667,6 +667,14 @@ def _mark_dead_no_session(db_path, state_directory, sid, streak: int) -> None:
 _VERIFY_ACK_GRACE_SECONDS = 120
 
 
+def _verify_status_label(status) -> str:
+    """Human-readable status for decision-log details - the raw
+    SESSION_ABSENT sentinel and bare None must not leak verbatim."""
+    if status == SESSION_ABSENT:
+        return "absent"
+    return status if status is not None else "none"
+
+
 def _verify_unconfirmed_wakes(db_path, state_directory, sids, policy, notify) -> None:
     """Re-check ``sent_unconfirmed`` sessions on one shared attach.
 
@@ -692,7 +700,13 @@ def _verify_unconfirmed_wakes(db_path, state_directory, sids, policy, notify) ->
     now = int(time.time())
     for sid in sids:
         status = statuses.get(sid, SESSION_ABSENT)
-        if status == SESSION_ABSENT:
+        absent = status == SESSION_ABSENT
+        # the ack watermark is read before the no_session accounting:
+        # a fresh ack proves a live drain turn even when session/list
+        # raced and reported the session absent (item_21 r3)
+        ack = db.last_ack_at(sid, path=db_path)
+        ack_fresh = ack is not None and now - int(ack) <= _VERIFY_ACK_GRACE_SECONDS
+        if absent and not ack_fresh:
             # absent on the re-check is the same evidence as a failed
             # session/list lookup: feed the no_session streak so a
             # dead tab counts toward dead-marking (item_21 review)
@@ -701,17 +715,10 @@ def _verify_unconfirmed_wakes(db_path, state_directory, sids, policy, notify) ->
                 _mark_dead_no_session(db_path, state_directory, sid, ns_streak)
                 continue  # dead-marked - the unconfirmed bump is moot
         else:
-            # listed but possibly statusless (None) - present evidence,
-            # never dead-mark input
+            # listed (possibly statusless), or absent but provably
+            # live via a fresh ack - either way not no_session evidence
             policy.record_session_seen(sid)
-        alive = status is not None and status != SESSION_ABSENT and not status_is_idle(status)
-        if not alive:
-            # idle on the list, but a fresh ack watermark is equally
-            # strong turn evidence: the drain turn opened and closed
-            # before this re-check
-            ack = db.last_ack_at(sid, path=db_path)
-            if ack is not None and now - int(ack) <= _VERIFY_ACK_GRACE_SECONDS:
-                alive = True
+        alive = ack_fresh or (not absent and status is not None and not status_is_idle(status))
         if alive:
             db.record_wake_outcome(sid, "verified", path=db_path)
             policy.record_confirmed(sid)
@@ -719,7 +726,7 @@ def _verify_unconfirmed_wakes(db_path, state_directory, sids, policy, notify) ->
                 state_directory,
                 "wake_verified",
                 sid,
-                f"status={status if status is not None else 'ack'}",
+                f"status={_verify_status_label(status)}",
             )
             continue
         streak, escalated = db.bump_wake_streak(sid, path=db_path)
@@ -734,14 +741,14 @@ def _verify_unconfirmed_wakes(db_path, state_directory, sids, policy, notify) ->
                 state_directory,
                 "wake_unconfirmed_escalated",
                 sid,
-                f"streak={streak} status={status}",
+                f"streak={streak} status={_verify_status_label(status)}",
             )
         else:
             _decision(
                 state_directory,
                 "wake_unconfirmed",
                 sid,
-                f"streak={streak} status={status}",
+                f"streak={streak} status={_verify_status_label(status)}",
             )
 
 
