@@ -2784,28 +2784,38 @@ def _version_string() -> str:
     path is always appended so the report is self-describing.
     """
     here = Path(__file__).resolve()
-    pyproject = here.parents[3] / "pyproject.toml"  # src/session_bridge/cli/bridge.py
-    if "src" in here.parts and pyproject.is_file():
+    # src/session_bridge/cli/bridge.py -> repo root; guard the walk so
+    # an odd layout can never break parser construction for every command
+    pyproject = here.parents[3] / "pyproject.toml" if len(here.parents) > 3 else None
+    if pyproject is not None and "src" in here.parts and pyproject.is_file():
         try:
+            in_project = False
             for line in pyproject.read_text().splitlines():
-                m = re.fullmatch(r'version\s*=\s*"([^"]+)"', line.strip())
-                if m:
-                    return f"{m.group(1)} (editable, src: {pyproject.parent})"
+                line = line.strip()
+                if line.startswith("["):
+                    in_project = line == "[project]"
+                    continue
+                if in_project:
+                    m = re.fullmatch(r'version\s*=\s*"([^"]+)"', line)
+                    if m:
+                        return f"{m.group(1)} (editable, src: {pyproject.parent})"
         except OSError:
             pass
     try:
         ver = importlib.metadata.version("session-bridge")
     except importlib.metadata.PackageNotFoundError:
         ver = "unknown"
-    return f"{ver} (src: {here.parents[2]})"
+    src_hint = here.parents[2] if len(here.parents) > 2 else here
+    return f"{ver} (src: {src_hint})"
 
 
 def _cmd_version(args) -> int:
+    ver = _version_string()
     return _emit(
         args,
-        JsonResponse(status="ok", data={"version": _version_string()}),
+        JsonResponse(status="ok", data={"version": ver}),
         ExitCode.OK,
-        human=f"session-bridge {_version_string()}",
+        human=f"session-bridge {ver}",
     )
 
 
@@ -3129,6 +3139,10 @@ _HANDLERS = {
 
 def main(argv=None) -> int:
     args = _parse_args(argv)
+    if args.command == "version":
+        # pure diagnostic: no state db init - a broken db must never
+        # block the deployed-version report (PR54 r1 warning)
+        return _cmd_version(args)
     try:
         db.init(args.db)
     except Exception as e:
