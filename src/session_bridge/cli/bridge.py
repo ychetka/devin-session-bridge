@@ -1014,6 +1014,20 @@ _FLEET_STATE_ALIAS = {
     TaskStatus.AWAITING_USER.value: "awaiting",
 }
 
+#: compact lifecycle cells for the TSTAT column (item_23): STATE
+#: alone was ambiguous - a done task and a never-claimed queued one
+#: both read "idle", so the orchestrator could not tell "worker idle
+#: after finishing" from "task not picked up" without inspect.
+_TASK_STATE_CELL = {
+    TaskStatus.QUEUED.value: "queued",
+    TaskStatus.DISPATCH_DECIDED.value: "disp",
+    TaskStatus.RUNNING.value: "run",
+    TaskStatus.AWAITING_USER.value: "wait",
+    TaskStatus.DONE.value: "done",
+    TaskStatus.FAILED.value: "fail",
+    TaskStatus.PAUSED.value: "paus",
+}
+
 
 def _age(now: int, ts):
     """Whole seconds between ``ts`` and ``now``; None when unknown."""
@@ -1311,6 +1325,14 @@ def _wake_cell(r) -> str:
     return _cut(cell, 7)
 
 
+def _task_state_cell(r) -> str:
+    """Compact lifecycle of the latest task for TSTAT (item_23)."""
+    st = r.get("task_status")
+    if not st:
+        return "-"
+    return _TASK_STATE_CELL.get(st, _cut(st, 6))
+
+
 def _fleet_row_line(r) -> str:
     # a leading "*" marks a session that never registered on the bus
     # (seen only through a pushed task)
@@ -1323,7 +1345,7 @@ def _fleet_row_line(r) -> str:
     fail = "-" if r["attempt"] is None else f"{r['attempt']}/{MAX_ATTEMPTS}"
     return (
         f"{_cut(sid, 16):<16} {_cut(r['repo'], 16):<16} {_cut(task, 20):<20}"
-        f" {_cut(r['state'], 8):<8} {q:>4} {fail:>4}"
+        f" {_task_state_cell(r):<6} {_cut(r['state'], 8):<8} {q:>4} {fail:>4}"
         f" {_fmt_age(_fleet_seen_age(r)):>5} {_wake_cell(r):<7}"
     )
 
@@ -1362,7 +1384,7 @@ def _render_status(snap) -> str:
         lines.append("(no active sessions)")
     else:
         lines.append(
-            f"{'SID':<16} {'REPO':<16} {'TASK':<20} {'STATE':<8}"
+            f"{'SID':<16} {'REPO':<16} {'TASK':<20} {'TSTAT':<6} {'STATE':<8}"
             f" {'Q':>4} {'FAIL':>4} {'SEEN':>5} {'WAKE':<7}"
         )
         # rows get what the budget leaves after banner + vitals +

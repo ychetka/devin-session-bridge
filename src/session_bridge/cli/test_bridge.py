@@ -297,7 +297,7 @@ def test_item07_gwt5_status_human_table(env, capsys):
     assert rc == ExitCode.OK
     table = capsys.readouterr().out
     header = next(line for line in table.splitlines() if "STATE" in line)
-    for col in ("SID", "REPO", "TASK", "STATE", "Q", "FAIL", "SEEN", "WAKE"):
+    for col in ("SID", "REPO", "TASK", "TSTAT", "STATE", "Q", "FAIL", "SEEN", "WAKE"):
         assert col in header
     # the pushed-but-never-registered session shows as a fleet row
     assert any(line.startswith("*s1") for line in table.splitlines())
@@ -344,6 +344,58 @@ def test_item21_gwt5_status_shows_wake_and_activity(env, capsys):
     line = next(ln for ln in capsys.readouterr().out.splitlines() if ln.startswith(SID))
     assert "uncx2" in line
     assert db.get_task(tid, path=env.db) is not None
+
+
+def test_item23_gwt1_tstat_done_lifecycle_not_idle(env, capsys):
+    """[ITEM-23.GWT-1] the live misread: latest task done, STATE=idle
+    (session reading) but TSTAT shows done - the row disambiguates
+    without inspect."""
+    res = db.register(SID, "/repo/ws", path=env.db)
+    assert res.accepted
+    db.set_session_mode(SID, SessionMode.MANAGED, path=env.db)
+    tid = _task(env)
+    assert _run(["claim", str(tid), "--session", SID, "--json"], capsys)[0] == ExitCode.OK
+    assert _run(["finish", str(tid), "--session", SID, "--json"], capsys)[0] == ExitCode.OK
+
+    rc = bridge.main(["status"])
+    assert rc == ExitCode.OK
+    line = next(ln for ln in capsys.readouterr().out.splitlines() if ln.startswith(SID))
+    assert " done " in line  # TSTAT
+    assert " idle " in line  # STATE still reports the idle session
+
+
+def test_item23_gwt2_tstat_queued_vs_done_disambiguation(env, capsys):
+    """[ITEM-23.GWT-2] TSTAT makes the lifecycle explicit on every row:
+    queued stays queued in both cells, done no longer hides behind
+    the STATE idle alias."""
+    res = db.register(SID, "/repo/ws", path=env.db)
+    assert res.accepted
+    res2 = db.register("s2", "/repo/ws2", path=env.db)
+    assert res2.accepted
+    _task(env)  # queued, unclaimed for SID
+    # keep it queued through the status call - pump would otherwise
+    # dispatch the queued task for the unmanaged session mid-view
+    db.session_pause(SID, True, path=env.db)
+    # s2's task lands done: enqueue keeps the insert invariants, the
+    # update just jumps it to the terminal state - CLI claim/finish
+    # would dispatch mid-view for the unmanaged session
+    tid2 = _task(env, sid="s2")
+    con = db.connect(env.db)
+    try:
+        con.execute("UPDATE tasks SET status='done' WHERE id=?", (tid2,))
+        con.commit()
+    finally:
+        con.close()
+    rc = bridge.main(["status"])
+    assert rc == ExitCode.OK
+    lines = {
+        ln.split()[0]: ln
+        for ln in capsys.readouterr().out.splitlines()
+        if ln.startswith((SID, "s2"))
+    }
+    assert " queued " in lines[SID]
+    assert " done " in lines["s2"]
+    assert " idle " in lines["s2"]  # done still reads idle in STATE
 
 
 def test_item21_wake_cell_failed_reason_prefix():
@@ -1196,7 +1248,7 @@ def test_item13e2_gwt2_healthy_fleet_compact_view(env, capsys):
     assert "daemon: running (pid " in text
     assert "orchestrator: orc1 active (hb " in text
     header = next(line for line in lines if "STATE" in line)
-    for col in ("SID", "REPO", "TASK", "STATE", "Q", "FAIL", "SEEN", "WAKE"):
+    for col in ("SID", "REPO", "TASK", "TSTAT", "STATE", "Q", "FAIL", "SEEN", "WAKE"):
         assert col in header
     # orchestrator sorts first, worker row carries task + budgets
     assert lines[lines.index(header) + 1].startswith("orc1")

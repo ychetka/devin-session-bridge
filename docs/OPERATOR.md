@@ -159,11 +159,20 @@ worker-only fleet shows `daemon: stopped` and `orchestrator: none`):
 $ bridge status
 daemon: running (pid 8123, hb 2s)
 orchestrator: <orc-sid> active (hb 14s)
-SID              REPO             TASK                 STATE       Q FAIL  SEEN WAKE
-<orc-sid>        ai_controller    -                    idle        -    -   14s sent
-<sid>            worker-repo      -                    idle        -    -   30s -
+SID              REPO             TASK                 TSTAT  STATE       Q FAIL  SEEN WAKE
+<orc-sid>        ai_controller    -                    -      idle        -    -   14s sent
+<sid>            worker-repo      #7 fix flaky test    run    running   0/3  0/2   30s -
 24h: done 0 | auto-decisions 0 | escalations 0
 ```
+
+`TSTAT` is the lifecycle of the session's latest task (`queued`,
+`disp` = dispatch_decided, `run`, `wait` = awaiting_user, `done`,
+`fail`, `paus`); `-` when there is no task. `STATE` is the session
+reading: `dead` for a daemon-marked session, `idle` when nothing is
+running (a `done` task still reads `idle` - check `TSTAT` for the
+task's actual end state), otherwise the task status. The two columns
+together separate "worker idle after finishing" (`done` + `idle`)
+from "task not picked up" (`queued` + `queued`).
 
 `SEEN` is the liveness cell: heartbeat age for unmanaged sessions,
 turn-activity recency for managed ones (the freshest of heartbeat,
@@ -553,9 +562,9 @@ ESCALATED #12: destructive_ops - reply: bridge escalate reply 12 A|B|defer|abort
 ORCHESTRATOR DEAD: reopen session, bridge register --role orchestrator [--force]
 daemon: running (pid 8123, hb 2s)
 orchestrator: <orc-sid> active (hb 14s)
-SID              REPO             TASK                 STATE       Q FAIL    HB
-<orc-sid>        ai_controller    -                    idle        -    -   14s
-worker-bee       devin-telegram   #7 fix flaky test    running   1/3  0/2   30s
+SID              REPO             TASK                 TSTAT  STATE       Q FAIL  SEEN WAKE
+<orc-sid>        ai_controller    -                    -      idle        -    -   14s -
+worker-bee       devin-telegram   #7 fix flaky test    run    running   1/3  0/2   30s -
 24h: done 5 | auto-decisions 12 | escalations 1
 ```
 
@@ -585,10 +594,12 @@ Fleet table, one row per session:
 | `SID` | session id; a leading `*` marks a session that never registered (seen only through a pushed task). |
 | `REPO` | basename of the session `cwd`, else its title. |
 | `TASK` | `#<id> <label>` of the session's latest task (`-` when none). |
-| `STATE` | `dead` for a daemon-marked session; `idle` when there is no live task (a `done` task means idle); otherwise the latest task's status - `queued`, `dispatch` (= `dispatch_decided`), `running`, `awaiting` (= `awaiting_user`), `paused`, `failed`. |
+| `TSTAT` | compact lifecycle of that latest task: `queued`, `disp` (= `dispatch_decided`), `run` (= `running`), `wait` (= `awaiting_user`), `done`, `fail` (= `failed`), `paus` (= `paused`); `-` when there is no task. Machine-readable equivalent: `task_status` in `--json` fleet rows. |
+| `STATE` | session-level reading: `dead` for a daemon-marked session; `idle` when nothing is running (a `done` task means idle - `TSTAT` carries the task's actual end state); otherwise the latest task's status - `queued`, `dispatch` (= `dispatch_decided`), `running`, `awaiting` (= `awaiting_user`), `paused`, `failed`. |
 | `Q` | questions asked on the task, `n/3` (`MAX_QUESTIONS_PER_TASK`). |
 | `FAIL` | task attempt counter, `n/2` (`MAX_ATTEMPTS`). |
-| `HB` | seconds since the session's last heartbeat stamp (`-` when none). |
+| `SEEN` | liveness age: heartbeat age for unmanaged sessions, turn-activity recency for managed ones (`-` when none). |
+| `WAKE` | last recorded wake outcome plus unconfirmed streak / escalation flag (`-` when never woken). |
 
 Footer digest (rolling 24h): `24h: done X | auto-decisions Y |
 escalations Z` - tasks finished, DELIBERATION audit rows written,
