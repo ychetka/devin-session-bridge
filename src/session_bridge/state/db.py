@@ -1608,10 +1608,18 @@ def heartbeat(session_id: str, *, path=None) -> int:
     bumps the generation on every call, per the contract: a caller
     holding an older generation detects it has been superseded.
 
-    A heartbeat is authoritative liveness, so it also revives a
-    sessions row the supervisor marked dead (item_122): a
-    dead-flagged session that provably heartbeats clears its own
-    latch instead of staying dead until a manual re-register.
+    A heartbeat is authoritative liveness for UNMANAGED sessions -
+    stale hb is their dead-marking signal - so a heartbeat also
+    revives their sessions row (item_122): a dead-flagged session
+    that provably heartbeats clears its own latch instead of staying
+    dead until a manual re-register. Managed rows are deliberately
+    excluded: their dead verdict comes from the no_session streak
+    (absent from session/list), which a heartbeat cannot refute -
+    and the DRAIN observer-shell heartbeat loop could outlive the
+    session itself, so reviving managed rows here would create a
+    revive/re-dead flap that requeues the live task to terminal
+    failure. A wrongly dead-marked managed session recovers through
+    ``register``, which no observer shell ever emits.
     """
     ts = _now()
 
@@ -1620,12 +1628,16 @@ def heartbeat(session_id: str, *, path=None) -> int:
         try:
             row = con.execute(_HEARTBEAT_UPSERT, (session_id, ts)).fetchone()
             con.execute(
-                "UPDATE sessions SET status=?, updated_at=? WHERE session_id=? AND status=?",
+                "UPDATE sessions SET status=?, updated_at=?"
+                " WHERE session_id=? AND status=?"
+                "  AND COALESCE(mode,?)<>?",
                 (
                     SessionStatus.ACTIVE.value,
                     ts,
                     session_id,
                     SessionStatus.DEAD.value,
+                    SessionMode.UNMANAGED.value,
+                    SessionMode.MANAGED.value,
                 ),
             )
             return int(row["generation"])

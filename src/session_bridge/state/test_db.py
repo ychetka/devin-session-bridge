@@ -1980,11 +1980,32 @@ def test_item122_gwt3_heartbeat_revives_dead_latch(db_path):
 
 
 def test_item122_gwt4_worker_heartbeat_also_revives(db_path):
-    """[ITEM-122.GWT-4] revival is not orchestrator-only: any session
-    whose process provably heartbeats was never really gone - the
-    row mirrors register()'s revive-on-sighting semantics."""
+    """[ITEM-122.GWT-4] revival is not orchestrator-only: any unmanaged
+    session whose process provably heartbeats was never really gone -
+    the row mirrors register()'s revive-on-sighting semantics."""
     res = db.register("w1", "/repo", path=db_path)
     assert res.accepted
     assert db.set_session_status("w1", "dead", path=db_path)
     db.heartbeat("w1", path=db_path)
     assert db.get_session("w1", path=db_path)["status"] == "active"
+
+
+def test_item122_gwt5_managed_heartbeat_does_not_revive(db_path):
+    """[ITEM-122.GWT-5] a MANAGED dead row stays dead on heartbeat:
+    its verdict comes from the no_session streak, which a heartbeat
+    cannot refute - and an observer-shell heartbeat loop outliving
+    the session would otherwise drive a revive/re-dead flap that
+    requeues the live task to terminal failure (review finding).
+    Recovery for managed sessions goes through register()."""
+    res = db.register("m1", "/repo", path=db_path)
+    assert res.accepted
+    db.set_session_mode("m1", "managed", path=db_path)
+    assert db.set_session_status("m1", "dead", path=db_path)
+    db.heartbeat("m1", path=db_path)
+    assert db.get_session("m1", path=db_path)["status"] == "dead"
+
+    # ...but an explicit register still revives it - deliberate
+    # operator/session intent, never emitted by an observer shell
+    res = db.register("m1", "/repo", path=db_path)
+    assert res.accepted
+    assert db.get_session("m1", path=db_path)["status"] == "active"

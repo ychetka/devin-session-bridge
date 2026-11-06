@@ -1732,23 +1732,30 @@ def _cmd_register(args) -> int:
         path=args.db,
     )
     if not result.accepted:
+        fresh = (
+            result.heartbeat_age is not None and result.heartbeat_age < db.HEARTBEAT_STALE_SECONDS
+        )
+        if fresh:
+            why = (
+                f"orchestrator {result.holder} holds a fresh heartbeat"
+                f" ({result.heartbeat_age}s ago)"
+            )
+        else:
+            why = (
+                f"orchestrator {result.holder} is a managed-active holder"
+                " - heartbeat age cannot demote it"
+            )
         resp = JsonResponse(
             session=args.session_id,
             status="refused",
-            error=(
-                f"orchestrator {result.holder} holds a fresh heartbeat"
-                f" ({result.heartbeat_age}s ago)"
-            ),
+            error=why,
             agent_instruction=("retry with --force to take over the orchestrator role"),
             data={
                 "holder": result.holder,
                 "heartbeat_age": result.heartbeat_age,
             },
         )
-        human = (
-            f"refused: orchestrator {result.holder} is alive"
-            f" (heartbeat {result.heartbeat_age}s ago); use --force to take over"
-        )
+        human = f"refused: {why}; use --force to take over"
         return _emit(args, resp, ExitCode.CONFLICT, human)
     resp = JsonResponse(
         session=result.session_id,
@@ -2034,12 +2041,15 @@ def _cmd_wait(args) -> int:
 def _cmd_heartbeat(args) -> int:
     """``bridge heartbeat <sid>``: the liveness metronome (item_13g).
 
-    Deliberately lighter than ``register``: it touches only the
-    ``worker_heartbeats`` row - no sessions upsert, no role change, no
-    orchestrator CAS - so a watcher cycle can keep its own session
-    alive without ever taking the orchestrator role over or reviving
-    a dead row (``register`` remains the ownership transition). The
-    bumped generation is returned so a holder detects supersession.
+    Deliberately lighter than ``register``: no role change and no
+    orchestrator CAS - a watcher cycle can keep its own session alive
+    without ever taking the orchestrator role over. For unmanaged
+    sessions it also revives a dead-flagged row (item_122): heartbeat
+    is their dead-marking signal, so fresh heartbeat activity is
+    authoritative recovery. Managed rows are not revived here - their
+    dead verdict is session/list-derived, which a heartbeat cannot
+    refute; they recover through ``register``. The bumped generation
+    is returned so a holder detects supersession.
     """
     generation = db.heartbeat(args.session_id, path=args.db)
     resp = JsonResponse(

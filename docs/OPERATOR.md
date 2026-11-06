@@ -233,13 +233,18 @@ the full fields (`wake_outcome`, `wake_streak`, `wake_escalated`,
    orchestrator is stale-hb between turns by design, so heartbeat age
    alone never demotes it (v0.3.2). A holder the supervisor marked
    `dead` blocks nothing regardless of heartbeat age, and a
-   dead-flagged session clears its own latch on its next heartbeat or
-   re-register - no manual `--force` needed once it is provably back.
+   dead-flagged session clears its own latch on re-register - or, for
+   unmanaged sessions, on its next heartbeat (managed dead verdicts
+   come from session/list absence, which a heartbeat cannot refute,
+   so a heartbeat never revives a managed row - this also prevents a
+   leftover observer-shell heartbeat loop from flapping a dead
+   managed session back and forth, v0.3.2).
 
    Refusal output looks like:
 
    ```text
-   refused: orchestrator <holder-sid> is alive (heartbeat 42s ago); use --force to take over
+   refused: orchestrator <holder-sid> holds a fresh heartbeat (42s ago); use --force to take over
+   refused: orchestrator <holder-sid> is a managed-active holder - heartbeat age cannot demote it; use --force to take over
    ```
 
    Troubleshooting:
