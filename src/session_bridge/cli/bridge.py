@@ -1100,13 +1100,14 @@ def _status_snapshot(args) -> dict:
             " (SELECT MIN(n.created_at) FROM notifications n"
             "   WHERE n.session_id=s.session_id"
             "     AND n.relayed_at IS NOT NULL AND n.ack_at IS NULL"
-            "     AND n.kind<>'heartbeat_tick') AS mail_oldest"
+            "     AND n.kind<>?) AS mail_oldest"
             " FROM sessions s"
             " LEFT JOIN worker_heartbeats wh"
             "   ON wh.session_id=s.session_id"
             " LEFT JOIN wake_state ws"
             "   ON ws.session_id=s.session_id"
-            " ORDER BY s.session_id"
+            " ORDER BY s.session_id",
+            (NotificationKind.HEARTBEAT_TICK.value,),
         ).fetchall()
         latest = {
             r["session_id"]: r

@@ -1199,3 +1199,61 @@ def test_item139_gwt6_no_orchestrator_falls_back_to_notify_send(env, monkeypatch
     daemon._mail_stall_pass(env.db, env.sdir, int(time.time()), env.notifier)
 
     assert env.sent and SID in env.sent[0][1]
+
+
+def test_item139_gwt8_episode_rearms_on_new_mail_after_partial_drain(env, monkeypatch):
+    """[ITEM-139.GWT-8] review fix: a session whose escalated mail
+    drained but NEWER mail keeps stalling must re-escalate - re-arming
+    only on a fully-empty mailbox would give a chronically stalled
+    session one escalation ever."""
+    _managed_stale(env)
+    res = db.register("orc", "/repo/orc", role="orchestrator", path=env.db)
+    assert res.accepted
+    _unacked(env, SID, NotificationKind.DIRECTIVE)
+    old_cutoff = int(time.time()) - 7200
+    _exec(env.db, "UPDATE notifications SET created_at=? WHERE ack_at IS NULL", (old_cutoff,))
+    _wake_calls(env, monkeypatch)
+
+    now = int(time.time())
+    daemon._mail_stall_pass(env.db, env.sdir, now, env.notifier)
+    assert _one(env.db, "SELECT COUNT(*) c FROM notifications WHERE session_id='orc'")["c"] == 1
+
+    # the escalated mail drains, a NEW directive arrives (created after
+    # the stamp) and itself stalls past the threshold
+    db.ack_notifications(SID, path=env.db)
+    _exec(
+        env.db,
+        "UPDATE wake_state SET mail_escalated_at=? WHERE session_id=?",
+        (int(time.time()) - 3600, SID),
+    )
+    _unacked(env, SID, NotificationKind.DIRECTIVE)
+    # created_at is newer than the (backdated) stamp but older than
+    # the stall threshold -> a fresh episode, not the same stall
+    _exec(
+        env.db,
+        "UPDATE notifications SET created_at=? WHERE ack_at IS NULL",
+        (int(time.time()) - 2000,),
+    )
+    daemon._mail_stall_pass(env.db, env.sdir, now + 30, env.notifier)
+    assert _one(env.db, "SELECT COUNT(*) c FROM notifications WHERE session_id='orc'")["c"] == 2
+
+
+def test_item139_gwt9_no_target_defers_without_consuming_episode(env, monkeypatch):
+    """[ITEM-139.GWT-9] review fix: no orchestrator and no notify_send
+    -> mail_stall_deferred, the stamp is NOT consumed - the escalation
+    still fires the first pass a target exists."""
+    _managed_stale(env)
+    _unacked(env, SID, NotificationKind.DIRECTIVE)
+    _exec(env.db, "UPDATE notifications SET created_at=?", (int(time.time()) - 7200,))
+    _wake_calls(env, monkeypatch)
+
+    daemon._mail_stall_pass(env.db, env.sdir, int(time.time()), None)
+    assert (
+        _one(env.db, "SELECT COUNT(*) c FROM wake_state WHERE mail_escalated_at IS NOT NULL")["c"]
+        == 0
+    )
+    assert [d["event"] for d in _decisions(env)] == ["mail_stall_deferred"]
+
+    # notify_send appears -> the episode escalates on the next pass
+    daemon._mail_stall_pass(env.db, env.sdir, int(time.time()) + 5, env.notifier)
+    assert env.sent and SID in env.sent[0][1]

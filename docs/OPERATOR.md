@@ -369,7 +369,8 @@ Daemon files in the state dir:
   `daemon_stop`, `wake_sent`, `wake_skipped_busy`, `wake_failed`,
   `wake_breaker_open`, `wake_pass_deadline`, `wake_verified`,
   `wake_unconfirmed`, `wake_unconfirmed_escalated`,
-  `wake_verify_failed`, `mail_stall_escalated`.
+  `wake_verify_failed`, `mail_stall_escalated`,
+  `mail_stall_deferred`.
 - `logs/daemon.log` - the detached daemon's stderr (decision lines are
   echoed there too).
 
@@ -422,10 +423,15 @@ Each pass (~5s, with up to ~1s startup jitter):
    manual-wake it or escalate to the developer. The orchestrator's
    own stall (or the absence of an active holder) falls back to
    `notify-send` - a self-addressed directive would sit undrained
-   too. The dedup stamp lives in `wake_state.mail_escalated_at` and
-   is cleared when the mailbox drains, so a drained-then-restalled
-   session re-escalates as a fresh episode. The pass also writes the
-   maximum undrained age as `mail_undrained_max_age=<s>` on the
+   too. With no delivery target at all the pass logs
+   `mail_stall_deferred` and retries next pass without consuming the
+   episode. The dedup stamp lives in `wake_state.mail_escalated_at`;
+   it is cleared when the mailbox fully drains OR when the oldest
+   remaining mail is newer than the stamp (the escalated items were
+   drained - what sits there now is a new stall), so a chronically
+   stalled session is not limited to one escalation ever. The pass
+   also writes the maximum undrained age as
+   `mail_undrained_max_age=<s>` on the
    second line of `daemon_heartbeat.txt` (line 1 stays the unix
    timestamp - the watchdog contract is unchanged).
 

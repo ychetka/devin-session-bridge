@@ -683,10 +683,20 @@ def _wake_pass(db_path, state_directory, now: int, policy: WakePolicy, notify=No
         _verify_unconfirmed_wakes(db_path, state_directory, unverified, policy, notify)
 
 
+def _env_int(name: str, default: int) -> int:
+    """Env-derived int with a safe default: a malformed override must
+    not crash the module import (bridge.py loads this module at CLI
+    startup - a typoed env var would brick the whole CLI)."""
+    try:
+        return int(os.environ.get(name, ""))
+    except ValueError:
+        return default
+
+
 #: Undrained actionable mail older than this triggers one escalation
 #: per stall episode (item_139) - a session whose relayed mail sits
 #: unacked this long is unreachable by every other signal we have.
-_MAIL_STALL_SECONDS = int(os.environ.get("SESSIONS_BRIDGE_MAIL_STALL_SECONDS", "1800"))
+_MAIL_STALL_SECONDS = _env_int("SESSIONS_BRIDGE_MAIL_STALL_SECONDS", 1800)
 
 
 def _mail_stall_pass(db_path, state_directory, now: int, notify_send=None) -> int:
@@ -710,9 +720,17 @@ def _mail_stall_pass(db_path, state_directory, now: int, notify_send=None) -> in
     for r in undrained.values():
         max_age = max(max_age, now - r["oldest"])
 
-    # a drained mailbox opens a fresh episode for the next stall
+    # episode re-arm: a fully-drained mailbox obviously opens a fresh
+    # episode, but so does one whose OLDEST remaining mail is newer
+    # than the stamp - the previously escalated items were drained
+    # and what sits there now is a new stall, not the same one
+    # (review: without this, a session that never fully drains gets
+    # exactly one escalation ever).
     for sid, ws in db.list_wake_state(path=db_path).items():
-        if ws.get("mail_escalated_at") is not None and sid not in undrained:
+        stamp = ws.get("mail_escalated_at")
+        if stamp is None:
+            continue
+        if sid not in undrained or undrained[sid]["oldest"] > stamp:
             db.clear_mail_escalated(sid, path=db_path)
 
     con = db.connect(db_path)
@@ -730,6 +748,22 @@ def _mail_stall_pass(db_path, state_directory, now: int, notify_send=None) -> in
         age = now - r["oldest"]
         if age < _MAIL_STALL_SECONDS:
             continue
+        # pick the delivery target FIRST: the dedup stamp is consumed
+        # only when an escalation can actually leave the daemon
+        # (review: stamping before delivery meant a notify-send-less
+        # pass logged the episode's only escalation into the void).
+        if orch_sid is not None and sid != orch_sid:
+            target = "orchestrator"
+        elif notify_send is not None:
+            target = "notify-send"
+        else:
+            _decision(
+                state_directory,
+                "mail_stall_deferred",
+                sid,
+                f"age={age}s count={r['count']} no escalation target",
+            )
+            continue
         if not db.mark_mail_escalated(sid, path=db_path):
             continue  # already escalated this episode
         body = (
@@ -737,29 +771,17 @@ def _mail_stall_pass(db_path, state_directory, now: int, notify_send=None) -> in
             " relayed notification(s) - drain is not reaching it"
             " (manual `bridge wake` or escalate to developer)"
         )
-        if orch_sid is not None and sid != orch_sid:
+        if target == "orchestrator":
             db.notify(orch_sid, NotificationKind.DIRECTIVE, body, path=db_path)
-            _decision(
-                state_directory,
-                "mail_stall_escalated",
-                sid,
-                f"age={age}s count={r['count']} -> orchestrator {orch_sid}",
-            )
-        elif notify_send is not None:
-            notify_send("sessions-bridge MAIL STALL", body)
-            _decision(
-                state_directory,
-                "mail_stall_escalated",
-                sid,
-                f"age={age}s count={r['count']} -> notify-send",
-            )
         else:
-            _decision(
-                state_directory,
-                "mail_stall_escalated",
-                sid,
-                f"age={age}s count={r['count']} no escalation target",
-            )
+            notify_send("sessions-bridge MAIL STALL", body)
+        _decision(
+            state_directory,
+            "mail_stall_escalated",
+            sid,
+            f"age={age}s count={r['count']} -> {target}"
+            + (f" {orch_sid}" if target == "orchestrator" else ""),
+        )
     return max_age
 
 

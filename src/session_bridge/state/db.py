@@ -126,6 +126,9 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- dead schema for now: declared for the contract model, not yet
   -- consumed by claim_queued
   run_after INTEGER,
+  -- `bridge wait` stamps the mirrored lease expiry here so the wake
+  -- query can skip externally-waiting running tasks (item_139)
+  wait_until INTEGER,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
