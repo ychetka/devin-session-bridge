@@ -711,7 +711,9 @@ def _mail_stall_pass(db_path, state_directory, now: int, notify_send=None) -> in
     undrained too).
 
     Dedup is the ``wake_state.mail_escalated_at`` stamp: one
-    escalation per stall episode, cleared when the mailbox drains.
+    escalation per stall episode, cleared when the mailbox drains or
+    when the oldest remaining mail is newer than the stamp (the
+    escalated items drained - a newer stall is a fresh episode).
     Returns the maximum undrained age seen this pass - the caller
     writes it into ``daemon_heartbeat.txt`` as the stall metric.
     """
