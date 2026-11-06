@@ -983,3 +983,69 @@ def test_item102c_gwt5_acked_actionable_mail_does_not_rewake(env, monkeypatch):
 
     assert daemon.run(env.db, env.qdir, once=True, notify_send=env.notifier) == daemon.RUN_OK
     assert calls == []
+
+
+# --- item_122: incident/stall hardening ------------------------------------
+
+
+def test_item122_gwt5_rpc_error_post_list_resets_no_session_streak(env, monkeypatch):
+    """[ITEM-122.GWT-5] rpc_error reaching _wake_pass is post-list by
+    construction (wake_session remaps pre-list RPC failures to
+    attach_failed), so it proves the session answered to
+    session/list: the no_session streak must reset, not accumulate
+    toward dead-marking."""
+    _managed_with_mail(env)
+    monkeypatch.setattr(daemon, "find_lockfile", lambda: None)
+
+    def no_session(*a, **k):
+        raise daemon.WakeError("no_session", "not in session/list")
+
+    monkeypatch.setattr(daemon, "wake_session", no_session)
+    now = int(time.time())
+    policy = daemon.WakePolicy(cooldown_seconds=0)
+    daemon._wake_pass(env.db, env.sdir, now, policy)
+    daemon._wake_pass(env.db, env.sdir, now, policy)  # streak 2 of 3
+    assert policy._no_session_streak[SID] == 2
+
+    def rpc_fail(*a, **k):
+        raise daemon.WakeError("rpc_error", "session/prompt rejected mid-turn")
+
+    monkeypatch.setattr(daemon, "wake_session", rpc_fail)
+    daemon._wake_pass(env.db, env.sdir, now, policy)
+    assert SID not in policy._no_session_streak
+
+    # back to no_session: the dead streak rebuilds from zero
+    monkeypatch.setattr(daemon, "wake_session", no_session)
+    daemon._wake_pass(env.db, env.sdir, now, policy)
+    daemon._wake_pass(env.db, env.sdir, now, policy)
+    assert db.get_session(SID, path=env.db)["status"] == SessionStatus.ACTIVE.value
+    daemon._wake_pass(env.db, env.sdir, now, policy)
+    assert db.get_session(SID, path=env.db)["status"] == SessionStatus.DEAD.value
+
+
+def test_item122_gwt6_restart_mid_streak_starts_fresh(env, monkeypatch):
+    """[ITEM-122.GWT-6] WakePolicy is process-local: a daemon restart
+    mid no_session streak drops the accumulated count - the session
+    is dead-marked only after a full fresh streak, never on
+    carried-over misses (the PR #34 missing test)."""
+    _managed_with_mail(env)
+    monkeypatch.setattr(daemon, "find_lockfile", lambda: None)
+
+    def gone(*a, **k):
+        raise daemon.WakeError("no_session", "not in session/list")
+
+    monkeypatch.setattr(daemon, "wake_session", gone)
+    now = int(time.time())
+
+    p1 = daemon.WakePolicy(cooldown_seconds=0)
+    daemon._wake_pass(env.db, env.sdir, now, p1)
+    daemon._wake_pass(env.db, env.sdir, now, p1)  # streak 2 of 3
+    assert db.get_session(SID, path=env.db)["status"] == SessionStatus.ACTIVE.value
+
+    # restart boundary: a fresh policy = a clean streak ledger
+    p2 = daemon.WakePolicy(cooldown_seconds=0)
+    daemon._wake_pass(env.db, env.sdir, now, p2)
+    daemon._wake_pass(env.db, env.sdir, now, p2)  # fresh streak 2 - alive
+    assert db.get_session(SID, path=env.db)["status"] == SessionStatus.ACTIVE.value
+    daemon._wake_pass(env.db, env.sdir, now, p2)  # fresh streak 3 - dead
+    assert db.get_session(SID, path=env.db)["status"] == SessionStatus.DEAD.value

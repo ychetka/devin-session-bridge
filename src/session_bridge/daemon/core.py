@@ -612,9 +612,12 @@ def _wake_pass(db_path, state_directory, now: int, policy: WakePolicy, notify=No
                 opened = False
             else:
                 opened = policy.record_result(host_key, False)
-            if e.reason == "no_cwd":
-                # session was in session/list (present, unwakeable) -
-                # counts as seen, never toward the dead-streak
+            if e.reason in ("no_cwd", "rpc_error"):
+                # both prove the session answered to session/list:
+                # no_cwd means present-but-unwakeable, and rpc_error
+                # can only surface post-list (wake_session remaps
+                # pre-list RPC failures to attach_failed) - either way
+                # it counts as seen, never toward the dead-streak
                 policy.record_session_seen(sid)
             if e.reason == "no_session":
                 streak = policy.record_no_session(sid)
