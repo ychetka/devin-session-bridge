@@ -1721,8 +1721,9 @@ def _cmd_register(args) -> int:
     """``bridge register <sid>``: join the bus as worker/orchestrator.
 
     Orchestrator registrations go through the CAS singleton in
-    ``db.register`` - a fresh-holder refusal maps to CONFLICT with a
-    ``--force`` hint instead of a bare error.
+    ``db.register`` - a refused takeover (fresh-heartbeat holder or
+    managed-active holder) maps to CONFLICT with a ``--force`` hint
+    instead of a bare error.
     """
     result = db.register(
         args.session_id,

@@ -988,8 +988,8 @@ def test_item102c_gwt5_acked_actionable_mail_does_not_rewake(env, monkeypatch):
 # --- item_122: incident/stall hardening ------------------------------------
 
 
-def test_item122_gwt5_rpc_error_post_list_resets_no_session_streak(env, monkeypatch):
-    """[ITEM-122.GWT-5] rpc_error reaching _wake_pass is post-list by
+def test_item122_gwt6_rpc_error_post_list_resets_no_session_streak(env, monkeypatch):
+    """[ITEM-122.GWT-6] rpc_error reaching _wake_pass is post-list by
     construction (wake_session remaps pre-list RPC failures to
     attach_failed), so it proves the session answered to
     session/list: the no_session streak must reset, not accumulate
@@ -1023,8 +1023,8 @@ def test_item122_gwt5_rpc_error_post_list_resets_no_session_streak(env, monkeypa
     assert db.get_session(SID, path=env.db)["status"] == SessionStatus.DEAD.value
 
 
-def test_item122_gwt6_restart_mid_streak_starts_fresh(env, monkeypatch):
-    """[ITEM-122.GWT-6] WakePolicy is process-local: a daemon restart
+def test_item122_gwt7_restart_mid_streak_starts_fresh(env, monkeypatch):
+    """[ITEM-122.GWT-7] WakePolicy is process-local: a daemon restart
     mid no_session streak drops the accumulated count - the session
     is dead-marked only after a full fresh streak, never on
     carried-over misses (the PR #34 missing test)."""
