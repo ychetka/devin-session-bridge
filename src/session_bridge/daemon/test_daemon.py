@@ -1257,3 +1257,131 @@ def test_item139_gwt9_no_target_defers_without_consuming_episode(env, monkeypatc
     # notify_send appears -> the episode escalates on the next pass
     daemon._mail_stall_pass(env.db, env.sdir, int(time.time()) + 5, env.notifier)
     assert env.sent and SID in env.sent[0][1]
+
+
+# --- item_139 amendment: file-level pending mail + `bridge directive` ---------
+
+
+def _foreign_msg(env, sid, nid=99, body="foreign directive"):
+    """Hand-written mailbox file - the msg_003 shape: a writer that
+    bypassed the notifications registry entirely."""
+    mdir = os.path.join(env.qdir, sid)
+    os.makedirs(mdir, exist_ok=True)
+    path = os.path.join(mdir, f"msg_{nid}.txt")
+    with open(path, "w") as fh:
+        fh.write(body)
+    return path
+
+
+def test_item139_gwt10_foreign_msg_file_wakes_fresh_hb(env, monkeypatch):
+    """[ITEM-139.GWT-10] fresh-hb managed session + an unconsumed
+    msg_*.txt and NO notification rows -> wake candidate: file
+    presence is mail, whoever wrote it (the msg_003 incident). Runs
+    with queue_dir=None - the default resolution path the review
+    caught disabled: env.qdir IS <dir of env.db>/queue."""
+    _managed_fresh(env)
+    _foreign_msg(env, SID)
+    calls = _wake_calls(env, monkeypatch)
+
+    assert daemon.run(env.db, None, once=True, notify_send=env.notifier) == daemon.RUN_OK
+    assert calls == [SID]
+
+
+def test_item139_gwt11_bridge_directive_relays_and_wakes(env, monkeypatch, capsys):
+    """[ITEM-139.GWT-11] `bridge directive` writes a registered
+    notification: the next daemon pass relays it into the fs mailbox
+    and the actionable-mail leg wakes the recipient."""
+    _managed_fresh(env)
+    calls = _wake_calls(env, monkeypatch)
+
+    assert bridge.main(["--db", env.db, "directive", SID, "steer now"]) == 0
+    nid = _one(
+        env.db,
+        "SELECT id FROM notifications WHERE session_id=? AND kind='directive'",
+        (SID,),
+    )
+    assert nid is not None
+
+    assert daemon.run(env.db, env.qdir, once=True, notify_send=env.notifier) == daemon.RUN_OK
+    assert calls == [SID]
+    assert os.path.exists(os.path.join(env.qdir, SID, f"msg_{nid['id']}.txt"))
+
+    # an unknown sid is refused, not queued into the void
+    capsys.readouterr()
+    assert bridge.main(["--db", env.db, "directive", "ghost-sid", "steer"]) != 0
+    assert (
+        _one(env.db, "SELECT COUNT(*) c FROM notifications WHERE session_id='ghost-sid'")["c"] == 0
+    )
+
+    # a dead session is refused too - undrainable mail would only
+    # grow a phantom stall episode
+    db.set_session_status(SID, "dead", path=env.db)
+    assert bridge.main(["--db", env.db, "directive", SID, "steer"]) != 0
+    assert (
+        _one(
+            env.db,
+            "SELECT COUNT(*) c FROM notifications WHERE session_id=? AND kind='directive'",
+            (SID,),
+        )["c"]
+        == 1
+    )  # only the earlier successful directive
+
+
+def test_item139_gwt12_fs_only_pending_escalates_stall(env, monkeypatch):
+    """[ITEM-139.GWT-12] a mailbox file from a foreign writer older
+    than the stall threshold escalates by its mtime even though the
+    notifications table knows nothing about it."""
+    _managed_stale(env)
+    path = _foreign_msg(env, SID)
+    old = int(time.time()) - 7200
+    os.utime(path, (old, old))
+    _wake_calls(env, monkeypatch)
+
+    daemon._mail_stall_pass(env.db, env.sdir, int(time.time()), env.notifier, env.qdir)
+
+    assert env.sent and SID in env.sent[0][1] and "unregistered mailbox file" in env.sent[0][1]
+
+
+def test_item139_gwt13_fs_pending_respects_managed_active_gate(env, monkeypatch):
+    """[ITEM-139.GWT-13] the file leg honours the same gate as every
+    other: an unmanaged session's mailbox dir and a dead managed
+    session's dir are not wake candidates."""
+    res = db.register("unmanaged", "/repo/ws", path=env.db)
+    assert res.accepted
+    _foreign_msg(env, "unmanaged")
+    _managed_stale(env)
+    _foreign_msg(env, SID)
+    db.set_session_status(SID, "dead", path=env.db)
+    calls = _wake_calls(env, monkeypatch)
+
+    assert daemon.run(env.db, env.qdir, once=True, notify_send=env.notifier) == daemon.RUN_OK
+    assert calls == []
+
+
+def test_item139_gwt14_real_tick_file_does_not_wake(env, monkeypatch):
+    """[ITEM-139.GWT-14] a genuine relayed heartbeat_tick file in the
+    mailbox is a poke, not pending mail: file leg stays silent even
+    though a msg_*.txt exists on disk."""
+    _managed_fresh(env)
+    db.notify(SID, NotificationKind.HEARTBEAT_TICK, "tick", path=env.db)
+    calls = _wake_calls(env, monkeypatch)
+
+    assert daemon.run(env.db, env.qdir, once=True, notify_send=env.notifier) == daemon.RUN_OK
+    assert calls == []
+    # the relayed tick file is really on disk and still must not wake
+    assert daemon.run(env.db, env.qdir, once=True, notify_send=env.notifier) == daemon.RUN_OK
+    assert calls == []
+
+
+def test_item139_gwt15_foreign_file_colliding_with_tick_nid_wakes(env, monkeypatch):
+    """[ITEM-139.GWT-15] a foreign msg_<N>.txt whose N collides with a
+    heartbeat_tick row id is still actionable: provenance comes from
+    the relay headers, not the bare id."""
+    _managed_fresh(env)
+    tick_nid = db.notify(SID, NotificationKind.HEARTBEAT_TICK, "tick", path=env.db)
+    db.mark_relayed(tick_nid, path=env.db)
+    _foreign_msg(env, SID, nid=tick_nid)  # no relay headers inside
+    calls = _wake_calls(env, monkeypatch)
+
+    assert daemon.run(env.db, env.qdir, once=True, notify_send=env.notifier) == daemon.RUN_OK
+    assert calls == [SID]

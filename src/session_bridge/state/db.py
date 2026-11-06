@@ -2410,7 +2410,10 @@ def list_wake_state(*, path=None) -> dict:
 
 
 def sessions_with_undrained_mail(*, path=None) -> dict:
-    """Undrained actionable mail per session: {sid: {oldest, count}}.
+    """Undrained actionable mail per session:
+    {sid: {oldest, count, nids}} - ``nids`` is the set of pending
+    notification ids so callers can dedup the matching
+    ``msg_<nid>.txt`` mailbox files against foreign files.
 
     "Undrained" = relayed to the fs mailbox but not yet acked; the
     heartbeat_tick kind is excluded - it is a liveness poke, not
@@ -2423,14 +2426,22 @@ def sessions_with_undrained_mail(*, path=None) -> dict:
         try:
             rows = con.execute(
                 "SELECT session_id AS sid, MIN(created_at) AS oldest,"
-                " COUNT(*) AS count"
+                " COUNT(*) AS count,"
+                " GROUP_CONCAT(id) AS nids"
                 " FROM notifications"
                 " WHERE relayed_at IS NOT NULL AND ack_at IS NULL"
                 "  AND kind<>?"
                 " GROUP BY session_id",
                 (NotificationKind.HEARTBEAT_TICK.value,),
             ).fetchall()
-            return {r["sid"]: {"oldest": int(r["oldest"]), "count": int(r["count"])} for r in rows}
+            return {
+                r["sid"]: {
+                    "oldest": int(r["oldest"]),
+                    "count": int(r["count"]),
+                    "nids": {int(n) for n in (r["nids"] or "").split(",") if n},
+                }
+                for r in rows
+            }
         finally:
             con.close()
 

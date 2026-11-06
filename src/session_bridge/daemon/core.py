@@ -47,7 +47,7 @@ import tempfile
 import threading
 import time
 
-from session_bridge.mailbox import write_message
+from session_bridge.mailbox import mailbox_dir, write_message
 from session_bridge.state import db
 from session_bridge.state.contract import (
     WAKE_UNCONFIRMED_ESCALATE_STREAK,
@@ -517,8 +517,66 @@ _SESSION_LEVEL_REASONS = {"no_session", "no_cwd", "rpc_error"}
 _NO_SESSION_DEAD_STREAK = 3
 
 
-def _wake_candidates(db_path, now: int):
-    """Active managed sessions the mailbox alone cannot reach, in two
+def _pending_mailbox_dirs(db_path, queue_dir=None) -> dict:
+    """Managed+active sessions with unconsumed ``msg_*.txt`` files.
+
+    The notifications table only knows mail the daemon itself relayed;
+    a foreign writer (an orchestrator hand-writing msg_*.txt, a
+    hook) leaves files no row covers - file presence is the ground
+    truth of "mail waiting" (item_139 amendment: shore-felidae's
+    msg_003 sat ~2h with zero wake events because the wake query
+    looked at rows only). Returns
+    {sid: {"oldest": mtime, "names": [msg basenames]}}.
+    """
+    con = db.connect(db_path)
+    try:
+        sids = [
+            r["session_id"]
+            for r in con.execute(
+                "SELECT session_id FROM sessions WHERE mode=? AND status='active'",
+                (SessionMode.MANAGED.value,),
+            ).fetchall()
+        ]
+        pending = {}
+        for sid in sids:
+            mdir = mailbox_dir(sid, db_path=db_path, queue_dir=queue_dir)
+            try:
+                names = [n for n in os.listdir(mdir) if n.startswith("msg_") and n.endswith(".txt")]
+            except OSError:
+                continue
+            # stat each file individually: the consumer may delete it
+            # between listdir and getmtime (TOCTOU) - a vanished file
+            # is just already-drained mail, not a pass-killing error
+            stats = []
+            for n in names:
+                try:
+                    stats.append((n, int(os.path.getmtime(os.path.join(mdir, n)))))
+                except OSError:
+                    continue
+            if not stats:
+                continue
+            # a heartbeat_tick file is a liveness poke, never
+            # actionable mail - without the header check the file leg
+            # would re-break the "tick alone never wakes" contract
+            # every time the relay delivers a poke.  Provenance comes
+            # from the file's own relay headers (_msg_is_tick), not a
+            # bare id lookup: a foreign writer's msg_<N>.txt may
+            # collide with an unrelated row id.
+            actionable = [
+                (n, mt) for n, mt in stats if not _msg_is_tick(os.path.join(mdir, n), _msg_nid(n))
+            ]
+            if actionable:
+                pending[sid] = {
+                    "oldest": min(mt for _, mt in actionable),
+                    "names": [n for n, _ in actionable],
+                }
+        return pending
+    finally:
+        con.close()
+
+
+def _wake_candidates(db_path, now: int, queue_dir=None, pending=None):
+    """Active managed sessions the mailbox alone cannot reach, in three
     legs.
 
     Stale-heartbeat leg (item_16/17): no turn is open (heartbeat stale
@@ -531,6 +589,11 @@ def _wake_candidates(db_path, now: int):
     a DRAIN session idle at the prompt opens no turn on its own, so
     directives would sit until a human typed. heartbeat_tick alone
     never qualifies a fresh-heartbeat session.
+
+    File-pending leg (item_139 amendment): any unconsumed msg_*.txt
+    in the session's mailbox dir qualifies whatever the heartbeat or
+    notification rows say - the fs mailbox is the authoritative
+    delivery channel, and foreign writers bypass the outbox entirely.
 
     Dead sessions are excluded so a no_session-marked session is not
     probed forever.
@@ -546,7 +609,7 @@ def _wake_candidates(db_path, now: int):
         # that by definition cannot act yet is noise. The stamp decays
         # with the lease it mirrors, so an abandoned wait becomes
         # wake-worthy again on its own.
-        return con.execute(
+        rows = con.execute(
             "SELECT DISTINCT s.session_id AS sid, s.cwd AS cwd"
             " FROM sessions s"
             " LEFT JOIN worker_heartbeats wh ON wh.session_id=s.session_id"
@@ -586,11 +649,37 @@ def _wake_candidates(db_path, now: int):
                 NotificationKind.HEARTBEAT_TICK.value,
             ),
         ).fetchall()
+        # file-pending leg: unconsumed msg_*.txt is mail even when no
+        # notification row exists for it (foreign writers bypass the
+        # outbox - the msg_003 sleeping-DRAIN evidence, item_139). No
+        # queue_dir guard: mailbox_dir resolves the default queue root
+        # from db_path, so the leg is on in every configuration.
+        if pending is None:
+            pending = _pending_mailbox_dirs(db_path, queue_dir)
+        have = {r["sid"] for r in rows}
+        extra = [sid for sid in pending if sid not in have]
+        if extra:
+            marks = ",".join("?" * len(extra))
+            rows += con.execute(
+                "SELECT session_id AS sid, cwd AS cwd FROM sessions"
+                f" WHERE session_id IN ({marks})"
+                " AND mode=? AND status='active'",
+                (*extra, SessionMode.MANAGED.value),
+            ).fetchall()
+        return rows
     finally:
         con.close()
 
 
-def _wake_pass(db_path, state_directory, now: int, policy: WakePolicy, notify=None) -> None:
+def _wake_pass(
+    db_path,
+    state_directory,
+    now: int,
+    policy: WakePolicy,
+    notify=None,
+    queue_dir=None,
+    pending=None,
+) -> None:
     """Nudge idle managed sessions that have mail waiting (item_16).
 
     Runs after the relay pass so the same pass can already wake a
@@ -610,7 +699,7 @@ def _wake_pass(db_path, state_directory, now: int, policy: WakePolicy, notify=No
     """
     deadline = time.monotonic() + _WAKE_PASS_DEADLINE_SECONDS
     unverified: list[str] = []
-    for row in _wake_candidates(db_path, now):
+    for row in _wake_candidates(db_path, now, queue_dir, pending):
         if time.monotonic() >= deadline:
             _decision(
                 state_directory,
@@ -699,7 +788,52 @@ def _env_int(name: str, default: int) -> int:
 _MAIL_STALL_SECONDS = _env_int("SESSIONS_BRIDGE_MAIL_STALL_SECONDS", 1800)
 
 
-def _mail_stall_pass(db_path, state_directory, now: int, notify_send=None) -> int:
+def _msg_nid(name: str):
+    """Numeric notification id from ``msg_<nid>.txt``; None when the
+    name carries no digits (a foreign file that matches no row)."""
+    stem = name[4:-4] if name.startswith("msg_") and name.endswith(".txt") else ""
+    return int(stem) if stem.isdigit() else None
+
+
+def _msg_is_tick(path: str, nid) -> bool:
+    """True only for a genuine relayed heartbeat_tick artifact.
+
+    The filename id alone cannot prove identity - a foreign writer
+    may collide with an unrelated row's id - so the relay's own
+    headers must agree: ``notification_id`` matching the basename id
+    AND ``kind: heartbeat_tick`` verbatim (relay_payload always
+    writes both).  A file without parseable headers is not a tick;
+    erring on the actionable side re-breaks nothing - the msg_003
+    incident was undetected foreign mail, not a noisy wake.
+    """
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            head = [fh.readline() for _ in range(8)]
+    except OSError:
+        return False
+    headers = {}
+    for line in head:
+        line = line.strip()
+        if not line:
+            break
+        key, sep, val = line.partition(":")
+        if sep:
+            headers[key.strip()] = val.strip()
+    return (
+        headers.get("kind") == NotificationKind.HEARTBEAT_TICK.value
+        and nid is not None
+        and headers.get("notification_id") == str(nid)
+    )
+
+
+def _mail_stall_pass(
+    db_path,
+    state_directory,
+    now: int,
+    notify_send=None,
+    queue_dir=None,
+    pending=None,
+) -> int:
     """Escalate undrained mail to the orchestrator, once per episode.
 
     For every session whose actionable mail (relayed, unacked,
@@ -710,6 +844,11 @@ def _mail_stall_pass(db_path, state_directory, now: int, notify_send=None) -> in
     to ``notify_send`` instead (a self-addressed directive would sit
     undrained too).
 
+    Unconsumed ``msg_*.txt`` files count as undrained too (item_139
+    amendment): foreign writers bypass the notifications table, so a
+    hand-written directive that never reaches its session must still
+    escalate - the file's mtime is its age.
+
     Dedup is the ``wake_state.mail_escalated_at`` stamp: one
     escalation per stall episode, cleared when the mailbox drains or
     when the oldest remaining mail is newer than the stamp (the
@@ -718,6 +857,23 @@ def _mail_stall_pass(db_path, state_directory, now: int, notify_send=None) -> in
     writes it into ``daemon_heartbeat.txt`` as the stall metric.
     """
     undrained = db.sessions_with_undrained_mail(path=db_path)
+    # merge fs-level pending mail: files the outbox never registered
+    # carry only their mtime as age evidence. Files whose msg_<nid>
+    # matches an unacked notification are the SAME mail counted two
+    # ways - only genuinely unregistered files join the count.
+    if pending is None:
+        pending = _pending_mailbox_dirs(db_path, queue_dir)
+    for sid, r in pending.items():
+        if sid in undrained:
+            u = undrained[sid]
+            u["oldest"] = min(u["oldest"], r["oldest"])
+            u["foreign"] = sum(1 for n in r["names"] if _msg_nid(n) not in u["nids"])
+        else:
+            undrained[sid] = {
+                "oldest": r["oldest"],
+                "count": 0,
+                "foreign": len(r["names"]),
+            }
     max_age = 0
     for r in undrained.values():
         max_age = max(max_age, now - r["oldest"])
@@ -770,7 +926,8 @@ def _mail_stall_pass(db_path, state_directory, now: int, notify_send=None) -> in
             continue  # already escalated this episode
         body = (
             f"mail undrained {age // 60}m: {sid} has {r['count']} unacked"
-            " relayed notification(s) - drain is not reaching it"
+            f" notification(s) + {r.get('foreign', 0)} unregistered"
+            " mailbox file(s) - drain is not reaching it"
             " (manual `bridge wake` or escalate to developer)"
         )
         if target == "orchestrator":
@@ -1004,9 +1161,15 @@ def run(
                 now = int(time.time())
                 _schedule_pass(db_path, state_directory, now)
                 _relay_pass(db_path, queue_dir, state_directory)
-                _wake_pass(db_path, state_directory, now, wake_policy, notify)
+                # one mailbox-dir scan per pass shared by the wake and
+                # stall legs (review: computing it twice per pass was a
+                # wasted second connection + listdir round)
+                pending = _pending_mailbox_dirs(db_path, queue_dir)
+                _wake_pass(db_path, state_directory, now, wake_policy, notify, queue_dir, pending)
                 _sweep_pass(db_path, state_directory, notify, now)
-                stall_age = _mail_stall_pass(db_path, state_directory, now, notify)
+                stall_age = _mail_stall_pass(
+                    db_path, state_directory, now, notify, queue_dir, pending
+                )
                 _question_janitor_pass(db_path, state_directory)
                 # metric line: the oldest undrained-mail age rides along
                 # in the heartbeat file (external watchdogs read line 1
