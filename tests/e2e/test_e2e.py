@@ -25,7 +25,10 @@ or credentials.toml is absent - detected from the environment, never
 a hard failure. Every scratch session the tests create in real devin
 is deleted in teardown via ``devin rm <session_id> --force`` (not
 merely closed), and scratch repos/queue/tmp dirs are removed - the
-finalizers run even when a test fails.
+finalizers run even when a test fails. As a second net,
+``conftest.py::orphan_devin_session_sweep`` deletes after the whole
+module any leftover devin session whose cwd is a pytest scratch
+repo (issue #9).
 """
 
 import json
