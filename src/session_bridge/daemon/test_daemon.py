@@ -1313,6 +1313,19 @@ def test_item139_gwt11_bridge_directive_relays_and_wakes(env, monkeypatch, capsy
         _one(env.db, "SELECT COUNT(*) c FROM notifications WHERE session_id='ghost-sid'")["c"] == 0
     )
 
+    # a dead session is refused too - undrainable mail would only
+    # grow a phantom stall episode
+    db.set_session_status(SID, "dead", path=env.db)
+    assert bridge.main(["--db", env.db, "directive", SID, "steer"]) != 0
+    assert (
+        _one(
+            env.db,
+            "SELECT COUNT(*) c FROM notifications WHERE session_id=? AND kind='directive'",
+            (SID,),
+        )["c"]
+        == 1
+    )  # only the earlier successful directive
+
 
 def test_item139_gwt12_fs_only_pending_escalates_stall(env, monkeypatch):
     """[ITEM-139.GWT-12] a mailbox file from a foreign writer older

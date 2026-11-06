@@ -1826,8 +1826,9 @@ def _cmd_directive(args) -> int:
     """``bridge directive``: the registered directive-push path
     (item_139 amendment). The notification row rides the normal
     outbox: the daemon relays it into the fs mailbox AND the
-    actionable-mail wake leg reaches the session - the delivery loop
-    a hand-written msg_*.txt never had."""
+    actionable-mail wake leg reaches the session. A hand-written
+    msg_*.txt gets woken too (the file leg) but lacks registry
+    evidence - no ack tracking, no dedup, no stall attribution."""
     if not args.text.strip():
         resp = JsonResponse(
             session=args.session_id,

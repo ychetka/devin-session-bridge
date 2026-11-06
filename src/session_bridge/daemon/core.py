@@ -661,8 +661,10 @@ def _wake_candidates(db_path, now: int, queue_dir=None, pending=None):
         if extra:
             marks = ",".join("?" * len(extra))
             rows += con.execute(
-                f"SELECT session_id AS sid, cwd AS cwd FROM sessions WHERE session_id IN ({marks})",
-                extra,
+                "SELECT session_id AS sid, cwd AS cwd FROM sessions"
+                f" WHERE session_id IN ({marks})"
+                " AND mode=? AND status='active'",
+                (*extra, SessionMode.MANAGED.value),
             ).fetchall()
         return rows
     finally:
