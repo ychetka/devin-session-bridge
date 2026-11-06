@@ -1920,3 +1920,92 @@ def test_item21_list_wake_state(db_path):
     rows = db.list_wake_state(path=db_path)
     assert set(rows) == {"s1", "s2"}
     assert rows["s2"]["last_outcome"] == "sent_unconfirmed"
+
+
+# --- item_122: incident/stall hardening ------------------------------------
+
+
+def test_item122_gwt1_managed_orchestrator_refuses_stale_takeover(db_path):
+    """[ITEM-122.GWT-1] a managed, still-active orchestrator blocks CAS
+    takeover at ANY heartbeat age - DRAIN sessions are stale-hb
+    between turns by design; only --force or a dead verdict clears."""
+    res = db.register("orc1", "/repo", role="orchestrator", path=db_path)
+    assert res.accepted
+    db.set_session_mode("orc1", "managed", path=db_path)
+
+    # heartbeat ages past stale - an unmanaged holder would demote here
+    _exec(
+        db_path,
+        "UPDATE worker_heartbeats SET last_seen_at=? WHERE session_id=?",
+        (int(time.time()) - db.HEARTBEAT_STALE_SECONDS - 1, "orc1"),
+    )
+    res = db.register("orc2", "/repo2", role="orchestrator", path=db_path)
+    assert res.accepted is False
+    assert res.holder == "orc1"
+    assert res.heartbeat_age > db.HEARTBEAT_STALE_SECONDS
+    assert db.get_session("orc2", path=db_path) is None
+    assert db.get_session("orc1", path=db_path)["role"] == "orchestrator"
+
+    # --force still takes the slot unconditionally
+    res = db.register("orc2", "/repo2", role="orchestrator", force=True, path=db_path)
+    assert res.accepted is True
+    assert db.get_session("orc1", path=db_path)["role"] == "worker"
+
+
+def test_item122_gwt2_dead_managed_orchestrator_does_not_block(db_path):
+    """[ITEM-122.GWT-2] the protection ends at the supervisor's dead
+    verdict: a managed orchestrator marked dead is demotable without
+    force - it is provably gone, not merely between turns."""
+    res = db.register("orc1", "/repo", role="orchestrator", path=db_path)
+    assert res.accepted
+    db.set_session_mode("orc1", "managed", path=db_path)
+    assert db.set_session_status("orc1", "dead", path=db_path)
+
+    res = db.register("orc2", "/repo2", role="orchestrator", path=db_path)
+    assert res.accepted is True
+    assert db.get_session("orc1", path=db_path)["role"] == "worker"
+
+
+def test_item122_gwt3_heartbeat_revives_dead_latch(db_path):
+    """[ITEM-122.GWT-3] a heartbeat is authoritative liveness: a
+    dead-flagged session that heartbeats clears its own latch -
+    no manual re-register needed (orchestrator_dead auto-recovery)."""
+    res = db.register("orc1", "/repo", role="orchestrator", path=db_path)
+    assert res.accepted
+    assert db.set_session_status("orc1", "dead", path=db_path)
+    assert db.get_session("orc1", path=db_path)["status"] == "dead"
+
+    db.heartbeat("orc1", path=db_path)
+    assert db.get_session("orc1", path=db_path)["status"] == "active"
+
+
+def test_item122_gwt4_worker_heartbeat_also_revives(db_path):
+    """[ITEM-122.GWT-4] revival is not orchestrator-only: any unmanaged
+    session whose process provably heartbeats was never really gone -
+    the row mirrors register()'s revive-on-sighting semantics."""
+    res = db.register("w1", "/repo", path=db_path)
+    assert res.accepted
+    assert db.set_session_status("w1", "dead", path=db_path)
+    db.heartbeat("w1", path=db_path)
+    assert db.get_session("w1", path=db_path)["status"] == "active"
+
+
+def test_item122_gwt5_managed_heartbeat_does_not_revive(db_path):
+    """[ITEM-122.GWT-5] a MANAGED dead row stays dead on heartbeat:
+    its verdict comes from the no_session streak, which a heartbeat
+    cannot refute - and an observer-shell heartbeat loop outliving
+    the session would otherwise drive a revive/re-dead flap that
+    requeues the live task to terminal failure (review finding).
+    Recovery for managed sessions goes through register()."""
+    res = db.register("m1", "/repo", path=db_path)
+    assert res.accepted
+    db.set_session_mode("m1", "managed", path=db_path)
+    assert db.set_session_status("m1", "dead", path=db_path)
+    db.heartbeat("m1", path=db_path)
+    assert db.get_session("m1", path=db_path)["status"] == "dead"
+
+    # ...but an explicit register still revives it - deliberate
+    # operator/session intent, never emitted by an observer shell
+    res = db.register("m1", "/repo", path=db_path)
+    assert res.accepted
+    assert db.get_session("m1", path=db_path)["status"] == "active"

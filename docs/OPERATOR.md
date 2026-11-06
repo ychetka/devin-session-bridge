@@ -228,19 +228,32 @@ the full fields (`wake_outcome`, `wake_streak`, `wake_escalated`,
 4. The session runs `bridge register <its-sid> --role orchestrator`. The
    orchestrator role is a CAS singleton: registration is refused while
    another session holds the role with a fresh heartbeat
-   (`HEARTBEAT_STALE_SECONDS = 120`).
+   (`HEARTBEAT_STALE_SECONDS = 120`), and also while the holder is a
+   managed session still marked active - a DRAIN-mode managed
+   orchestrator is stale-hb between turns by design, so heartbeat age
+   alone never demotes it (v0.3.2). A holder the supervisor marked
+   `dead` blocks nothing regardless of heartbeat age, and a
+   dead-flagged session clears its own latch on re-register - or, for
+   unmanaged sessions, on its next heartbeat (managed dead verdicts
+   come from session/list absence, which a heartbeat cannot refute,
+   so a heartbeat never revives a managed row - this also prevents a
+   leftover observer-shell heartbeat loop from flapping a dead
+   managed session back and forth, v0.3.2).
 
    Refusal output looks like:
 
    ```text
-   refused: orchestrator <holder-sid> is alive (heartbeat 42s ago); use --force to take over
+   refused: orchestrator <holder-sid> holds a fresh heartbeat (42s ago); use --force to take over
+   refused: orchestrator <holder-sid> is a managed-active holder - heartbeat age cannot demote it; use --force to take over
    ```
 
    Troubleshooting:
 
    - The old orchestrator session is actually still open: close it, or
      wait until its heartbeat goes stale (~120s after its last
-     `bridge register`) and rerun register normally.
+     `bridge register`) and rerun register normally. A managed holder
+     never goes stale for CAS purposes - close the session or use
+     `--force` there.
    - The old session is known-dead (closed tab, crashed host): rerun
      with `bridge register <its-sid> --role orchestrator --force`. The takeover
      demotes the previous holder to worker.
@@ -428,6 +441,11 @@ notification state):
 - `wake_failed` with `reason=no_cwd` - the session IS in the host's
   list but carries no cwd (registered without `--workspace` and the
   host reports none); it counts as alive - fix the registration;
+- `wake_failed` with `reason=rpc_error` - a post-list RPC failure
+  (e.g. `session/prompt` rejected because the session went busy
+  mid-attach); it counts as alive too - only pre-list RPC failures
+  surface as `attach_failed` instead, so an `rpc_error` never feeds
+  the no_session dead-streak (v0.3.2);
 - `wake_breaker_open` - N consecutive host failures suspended all
   wake attempts for the breaker window (default 3 failures, 600s);
 - `wake_pass_deadline` - the pass ran out of its 120s budget;

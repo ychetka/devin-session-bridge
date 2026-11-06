@@ -1502,10 +1502,17 @@ def register(
     heartbeat (younger than HEARTBEAT_STALE_SECONDS) the registration
     is refused - no state is written and the result carries the holder
     sid plus its heartbeat age. A stale or heartbeat-less holder is
-    demoted to worker and the new sid takes over; ``force=True``
-    demotes any holder unconditionally. The whole read-decide-write
-    runs inside one BEGIN IMMEDIATE transaction so concurrent
-    orchestrator registrations serialize on the SQLite writer lock.
+    demoted to worker and the new sid takes over, with one exception:
+    a managed holder still marked active refuses CAS takeover at any
+    heartbeat age - a DRAIN-mode managed orchestrator is stale-hb
+    between turns by design (the wake nudge exists to reach it), so
+    demoting it on silence alone is a demotion hole. Only
+    ``force=True`` or the supervisor's own dead verdict clears it -
+    and a dead holder blocks nothing in the first place, whatever its
+    heartbeat row says.
+    The whole read-decide-write runs inside one BEGIN IMMEDIATE
+    transaction so concurrent orchestrator registrations serialize on
+    the SQLite writer lock.
 
     Registering is a liveness signal, so the sessions row is written
     with ``status='active'`` (a session the supervisor marked dead
@@ -1522,16 +1529,27 @@ def register(
             con.execute("BEGIN IMMEDIATE")
             try:
                 if role_v == SessionRole.ORCHESTRATOR.value and not force:
+                    # a holder is protected while marked active and
+                    # either its heartbeat is fresh OR it is a managed
+                    # session - managed DRAIN sessions are stale-hb
+                    # between turns by design, so hb age alone must
+                    # never demote them (item_122). A dead verdict is
+                    # terminal fencing evidence: a dead holder blocks
+                    # nothing, whatever its heartbeat row says.
                     holder = con.execute(
                         "SELECT s.session_id AS sid, wh.last_seen_at AS seen"
                         " FROM sessions s"
-                        " JOIN worker_heartbeats wh"
+                        " LEFT JOIN worker_heartbeats wh"
                         "  ON wh.session_id=s.session_id"
-                        " WHERE s.role=? AND s.session_id<>? AND wh.last_seen_at>?",
+                        " WHERE s.role=? AND s.session_id<>?"
+                        "  AND s.status=?"
+                        "  AND (wh.last_seen_at>? OR s.mode=?)",
                         (
                             SessionRole.ORCHESTRATOR.value,
                             session_id,
+                            SessionStatus.ACTIVE.value,
                             ts - HEARTBEAT_STALE_SECONDS,
+                            SessionMode.MANAGED.value,
                         ),
                     ).fetchone()
                     if holder is not None:
@@ -1541,7 +1559,9 @@ def register(
                             session_id=session_id,
                             role=role_v,
                             holder=holder["sid"],
-                            heartbeat_age=ts - int(holder["seen"]),
+                            heartbeat_age=(
+                                ts - int(holder["seen"]) if holder["seen"] is not None else None
+                            ),
                         )
                 if role_v == SessionRole.ORCHESTRATOR.value:
                     # singleton takeover: demote every other holder
@@ -1587,14 +1607,47 @@ def heartbeat(session_id: str, *, path=None) -> int:
     Inserts the worker_heartbeats row when missing (generation 1) and
     bumps the generation on every call, per the contract: a caller
     holding an older generation detects it has been superseded.
+
+    A heartbeat is authoritative liveness for UNMANAGED sessions -
+    stale hb is their dead-marking signal - so a heartbeat also
+    revives their sessions row (item_122): a dead-flagged session
+    that provably heartbeats clears its own latch instead of staying
+    dead until a manual re-register. Managed rows are deliberately
+    excluded: their dead verdict comes from the no_session streak
+    (absent from session/list), which a heartbeat cannot refute -
+    and the DRAIN observer-shell heartbeat loop could outlive the
+    session itself, so reviving managed rows here would create a
+    revive/re-dead flap that requeues the live task to terminal
+    failure. A wrongly dead-marked managed session recovers through
+    ``register``, which no observer shell ever emits.
     """
     ts = _now()
 
     def op():
         con = connect(path)
         try:
-            row = con.execute(_HEARTBEAT_UPSERT, (session_id, ts)).fetchone()
-            return int(row["generation"])
+            con.execute("BEGIN IMMEDIATE")
+            try:
+                row = con.execute(_HEARTBEAT_UPSERT, (session_id, ts)).fetchone()
+                con.execute(
+                    "UPDATE sessions SET status=?, updated_at=?"
+                    " WHERE session_id=? AND status=?"
+                    "  AND COALESCE(mode,?)<>?",
+                    (
+                        SessionStatus.ACTIVE.value,
+                        ts,
+                        session_id,
+                        SessionStatus.DEAD.value,
+                        SessionMode.UNMANAGED.value,
+                        SessionMode.MANAGED.value,
+                    ),
+                )
+                con.execute("COMMIT")
+                return int(row["generation"])
+            except BaseException:
+                if con.in_transaction:
+                    con.execute("ROLLBACK")
+                raise
         finally:
             con.close()
 
