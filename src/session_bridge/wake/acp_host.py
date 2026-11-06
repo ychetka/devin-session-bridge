@@ -282,10 +282,22 @@ def status_is_idle(status: str | None) -> bool:
 
 
 def _is_busy(entry: dict | None) -> bool:
-    """Conservative busy check: only an explicit idle status wakes."""
+    """Busy check: only an explicit non-idle statusEnum skips the nudge.
+
+    A missing statusEnum means the host holds no live turn state for
+    the session at all (persisted row, closed tab, pre-statusEnum
+    restore). That is exactly the inert case the wake exists for -
+    the acp-host runs the prompt on demand even with no open client
+    (verified live: an unlocked closed session answers with a real
+    end_turn) - so statusless must not read as busy (item_139:
+    statusless sessions were skipped as "busy" forever, their mail
+    never drained, and the record_confirmed path masked every
+    safeguard).
+    """
     if entry is None:
         return True  # unknown session - do not inject blind
-    return not status_is_idle(_session_status(entry))
+    status = _session_status(entry)
+    return status is not None and not status_is_idle(status)
 
 
 def _initialize_params() -> dict:

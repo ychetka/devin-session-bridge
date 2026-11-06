@@ -271,7 +271,9 @@ def test_item13d_once_writes_heartbeat_and_decision_log(env):
 
     hb = Path(env.sdir) / daemon.HEARTBEAT_FILENAME
     assert hb.exists()
-    ts = int(hb.read_text().strip())
+    # line 1 is the timestamp contract; line 2 carries the item_139
+    # mail-stall metric - readers take the first line only
+    ts = int(hb.read_text().splitlines()[0])
     assert abs(ts - int(time.time())) < 5
     assert daemon.heartbeat_age(env.sdir) is not None
     assert daemon.heartbeat_age(env.sdir) < 5
@@ -1049,3 +1051,209 @@ def test_item122_gwt7_restart_mid_streak_starts_fresh(env, monkeypatch):
     assert db.get_session(SID, path=env.db)["status"] == SessionStatus.ACTIVE.value
     daemon._wake_pass(env.db, env.sdir, now, p2)  # fresh streak 3 - dead
     assert db.get_session(SID, path=env.db)["status"] == SessionStatus.DEAD.value
+
+
+# --- item_139: parked tasks are not wake triggers; mail-stall escalation -----
+
+
+def _running_task(env, sid=SID):
+    tid = db.enqueue(sid, "work", path=env.db)
+    assert db.claim_managed(tid, sid, sid, path=env.db)
+    return tid
+
+
+def _managed_stale(env, sid=SID):
+    res = db.register(sid, "/repo/ws", path=env.db)
+    assert res.accepted
+    db.set_session_mode(sid, SessionMode.MANAGED, path=env.db)
+    _stale_heartbeat(env.db, sid)
+
+
+def test_item139_gwt1_awaiting_user_task_not_wake_candidate(env, monkeypatch):
+    """[ITEM-139.GWT-1] stale-hb managed session whose only live task is
+    awaiting_user -> no task leg wake: the task is parked on an
+    out-of-band answer that arrives as actionable mail with its own
+    leg (the orchestrator task 128 defect)."""
+    _managed_stale(env)
+    tid = _running_task(env)
+    assert db.set_awaiting_user(tid, SID, "waiting on review", path=env.db)
+    calls = _wake_calls(env, monkeypatch)
+
+    assert daemon.run(env.db, env.qdir, once=True, notify_send=env.notifier) == daemon.RUN_OK
+    assert calls == []
+
+
+def test_item139_gwt2_fresh_wait_until_suppresses_task_leg(env, monkeypatch):
+    """[ITEM-139.GWT-2] `bridge wait` stamps wait_until = lease expiry:
+    a running task mid external-wait is not wake-worthy until the
+    stamp decays, then it is again (the dead-worker boundary)."""
+    _managed_stale(env)
+    tid = _running_task(env)
+    calls = _wake_calls(env, monkeypatch)
+
+    # running without a wait stamp: wake-worthy liveness probe
+    assert daemon.run(env.db, env.qdir, once=True, notify_send=env.notifier) == daemon.RUN_OK
+    assert calls == [SID]
+
+    calls.clear()
+    assert db.wait_task(tid, SID, "waiting on CI", path=env.db)
+    task = db.get_task(tid, path=env.db)
+    assert task["wait_until"] == task["lease_expires_at"]
+    assert daemon.run(env.db, env.qdir, once=True, notify_send=env.notifier) == daemon.RUN_OK
+    assert calls == []
+
+    # stamp expired -> wake-worthy again on its own, no clear needed
+    _exec(env.db, "UPDATE tasks SET wait_until=? WHERE id=?", (int(time.time()) - 1, tid))
+    assert daemon.run(env.db, env.qdir, once=True, notify_send=env.notifier) == daemon.RUN_OK
+    assert calls == [SID]
+
+
+def test_item139_gwt3_mail_stall_escalates_once_per_episode(env, monkeypatch):
+    """[ITEM-139.GWT-3] actionable mail older than the stall threshold
+    -> exactly one directive into the orchestrator mailbox naming the
+    session and age; draining opens a fresh episode."""
+    _managed_stale(env)
+    res = db.register("orc", "/repo/orc", role="orchestrator", path=env.db)
+    assert res.accepted
+    db.set_session_mode("orc", SessionMode.MANAGED, path=env.db)
+    _unacked(env, SID, NotificationKind.DIRECTIVE)
+    _exec(env.db, "UPDATE notifications SET created_at=?", (int(time.time()) - 7200,))
+    _wake_calls(env, monkeypatch)  # keep the wake path quiet
+
+    now = int(time.time())
+    age = daemon._mail_stall_pass(env.db, env.sdir, now, env.notifier)
+    assert age >= 7199
+    orch_mail = _one(
+        env.db,
+        "SELECT body FROM notifications WHERE session_id='orc' AND kind='directive'",
+    )
+    assert orch_mail is not None and SID in orch_mail["body"] and "120m" in orch_mail["body"]
+    assert (
+        _one(env.db, "SELECT mail_escalated_at FROM wake_state WHERE session_id=?", (SID,))[
+            "mail_escalated_at"
+        ]
+        is not None
+    )
+
+    # second pass same episode: dedup, no second directive
+    daemon._mail_stall_pass(env.db, env.sdir, now + 60, env.notifier)
+    assert _one(env.db, "SELECT COUNT(*) c FROM notifications WHERE session_id='orc'")["c"] == 1
+
+    # drain -> episode stamp cleared -> next stall re-escalates
+    db.ack_notifications(SID, path=env.db)
+    assert daemon._mail_stall_pass(env.db, env.sdir, now + 120, env.notifier) == 0
+    assert (
+        _one(env.db, "SELECT mail_escalated_at FROM wake_state WHERE session_id=?", (SID,))[
+            "mail_escalated_at"
+        ]
+        is None
+    )
+    _unacked(env, SID, NotificationKind.DIRECTIVE)
+    _exec(
+        env.db,
+        "UPDATE notifications SET created_at=? WHERE ack_at IS NULL",
+        (int(time.time()) - 7200,),
+    )
+    daemon._mail_stall_pass(env.db, env.sdir, now + 180, env.notifier)
+    assert _one(env.db, "SELECT COUNT(*) c FROM notifications WHERE session_id='orc'")["c"] == 2
+
+
+def test_item139_gwt4_tick_only_mail_never_stalls(env, monkeypatch):
+    """[ITEM-139.GWT-4] an ancient unacked heartbeat_tick is not
+    actionable mail: no escalation, metric stays 0."""
+    _managed_stale(env)
+    _unacked(env, SID, NotificationKind.HEARTBEAT_TICK)
+    _exec(env.db, "UPDATE notifications SET created_at=?", (int(time.time()) - 7200,))
+    _wake_calls(env, monkeypatch)
+
+    assert daemon._mail_stall_pass(env.db, env.sdir, int(time.time()), env.notifier) == 0
+    assert env.sent == []
+    assert _one(env.db, "SELECT COUNT(*) c FROM notifications WHERE kind='directive'")["c"] == 0
+
+
+def test_item139_gwt5_orchestrator_self_stall_uses_notify_send(env, monkeypatch):
+    """[ITEM-139.GWT-5] the active orchestrator's own undrained mail
+    cannot go to its own mailbox (it would stall there too) -> the
+    escalation lands on notify_send instead."""
+    res = db.register("orc", "/repo/orc", role="orchestrator", path=env.db)
+    assert res.accepted
+    db.set_session_mode("orc", SessionMode.MANAGED, path=env.db)
+    _unacked(env, "orc", NotificationKind.DIRECTIVE)
+    _exec(env.db, "UPDATE notifications SET created_at=?", (int(time.time()) - 7200,))
+    _wake_calls(env, monkeypatch)
+
+    daemon._mail_stall_pass(env.db, env.sdir, int(time.time()), env.notifier)
+
+    assert env.sent and "orc" in env.sent[0][1]
+    assert _one(env.db, "SELECT COUNT(*) c FROM notifications WHERE kind='directive'")["c"] == 1
+
+
+def test_item139_gwt6_no_orchestrator_falls_back_to_notify_send(env, monkeypatch):
+    """[ITEM-139.GWT-6] no active orchestrator holder -> the stall
+    notice has nowhere to route but the OS notification."""
+    _managed_stale(env)
+    _unacked(env, SID, NotificationKind.DIRECTIVE)
+    _exec(env.db, "UPDATE notifications SET created_at=?", (int(time.time()) - 7200,))
+    _wake_calls(env, monkeypatch)
+
+    daemon._mail_stall_pass(env.db, env.sdir, int(time.time()), env.notifier)
+
+    assert env.sent and SID in env.sent[0][1]
+
+
+def test_item139_gwt8_episode_rearms_on_new_mail_after_partial_drain(env, monkeypatch):
+    """[ITEM-139.GWT-8] review fix: a session whose escalated mail
+    drained but NEWER mail keeps stalling must re-escalate - re-arming
+    only on a fully-empty mailbox would give a chronically stalled
+    session one escalation ever."""
+    _managed_stale(env)
+    res = db.register("orc", "/repo/orc", role="orchestrator", path=env.db)
+    assert res.accepted
+    _unacked(env, SID, NotificationKind.DIRECTIVE)
+    old_cutoff = int(time.time()) - 7200
+    _exec(env.db, "UPDATE notifications SET created_at=? WHERE ack_at IS NULL", (old_cutoff,))
+    _wake_calls(env, monkeypatch)
+
+    now = int(time.time())
+    daemon._mail_stall_pass(env.db, env.sdir, now, env.notifier)
+    assert _one(env.db, "SELECT COUNT(*) c FROM notifications WHERE session_id='orc'")["c"] == 1
+
+    # the escalated mail drains, a NEW directive arrives (created after
+    # the stamp) and itself stalls past the threshold
+    db.ack_notifications(SID, path=env.db)
+    _exec(
+        env.db,
+        "UPDATE wake_state SET mail_escalated_at=? WHERE session_id=?",
+        (int(time.time()) - 3600, SID),
+    )
+    _unacked(env, SID, NotificationKind.DIRECTIVE)
+    # created_at is newer than the (backdated) stamp but older than
+    # the stall threshold -> a fresh episode, not the same stall
+    _exec(
+        env.db,
+        "UPDATE notifications SET created_at=? WHERE ack_at IS NULL",
+        (int(time.time()) - 2000,),
+    )
+    daemon._mail_stall_pass(env.db, env.sdir, now + 30, env.notifier)
+    assert _one(env.db, "SELECT COUNT(*) c FROM notifications WHERE session_id='orc'")["c"] == 2
+
+
+def test_item139_gwt9_no_target_defers_without_consuming_episode(env, monkeypatch):
+    """[ITEM-139.GWT-9] review fix: no orchestrator and no notify_send
+    -> mail_stall_deferred, the stamp is NOT consumed - the escalation
+    still fires the first pass a target exists."""
+    _managed_stale(env)
+    _unacked(env, SID, NotificationKind.DIRECTIVE)
+    _exec(env.db, "UPDATE notifications SET created_at=?", (int(time.time()) - 7200,))
+    _wake_calls(env, monkeypatch)
+
+    daemon._mail_stall_pass(env.db, env.sdir, int(time.time()), None)
+    assert (
+        _one(env.db, "SELECT COUNT(*) c FROM wake_state WHERE mail_escalated_at IS NOT NULL")["c"]
+        == 0
+    )
+    assert [d["event"] for d in _decisions(env)] == ["mail_stall_deferred"]
+
+    # notify_send appears -> the episode escalates on the next pass
+    daemon._mail_stall_pass(env.db, env.sdir, int(time.time()) + 5, env.notifier)
+    assert env.sent and SID in env.sent[0][1]

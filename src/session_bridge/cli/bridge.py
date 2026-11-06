@@ -1096,13 +1096,18 @@ def _status_snapshot(args) -> dict:
             " ws.escalated AS wake_escalated,"
             " ws.last_outcome_at AS wake_at,"
             " (SELECT MAX(n.ack_at) FROM notifications n"
-            "   WHERE n.session_id=s.session_id) AS last_ack"
+            "   WHERE n.session_id=s.session_id) AS last_ack,"
+            " (SELECT MIN(n.created_at) FROM notifications n"
+            "   WHERE n.session_id=s.session_id"
+            "     AND n.relayed_at IS NOT NULL AND n.ack_at IS NULL"
+            "     AND n.kind<>?) AS mail_oldest"
             " FROM sessions s"
             " LEFT JOIN worker_heartbeats wh"
             "   ON wh.session_id=s.session_id"
             " LEFT JOIN wake_state ws"
             "   ON ws.session_id=s.session_id"
-            " ORDER BY s.session_id"
+            " ORDER BY s.session_id",
+            (NotificationKind.HEARTBEAT_TICK.value,),
         ).fetchall()
         latest = {
             r["session_id"]: r
@@ -1179,6 +1184,7 @@ def _status_snapshot(args) -> dict:
             "wake_age_seconds": _age(now, r["wake_at"]),
             "wake_streak": int(r["wake_streak"] or 0),
             "wake_escalated": bool(r["wake_escalated"]),
+            "mail_age_seconds": _age(now, r["mail_oldest"]),
         }
         row["state"] = _fleet_state(r["status"], t)
         fleet.append(row)
@@ -1204,6 +1210,7 @@ def _status_snapshot(args) -> dict:
             "wake_age_seconds": None,
             "wake_streak": 0,
             "wake_escalated": False,
+            "mail_age_seconds": None,
             "state": _fleet_state(None, t),
         }
         fleet.append(row)
@@ -1349,6 +1356,7 @@ def _fleet_row_line(r) -> str:
         f"{_cut(sid, 16):<16} {_cut(r['repo'], 16):<16} {_cut(task, 20):<20}"
         f" {_task_state_cell(r):<6} {_cut(r['state'], 8):<8} {q:>4} {fail:>4}"
         f" {_fmt_age(_fleet_seen_age(r)):>5} {_wake_cell(r):<7}"
+        f" {_fmt_age(r['mail_age_seconds']):>5}"
     )
 
 
@@ -1387,7 +1395,7 @@ def _render_status(snap) -> str:
     else:
         lines.append(
             f"{'SID':<16} {'REPO':<16} {'TASK':<20} {'TSTAT':<6} {'STATE':<8}"
-            f" {'Q':>4} {'FAIL':>4} {'SEEN':>5} {'WAKE':<7}"
+            f" {'Q':>4} {'FAIL':>4} {'SEEN':>5} {'WAKE':<7} {'MAIL':>5}"
         )
         # rows get what the budget leaves after banner + vitals +
         # header + the digest footer

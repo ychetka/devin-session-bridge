@@ -265,13 +265,20 @@ def daemon_pid(state_directory: str):
 # --- daemon heartbeat ------------------------------------------------------------
 
 
-def _write_heartbeat(state_directory: str) -> None:
-    """Stamp ``daemon_heartbeat.txt`` with the current unix time."""
+def _write_heartbeat(state_directory: str, metric: str | None = None) -> None:
+    """Stamp ``daemon_heartbeat.txt`` with the current unix time.
+
+    ``metric`` is an optional ``key=value`` line appended after the
+    timestamp - consumers that read the file take line 1 only, so the
+    second line is pure observability (item_139 mail-stall gauge).
+    """
     target = heartbeat_path(state_directory)
     fd, tmp = tempfile.mkstemp(prefix=".hb-", dir=state_directory)
     try:
         with os.fdopen(fd, "w") as fh:
             fh.write(f"{int(time.time())}\n")
+            if metric:
+                fh.write(f"{metric}\n")
             fh.flush()
             os.fsync(fh.fileno())
         os.replace(tmp, target)
@@ -531,35 +538,53 @@ def _wake_candidates(db_path, now: int):
     cutoff = now - db.HEARTBEAT_STALE_SECONDS
     con = db.connect(db_path)
     try:
+        # Two statuses are excluded from the task leg deliberately
+        # (item_139): awaiting_user is a parked task whose blocker is
+        # out-of-band (its answer arrives as actionable mail, which has
+        # its own leg), and a running task with a fresh wait_until stamp
+        # declared an external wait via `bridge wait` - poking a session
+        # that by definition cannot act yet is noise. The stamp decays
+        # with the lease it mirrors, so an abandoned wait becomes
+        # wake-worthy again on its own.
         return con.execute(
             "SELECT DISTINCT s.session_id AS sid, s.cwd AS cwd"
             " FROM sessions s"
             " LEFT JOIN worker_heartbeats wh ON wh.session_id=s.session_id"
             " WHERE s.mode=? AND s.status='active'"
-            " AND ((wh.last_seen_at IS NULL OR wh.last_seen_at<=?)"
-            "      AND (EXISTS (SELECT 1 FROM notifications n"
-            "                    WHERE n.session_id=s.session_id"
-            "                      AND n.relayed_at IS NOT NULL"
-            "                      AND n.ack_at IS NULL)"
-            # a live task is also wake-worthy mail: it keeps liveness
-            # probing (and thus no_session death detection) alive even
-            # when the outbox is empty (item_17 review)
-            "      OR EXISTS (SELECT 1 FROM tasks t"
-            "                 WHERE t.session_id=s.session_id"
-            "                   AND t.status IN ('queued','dispatch_decided',"
-            "                                    'running','awaiting_user')))"
-            # actionable mail (item_102c) wakes even a fresh-heartbeat
-            # DRAIN session: idle at the prompt it never opens a turn
-            # on its own, so the directive would sit until a human
-            # typed. heartbeat_tick alone stays non-waking here - its
-            # liveness-poke role only matters on the stale-hb path
-            # above. A busy session answers `busy` - harmless.
+            " AND ("
+            # stale-heartbeat leg (item_16/17): mail or live task while
+            # no turn is open. A live task keeps liveness probing (and
+            # thus no_session death detection) alive even when the
+            # outbox is empty (item_17 review).
+            "      ((wh.last_seen_at IS NULL OR wh.last_seen_at<=?)"
+            "       AND (EXISTS (SELECT 1 FROM notifications n"
+            "                     WHERE n.session_id=s.session_id"
+            "                       AND n.relayed_at IS NOT NULL"
+            "                       AND n.ack_at IS NULL)"
+            "            OR EXISTS (SELECT 1 FROM tasks t"
+            "                       WHERE t.session_id=s.session_id"
+            "                         AND (t.status IN ('queued','dispatch_decided')"
+            "                              OR (t.status='running'"
+            "                                  AND (t.wait_until IS NULL"
+            "                                       OR t.wait_until<=?))))))"
+            # actionable-mail leg (item_102c) wakes even a
+            # fresh-heartbeat DRAIN session: idle at the prompt it
+            # never opens a turn on its own, so the directive would
+            # sit until a human typed. heartbeat_tick alone stays
+            # non-waking here - its liveness-poke role only matters on
+            # the stale-hb path above. A busy session answers `busy` -
+            # harmless.
             "      OR EXISTS (SELECT 1 FROM notifications n"
             "                 WHERE n.session_id=s.session_id"
             "                   AND n.relayed_at IS NOT NULL"
             "                   AND n.ack_at IS NULL"
             "                   AND n.kind != ?))",
-            (SessionMode.MANAGED.value, cutoff, NotificationKind.HEARTBEAT_TICK.value),
+            (
+                SessionMode.MANAGED.value,
+                cutoff,
+                now,
+                NotificationKind.HEARTBEAT_TICK.value,
+            ),
         ).fetchall()
     finally:
         con.close()
@@ -656,6 +681,110 @@ def _wake_pass(db_path, state_directory, now: int, policy: WakePolicy, notify=No
 
     if unverified:
         _verify_unconfirmed_wakes(db_path, state_directory, unverified, policy, notify)
+
+
+def _env_int(name: str, default: int) -> int:
+    """Env-derived int with a safe default: a malformed override must
+    not crash the module import (bridge.py loads this module at CLI
+    startup - a typoed env var would brick the whole CLI)."""
+    try:
+        return int(os.environ.get(name, ""))
+    except ValueError:
+        return default
+
+
+#: Undrained actionable mail older than this triggers one escalation
+#: per stall episode (item_139) - a session whose relayed mail sits
+#: unacked this long is unreachable by every other signal we have.
+_MAIL_STALL_SECONDS = _env_int("SESSIONS_BRIDGE_MAIL_STALL_SECONDS", 1800)
+
+
+def _mail_stall_pass(db_path, state_directory, now: int, notify_send=None) -> int:
+    """Escalate undrained mail to the orchestrator, once per episode.
+
+    For every session whose actionable mail (relayed, unacked,
+    non-heartbeat_tick) sits past ``_MAIL_STALL_SECONDS`` the daemon
+    pushes a directive into the active orchestrator's mailbox naming
+    the session and the wait age - the orchestrator can manual-wake
+    or escalate to the developer. The orchestrator's own stall goes
+    to ``notify_send`` instead (a self-addressed directive would sit
+    undrained too).
+
+    Dedup is the ``wake_state.mail_escalated_at`` stamp: one
+    escalation per stall episode, cleared when the mailbox drains or
+    when the oldest remaining mail is newer than the stamp (the
+    escalated items drained - a newer stall is a fresh episode).
+    Returns the maximum undrained age seen this pass - the caller
+    writes it into ``daemon_heartbeat.txt`` as the stall metric.
+    """
+    undrained = db.sessions_with_undrained_mail(path=db_path)
+    max_age = 0
+    for r in undrained.values():
+        max_age = max(max_age, now - r["oldest"])
+
+    # episode re-arm: a fully-drained mailbox obviously opens a fresh
+    # episode, but so does one whose OLDEST remaining mail is newer
+    # than the stamp - the previously escalated items were drained
+    # and what sits there now is a new stall, not the same one
+    # (review: without this, a session that never fully drains gets
+    # exactly one escalation ever).
+    for sid, ws in db.list_wake_state(path=db_path).items():
+        stamp = ws.get("mail_escalated_at")
+        if stamp is None:
+            continue
+        if sid not in undrained or undrained[sid]["oldest"] > stamp:
+            db.clear_mail_escalated(sid, path=db_path)
+
+    con = db.connect(db_path)
+    try:
+        orch = con.execute(
+            "SELECT session_id FROM sessions WHERE role=? AND status=?"
+            " ORDER BY updated_at DESC LIMIT 1",
+            (SessionRole.ORCHESTRATOR.value, SessionStatus.ACTIVE.value),
+        ).fetchone()
+    finally:
+        con.close()
+    orch_sid = orch["session_id"] if orch else None
+
+    for sid, r in undrained.items():
+        age = now - r["oldest"]
+        if age < _MAIL_STALL_SECONDS:
+            continue
+        # pick the delivery target FIRST: the dedup stamp is consumed
+        # only when an escalation can actually leave the daemon
+        # (review: stamping before delivery meant a notify-send-less
+        # pass logged the episode's only escalation into the void).
+        if orch_sid is not None and sid != orch_sid:
+            target = "orchestrator"
+        elif notify_send is not None:
+            target = "notify-send"
+        else:
+            _decision(
+                state_directory,
+                "mail_stall_deferred",
+                sid,
+                f"age={age}s count={r['count']} no escalation target",
+            )
+            continue
+        if not db.mark_mail_escalated(sid, path=db_path):
+            continue  # already escalated this episode
+        body = (
+            f"mail undrained {age // 60}m: {sid} has {r['count']} unacked"
+            " relayed notification(s) - drain is not reaching it"
+            " (manual `bridge wake` or escalate to developer)"
+        )
+        if target == "orchestrator":
+            db.notify(orch_sid, NotificationKind.DIRECTIVE, body, path=db_path)
+        else:
+            notify_send("sessions-bridge MAIL STALL", body)
+        _decision(
+            state_directory,
+            "mail_stall_escalated",
+            sid,
+            f"age={age}s count={r['count']} -> {target}"
+            + (f" {orch_sid}" if target == "orchestrator" else ""),
+        )
+    return max_age
 
 
 def _mark_dead_no_session(db_path, state_directory, sid, streak: int) -> None:
@@ -877,7 +1006,12 @@ def run(
                 _relay_pass(db_path, queue_dir, state_directory)
                 _wake_pass(db_path, state_directory, now, wake_policy, notify)
                 _sweep_pass(db_path, state_directory, notify, now)
+                stall_age = _mail_stall_pass(db_path, state_directory, now, notify)
                 _question_janitor_pass(db_path, state_directory)
+                # metric line: the oldest undrained-mail age rides along
+                # in the heartbeat file (external watchdogs read line 1
+                # only - line 2 is observability, not a contract)
+                _write_heartbeat(state_directory, f"mail_undrained_max_age={stall_age}")
             except Exception as e:
                 if once:
                     raise

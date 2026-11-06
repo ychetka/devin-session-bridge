@@ -126,6 +126,9 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- dead schema for now: declared for the contract model, not yet
   -- consumed by claim_queued
   run_after INTEGER,
+  -- `bridge wait` stamps the mirrored lease expiry here so the wake
+  -- query can skip externally-waiting running tasks (item_139)
+  wait_until INTEGER,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
@@ -264,6 +267,7 @@ CREATE TABLE IF NOT EXISTS wake_state (
   last_outcome_at INTEGER,
   unconfirmed_streak INTEGER NOT NULL DEFAULT 0,
   escalated INTEGER NOT NULL DEFAULT 0,
+  mail_escalated_at INTEGER,
   updated_at INTEGER NOT NULL
 );
 
@@ -283,7 +287,15 @@ _SESSION_COLUMN_MIGRATIONS = (
 # Columns the v3 schema adds to tasks, applied idempotently for
 # pre-v3 files in the same BEGIN IMMEDIATE migration transaction
 # (CREATE TABLE IF NOT EXISTS cannot extend a live tasks table).
-_TASK_COLUMN_MIGRATIONS = (("run_after", "INTEGER"),)
+_TASK_COLUMN_MIGRATIONS = (
+    ("run_after", "INTEGER"),
+    ("wait_until", "INTEGER"),
+)
+
+# Columns the item_139 schema adds to wake_state, applied idempotently
+# for pre-existing files inside the same BEGIN IMMEDIATE migration
+# transaction as the other column migrations.
+_WAKE_COLUMN_MIGRATIONS = (("mail_escalated_at", "INTEGER"),)
 
 _SESSION_FIELDS = frozenset({"cwd", "title", "queue_paused", "park_cycles_left", "note"})
 
@@ -377,6 +389,10 @@ def init(path=None) -> None:
                 for col, decl in _TASK_COLUMN_MIGRATIONS:
                     if col not in existing:
                         con.execute(f"ALTER TABLE tasks ADD COLUMN {col} {decl}")
+                existing = {r["name"] for r in con.execute("PRAGMA table_info(wake_state)")}
+                for col, decl in _WAKE_COLUMN_MIGRATIONS:
+                    if col not in existing:
+                        con.execute(f"ALTER TABLE wake_state ADD COLUMN {col} {decl}")
                 con.execute("PRAGMA user_version=3")
                 con.execute("COMMIT")
             except BaseException:
@@ -676,6 +692,14 @@ def wait_task(task_id: int, owner: str, note: str | None = None, *, path=None) -
     for operator visibility. Bounded: a single call extends at most
     one LEASE_SECONDS, so a dead worker stops renewing and the task
     still requeues within one lease period.
+
+    Also stamps ``wait_until`` = the new lease expiry (item_139): the
+    daemon wake candidates skip a running task whose declared
+    out-of-band wait is still fresh - waking a session that cannot
+    act until the external answer arrives is noise. The stamp needs
+    no clearing: it expires together with the lease it mirrors, so a
+    worker that resumes real work (or dies) becomes wake-worthy
+    again automatically.
     """
     ts = _now()
 
@@ -684,11 +708,12 @@ def wait_task(task_id: int, owner: str, note: str | None = None, *, path=None) -
         try:
             cur = con.execute(
                 "UPDATE tasks SET lease_expires_at=?, lease_renewed_at=?,"
-                " note=COALESCE(?,note), updated_at=?"
+                " wait_until=?, note=COALESCE(?,note), updated_at=?"
                 " WHERE id=? AND status=? AND lease_owner=?",
                 (
                     ts + LEASE_SECONDS,
                     ts,
+                    ts + LEASE_SECONDS,
                     note,
                     ts,
                     task_id,
@@ -2378,6 +2403,82 @@ def list_wake_state(*, path=None) -> dict:
             return {
                 r["session_id"]: dict(r) for r in con.execute("SELECT * FROM wake_state").fetchall()
             }
+        finally:
+            con.close()
+
+    return _retry(op)
+
+
+def sessions_with_undrained_mail(*, path=None) -> dict:
+    """Undrained actionable mail per session: {sid: {oldest, count}}.
+
+    "Undrained" = relayed to the fs mailbox but not yet acked; the
+    heartbeat_tick kind is excluded - it is a liveness poke, not
+    actionable work, so an unacked tick alone never stalls a session
+    (item_139).
+    """
+
+    def op():
+        con = connect(path)
+        try:
+            rows = con.execute(
+                "SELECT session_id AS sid, MIN(created_at) AS oldest,"
+                " COUNT(*) AS count"
+                " FROM notifications"
+                " WHERE relayed_at IS NOT NULL AND ack_at IS NULL"
+                "  AND kind<>?"
+                " GROUP BY session_id",
+                (NotificationKind.HEARTBEAT_TICK.value,),
+            ).fetchall()
+            return {r["sid"]: {"oldest": int(r["oldest"]), "count": int(r["count"])} for r in rows}
+        finally:
+            con.close()
+
+    return _retry(op)
+
+
+def mark_mail_escalated(session_id: str, *, path=None) -> bool:
+    """Stamp ``wake_state.mail_escalated_at`` once per stall episode.
+
+    Returns True only for the caller that actually set the stamp - the
+    upsert's NULL guard makes repeated daemon passes no-ops until
+    :func:`clear_mail_escalated` opens a fresh episode, so the
+    orchestrator gets one directive per stall, not one per pass.
+    """
+    ts = _now()
+
+    def op():
+        con = connect(path)
+        try:
+            cur = con.execute(
+                "INSERT INTO wake_state(session_id,mail_escalated_at,updated_at)"
+                " VALUES(?,?,?)"
+                " ON CONFLICT(session_id) DO UPDATE SET"
+                " mail_escalated_at=excluded.mail_escalated_at,"
+                " updated_at=excluded.updated_at"
+                " WHERE wake_state.mail_escalated_at IS NULL",
+                (session_id, ts, ts),
+            )
+            return cur.rowcount == 1
+        finally:
+            con.close()
+
+    return _retry(op)
+
+
+def clear_mail_escalated(session_id: str, *, path=None) -> bool:
+    """Drop the stall stamp once the mailbox is drained (new episode)."""
+    ts = _now()
+
+    def op():
+        con = connect(path)
+        try:
+            cur = con.execute(
+                "UPDATE wake_state SET mail_escalated_at=NULL, updated_at=?"
+                " WHERE session_id=? AND mail_escalated_at IS NOT NULL",
+                (ts, session_id),
+            )
+            return cur.rowcount == 1
         finally:
             con.close()
 
