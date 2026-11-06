@@ -1626,21 +1626,28 @@ def heartbeat(session_id: str, *, path=None) -> int:
     def op():
         con = connect(path)
         try:
-            row = con.execute(_HEARTBEAT_UPSERT, (session_id, ts)).fetchone()
-            con.execute(
-                "UPDATE sessions SET status=?, updated_at=?"
-                " WHERE session_id=? AND status=?"
-                "  AND COALESCE(mode,?)<>?",
-                (
-                    SessionStatus.ACTIVE.value,
-                    ts,
-                    session_id,
-                    SessionStatus.DEAD.value,
-                    SessionMode.UNMANAGED.value,
-                    SessionMode.MANAGED.value,
-                ),
-            )
-            return int(row["generation"])
+            con.execute("BEGIN IMMEDIATE")
+            try:
+                row = con.execute(_HEARTBEAT_UPSERT, (session_id, ts)).fetchone()
+                con.execute(
+                    "UPDATE sessions SET status=?, updated_at=?"
+                    " WHERE session_id=? AND status=?"
+                    "  AND COALESCE(mode,?)<>?",
+                    (
+                        SessionStatus.ACTIVE.value,
+                        ts,
+                        session_id,
+                        SessionStatus.DEAD.value,
+                        SessionMode.UNMANAGED.value,
+                        SessionMode.MANAGED.value,
+                    ),
+                )
+                con.execute("COMMIT")
+                return int(row["generation"])
+            except BaseException:
+                if con.in_transaction:
+                    con.execute("ROLLBACK")
+                raise
         finally:
             con.close()
 
