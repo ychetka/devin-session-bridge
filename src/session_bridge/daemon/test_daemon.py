@@ -1343,3 +1343,32 @@ def test_item139_gwt13_fs_pending_respects_managed_active_gate(env, monkeypatch)
 
     assert daemon.run(env.db, env.qdir, once=True, notify_send=env.notifier) == daemon.RUN_OK
     assert calls == []
+
+
+def test_item139_gwt14_real_tick_file_does_not_wake(env, monkeypatch):
+    """[ITEM-139.GWT-14] a genuine relayed heartbeat_tick file in the
+    mailbox is a poke, not pending mail: file leg stays silent even
+    though a msg_*.txt exists on disk."""
+    _managed_fresh(env)
+    db.notify(SID, NotificationKind.HEARTBEAT_TICK, "tick", path=env.db)
+    calls = _wake_calls(env, monkeypatch)
+
+    assert daemon.run(env.db, env.qdir, once=True, notify_send=env.notifier) == daemon.RUN_OK
+    assert calls == []
+    # the relayed tick file is really on disk and still must not wake
+    assert daemon.run(env.db, env.qdir, once=True, notify_send=env.notifier) == daemon.RUN_OK
+    assert calls == []
+
+
+def test_item139_gwt15_foreign_file_colliding_with_tick_nid_wakes(env, monkeypatch):
+    """[ITEM-139.GWT-15] a foreign msg_<N>.txt whose N collides with a
+    heartbeat_tick row id is still actionable: provenance comes from
+    the relay headers, not the bare id."""
+    _managed_fresh(env)
+    tick_nid = db.notify(SID, NotificationKind.HEARTBEAT_TICK, "tick", path=env.db)
+    db.mark_relayed(tick_nid, path=env.db)
+    _foreign_msg(env, SID, nid=tick_nid)  # no relay headers inside
+    calls = _wake_calls(env, monkeypatch)
+
+    assert daemon.run(env.db, env.qdir, once=True, notify_send=env.notifier) == daemon.RUN_OK
+    assert calls == [SID]

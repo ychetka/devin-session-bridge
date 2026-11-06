@@ -2410,7 +2410,10 @@ def list_wake_state(*, path=None) -> dict:
 
 
 def sessions_with_undrained_mail(*, path=None) -> dict:
-    """Undrained actionable mail per session: {sid: {oldest, count}}.
+    """Undrained actionable mail per session:
+    {sid: {oldest, count, nids}} - ``nids`` is the set of pending
+    notification ids so callers can dedup the matching
+    ``msg_<nid>.txt`` mailbox files against foreign files.
 
     "Undrained" = relayed to the fs mailbox but not yet acked; the
     heartbeat_tick kind is excluded - it is a liveness poke, not

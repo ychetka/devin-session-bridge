@@ -556,24 +556,14 @@ def _pending_mailbox_dirs(db_path, queue_dir=None) -> dict:
             if not stats:
                 continue
             # a heartbeat_tick file is a liveness poke, never
-            # actionable mail - without the kind lookup the file leg
+            # actionable mail - without the header check the file leg
             # would re-break the "tick alone never wakes" contract
-            # every time the relay delivers a poke.
-            nids = [n for n in (_msg_nid(x[0]) for x in stats) if n is not None]
-            kinds = {}
-            if nids:
-                marks = ",".join("?" * len(nids))
-                kinds = {
-                    int(r["id"]): r["kind"]
-                    for r in con.execute(
-                        f"SELECT id, kind FROM notifications WHERE id IN ({marks})",
-                        nids,
-                    ).fetchall()
-                }
+            # every time the relay delivers a poke.  Provenance comes
+            # from the file's own relay headers (_msg_is_tick), not a
+            # bare id lookup: a foreign writer's msg_<N>.txt may
+            # collide with an unrelated row id.
             actionable = [
-                (n, mt)
-                for n, mt in stats
-                if kinds.get(_msg_nid(n)) != NotificationKind.HEARTBEAT_TICK.value
+                (n, mt) for n, mt in stats if not _msg_is_tick(os.path.join(mdir, n), _msg_nid(n))
             ]
             if actionable:
                 pending[sid] = {
@@ -801,6 +791,37 @@ def _msg_nid(name: str):
     name carries no digits (a foreign file that matches no row)."""
     stem = name[4:-4] if name.startswith("msg_") and name.endswith(".txt") else ""
     return int(stem) if stem.isdigit() else None
+
+
+def _msg_is_tick(path: str, nid) -> bool:
+    """True only for a genuine relayed heartbeat_tick artifact.
+
+    The filename id alone cannot prove identity - a foreign writer
+    may collide with an unrelated row's id - so the relay's own
+    headers must agree: ``notification_id`` matching the basename id
+    AND ``kind: heartbeat_tick`` verbatim (relay_payload always
+    writes both).  A file without parseable headers is not a tick;
+    erring on the actionable side re-breaks nothing - the msg_003
+    incident was undetected foreign mail, not a noisy wake.
+    """
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            head = [fh.readline() for _ in range(8)]
+    except OSError:
+        return False
+    headers = {}
+    for line in head:
+        line = line.strip()
+        if not line:
+            break
+        key, sep, val = line.partition(":")
+        if sep:
+            headers[key.strip()] = val.strip()
+    return (
+        headers.get("kind") == NotificationKind.HEARTBEAT_TICK.value
+        and nid is not None
+        and headers.get("notification_id") == str(nid)
+    )
 
 
 def _mail_stall_pass(
