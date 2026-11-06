@@ -815,6 +815,25 @@ def _emit(args, resp: JsonResponse, code: ExitCode, human: str | None = None) ->
 
 
 def _cmd_push(args) -> int:
+    target = db.get_session(args.session_id, path=args.db)
+    if target is not None and target["status"] == SessionStatus.DEAD.value:
+        # a dead sid is undrainable by every transport - queueing
+        # would drop the task into a void (the devin-telegram v2.2.6
+        # incident: task sat 2200+s invisible as "idle")
+        resp = JsonResponse(
+            session=args.session_id,
+            status="dead",
+            queue_depth=_queue_depth(args),
+            error=f"session {args.session_id} is dead - queued work would never drain",
+            agent_instruction="do not retry: re-register the session first",
+        )
+        return _emit(
+            args,
+            resp,
+            ExitCode.NOT_FOUND,
+            f"refused: session {args.session_id} is dead",
+        )
+    unmanaged = target is None or target["mode"] != SessionMode.MANAGED.value
     tid = db.enqueue(
         args.session_id,
         task_text=args.task,
@@ -835,6 +854,17 @@ def _cmd_push(args) -> int:
             resp,
             ExitCode.CONFLICT,
             f"conflict: session {args.session_id} already has a live task",
+        )
+    if unmanaged:
+        # warn + flag (item_152): unmanaged sids have no drain
+        # contract - hook/acp transports may still deliver, but the
+        # caller must see that nothing guarantees it. Flag the queue
+        # row so `bridge inspect` surfaces the risk for as long as
+        # the task sits.
+        db.set_task_note(
+            tid,
+            "push target is not a managed session - delivery not guaranteed",
+            path=args.db,
         )
     result = pump(args)
     task = db.get_task(tid, path=args.db)
@@ -874,6 +904,13 @@ def _cmd_push(args) -> int:
         instruction = "do not retry: task queued for hook delivery inside the open session"
     elif task["status"] == TaskStatus.RUNNING.value:
         instruction = "do not retry: acp worker dispatched"
+    warning = None
+    if unmanaged:
+        warning = (
+            f"session {args.session_id} is not a managed session - no drain"
+            " contract; the task may sit undelivered"
+        )
+        instruction = warning if instruction is None else f"{instruction}; warning: {warning}"
     resp = JsonResponse(
         session=args.session_id,
         status=task["status"],
@@ -881,13 +918,15 @@ def _cmd_push(args) -> int:
         events=events,
         agent_instruction=instruction,
         error=error,
-        data={"task_id": tid, "transport": task["transport"]},
+        data={"task_id": tid, "transport": task["transport"], "warning": warning},
     )
     human = f"task {tid} {task['status']} for {args.session_id}"
     if task["transport"]:
         human += f" via {task['transport']}"
     if error:
         human += f" ({error})"
+    if warning:
+        human += " [UNMANAGED TARGET]"
     return _emit(args, resp, code, human)
 
 
@@ -1507,6 +1546,12 @@ def _cmd_inspect(args) -> int:
     else:
         wait = task["updated_at"] - task["created_at"]
     next_action = _next_action(task)
+    # derived guard surface (item_152): the push-time note flag can be
+    # overwritten by later lifecycle writers, so inspect re-derives the
+    # unmanaged warning live from the session row instead of trusting
+    # the stored note
+    target = db.get_session(task["session_id"], path=args.db)
+    unmanaged = target is None or target["mode"] != SessionMode.MANAGED.value
     data = {
         "task_id": task["id"],
         "session_id": task["session_id"],
@@ -1519,6 +1564,7 @@ def _cmd_inspect(args) -> int:
         "note": task["note"],
         "last_assistant_message": task["last_assistant_message"],
         "next_action": next_action,
+        "unmanaged_target": unmanaged,
     }
     resp = JsonResponse(
         session=task["session_id"],
@@ -1534,7 +1580,12 @@ def _cmd_inspect(args) -> int:
         f"  waited:    {wait}s\n"
         f"  task:      {task['task_text'] or task['task_file']}\n"
         f"  reason:    {task['note'] or '-'}\n"
-        f"  next:      {next_action}"
+        + (
+            "  warning:   target is not a managed session - delivery not guaranteed\n"
+            if unmanaged
+            else ""
+        )
+        + f"  next:      {next_action}"
     )
     return _emit(args, resp, ExitCode.OK, human)
 
