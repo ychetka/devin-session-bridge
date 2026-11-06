@@ -59,10 +59,12 @@ def _sweep_root(tmp_path_factory) -> Path:
     Default pytest basetemp (``<tmp>/pytest-of-<user>/pytest-<N>``)
     sweeps under the ``pytest-of-<user>`` parent so orphans of
     earlier crashed runs are caught too; any custom ``--basetemp``
-    confines the sweep to that directory alone.
+    confines the sweep to that directory alone - a leaf merely
+    starting with ``pytest-`` (e.g. ``/tmp/pytest-mine``) must not
+    escalate the root to its parent.
     """
     basetemp = Path(tmp_path_factory.getbasetemp())
-    if basetemp.name.startswith("pytest-"):
+    if basetemp.name.startswith("pytest-") and basetemp.parent.name.startswith("pytest-of-"):
         return basetemp.parent
     return basetemp
 
@@ -75,7 +77,9 @@ def _is_e2e_scratch(cwd: str | None, root: Path) -> bool:
     if p.name != _SCRATCH_BASENAME:
         return False
     try:
-        p.relative_to(root)
+        # resolve both sides: lexical relative_to would accept ".."
+        # escapes and miss a symlinked tmp dir
+        p.resolve().relative_to(root.resolve())
     except ValueError:
         return False
     return True

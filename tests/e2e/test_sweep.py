@@ -69,7 +69,7 @@ def test_item09_gwt3_missing_sessions_db_returns_empty(tmp_path, monkeypatch):
     assert _scratch_orphans(tmp_path) == []
 
 
-def test_item09_gwt4_sweep_root_scopes(tmp_path, monkeypatch):
+def test_item09_gwt4_sweep_root_scopes(tmp_path):
     """[ITEM-09.GWT-4] default basetemp sweeps under pytest-of-<user>;
     a custom basetemp confines the sweep to itself."""
     basetemp = tmp_path / "pytest-of-u" / "pytest-9"
@@ -86,3 +86,7 @@ def test_item09_gwt4_sweep_root_scopes(tmp_path, monkeypatch):
     custom = tmp_path / "custom-bt"
     custom.mkdir()
     assert _sweep_root(_FakeFactory(custom)) == custom
+    # a leaf named pytest-* NOT under pytest-of-* stays confined
+    sneaky = tmp_path / "pytest-mine"
+    sneaky.mkdir()
+    assert _sweep_root(_FakeFactory(sneaky)) == sneaky
