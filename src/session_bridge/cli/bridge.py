@@ -1822,6 +1822,43 @@ def _cmd_ask(args) -> int:
     )
 
 
+def _cmd_directive(args) -> int:
+    """``bridge directive``: the registered directive-push path
+    (item_139 amendment). The notification row rides the normal
+    outbox: the daemon relays it into the fs mailbox AND the
+    actionable-mail wake leg reaches the session - the delivery loop
+    a hand-written msg_*.txt never had."""
+    if not args.text.strip():
+        resp = JsonResponse(
+            session=args.session_id,
+            status="usage",
+            error="directive requires non-empty text",
+        )
+        return _emit(
+            args,
+            resp,
+            ExitCode.USAGE,
+            "usage: bridge directive <session_id> <text>",
+        )
+    nid = db.notify(
+        args.session_id,
+        NotificationKind.DIRECTIVE,
+        args.text,
+        path=args.db,
+    )
+    resp = JsonResponse(
+        session=args.session_id,
+        status="queued",
+        data={"notification_id": nid},
+    )
+    return _emit(
+        args,
+        resp,
+        ExitCode.OK,
+        f"directive notification {nid} queued for {args.session_id}",
+    )
+
+
 def _cmd_ack(args) -> int:
     """``bridge ack``: advance the restart watermark after mailbox consume."""
     acked = db.ack_notifications(args.session, args.up_to, path=args.db)
@@ -3029,6 +3066,18 @@ def _parse_args(argv) -> argparse.Namespace:
     )
     _add_json(sp)
 
+    # item_139 amendment: the registered directive-push path - writes a
+    # notification row so the daemon relays it to the fs mailbox AND
+    # wakes the session (hand-written msg_*.txt files bypass the
+    # registry and used to never wake anyone)
+    sp = sub.add_parser(
+        "directive",
+        help="send a registered directive notification to a session",
+    )
+    sp.add_argument("session_id")
+    sp.add_argument("text", help="directive text")
+    _add_json(sp)
+
     sp = sub.add_parser(
         "questions",
         help="orchestrator question queue: list / claim / answer",
@@ -3146,6 +3195,7 @@ _HANDLERS = {
     "register": _cmd_register,
     "ask": _cmd_ask,
     "ack": _cmd_ack,
+    "directive": _cmd_directive,
     "claim": _cmd_claim,
     "finish": _cmd_finish,
     "heartbeat": _cmd_heartbeat,

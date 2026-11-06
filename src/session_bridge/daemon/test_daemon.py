@@ -1257,3 +1257,80 @@ def test_item139_gwt9_no_target_defers_without_consuming_episode(env, monkeypatc
     # notify_send appears -> the episode escalates on the next pass
     daemon._mail_stall_pass(env.db, env.sdir, int(time.time()) + 5, env.notifier)
     assert env.sent and SID in env.sent[0][1]
+
+
+# --- item_139 amendment: file-level pending mail + `bridge directive` ---------
+
+
+def _foreign_msg(env, sid, nid=99, body="foreign directive"):
+    """Hand-written mailbox file - the msg_003 shape: a writer that
+    bypassed the notifications registry entirely."""
+    mdir = os.path.join(env.qdir, sid)
+    os.makedirs(mdir, exist_ok=True)
+    path = os.path.join(mdir, f"msg_{nid}.txt")
+    with open(path, "w") as fh:
+        fh.write(body)
+    return path
+
+
+def test_item139_gwt10_foreign_msg_file_wakes_fresh_hb(env, monkeypatch):
+    """[ITEM-139.GWT-10] fresh-hb managed session + an unconsumed
+    msg_*.txt and NO notification rows -> wake candidate: file
+    presence is mail, whoever wrote it (the msg_003 incident)."""
+    _managed_fresh(env)
+    _foreign_msg(env, SID)
+    calls = _wake_calls(env, monkeypatch)
+
+    assert daemon.run(env.db, env.qdir, once=True, notify_send=env.notifier) == daemon.RUN_OK
+    assert calls == [SID]
+
+
+def test_item139_gwt11_bridge_directive_relays_and_wakes(env, monkeypatch, capsys):
+    """[ITEM-139.GWT-11] `bridge directive` writes a registered
+    notification: the next daemon pass relays it into the fs mailbox
+    and the actionable-mail leg wakes the recipient."""
+    _managed_fresh(env)
+    calls = _wake_calls(env, monkeypatch)
+
+    assert bridge.main(["--db", env.db, "directive", SID, "steer now"]) == 0
+    nid = _one(
+        env.db,
+        "SELECT id FROM notifications WHERE session_id=? AND kind='directive'",
+        (SID,),
+    )
+    assert nid is not None
+
+    assert daemon.run(env.db, env.qdir, once=True, notify_send=env.notifier) == daemon.RUN_OK
+    assert calls == [SID]
+    assert os.path.exists(os.path.join(env.qdir, SID, f"msg_{nid['id']}.txt"))
+
+
+def test_item139_gwt12_fs_only_pending_escalates_stall(env, monkeypatch):
+    """[ITEM-139.GWT-12] a mailbox file from a foreign writer older
+    than the stall threshold escalates by its mtime even though the
+    notifications table knows nothing about it."""
+    _managed_stale(env)
+    path = _foreign_msg(env, SID)
+    old = int(time.time()) - 7200
+    os.utime(path, (old, old))
+    _wake_calls(env, monkeypatch)
+
+    daemon._mail_stall_pass(env.db, env.sdir, int(time.time()), env.notifier, env.qdir)
+
+    assert env.sent and SID in env.sent[0][1] and "pending mailbox file" in env.sent[0][1]
+
+
+def test_item139_gwt13_fs_pending_respects_managed_active_gate(env, monkeypatch):
+    """[ITEM-139.GWT-13] the file leg honours the same gate as every
+    other: an unmanaged session's mailbox dir and a dead managed
+    session's dir are not wake candidates."""
+    res = db.register("unmanaged", "/repo/ws", path=env.db)
+    assert res.accepted
+    _foreign_msg(env, "unmanaged")
+    _managed_stale(env)
+    _foreign_msg(env, SID)
+    db.set_session_status(SID, "dead", path=env.db)
+    calls = _wake_calls(env, monkeypatch)
+
+    assert daemon.run(env.db, env.qdir, once=True, notify_send=env.notifier) == daemon.RUN_OK
+    assert calls == []

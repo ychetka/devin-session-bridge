@@ -399,6 +399,13 @@ Each pass (~5s, with up to ~1s startup jitter):
    declared an external wait via `bridge wait` - waking a session
    that cannot act yet is noise; the stamp decays with the lease it
    mirrors, so an abandoned wait becomes wake-worthy on its own.
+   The third leg is file-level (v0.3.4): any unconsumed `msg_*.txt`
+   in the session's mailbox dir qualifies whatever rows or heartbeats
+   say - the fs mailbox is the authoritative channel, and foreign
+   writers (hand-written directives) bypass the notifications table
+   entirely. Use `bridge directive <sid> "<text>"` instead of writing
+   files by hand: it creates the notification row so relay, wake and
+   stall-escalation all see the mail.
 3. Sweep: **unmanaged** sessions whose `worker_heartbeats.last_seen_at`
    is older than `HEARTBEAT_STALE_SECONDS` (120s) flip to
    `status='dead'`. Managed sessions are excluded: between turns a
@@ -429,8 +436,10 @@ Each pass (~5s, with up to ~1s startup jitter):
    it is cleared when the mailbox fully drains OR when the oldest
    remaining mail is newer than the stamp (the escalated items were
    drained - what sits there now is a new stall), so a chronically
-   stalled session is not limited to one escalation ever. The pass
-   also writes the maximum undrained age as
+   stalled session is not limited to one escalation ever. Unconsumed
+   `msg_*.txt` files count as undrained mail too - their mtime is the
+   age evidence for mail the outbox never registered (v0.3.4). The
+   pass also writes the maximum undrained age as
    `mail_undrained_max_age=<s>` on the
    second line of `daemon_heartbeat.txt` (line 1 stays the unix
    timestamp - the watchdog contract is unchanged).
@@ -536,6 +545,30 @@ Manual wake:
 bridge wake <session_id>          # attach + idle check + nudge prompt
 bridge wake <session_id> --prompt "custom nudge text"
 ```
+
+### session/resume - deferred design (protocol >= 2)
+
+The item_139 spike established that an explicit resume step is not
+needed at the current protocol: `session/load` + `session/prompt`
+on a persisted session whose Desktop client is closed already
+produces a real turn (`stopReason: end_turn` verified live on a
+days-closed session). If acp-host protocol >= 2 splits this into a
+dedicated `session/resume` method, adopt it behind the wake
+transport with these flagged risks:
+
+- **duplicate turns**: a resume racing an in-flight wake prompt (or
+  a human reopening the tab) could open a second turn on one
+  session - gate resume on the same `statusEnum`-absent-or-idle
+  check and let the host arbitrate, never fire resume + prompt as
+  two unsequenced calls;
+- **parked watchers**: a resumed session may re-attach a resident
+  mailbox watcher the user had parked - resume must be treated as a
+  liveness event and re-check `queue_paused`/disarm state before
+  letting it act;
+- **replay effects**: delivery is at-least-once on every channel,
+  so a resumed session can re-drain an already-seen mailbox - the
+  consumer-side notification-id dedup is the only correct guard,
+  not transport-level "send once" assumptions.
 
 `bridge wake` bypasses the cooldown but keeps the busy check - it
 refuses (conflict) while the session is mid-turn. Useful to verify
@@ -710,6 +743,7 @@ Global flags: `--db PATH` (`SESSIONS_BRIDGE_DB`), `--queue-dir DIR`
 | `bridge register <sid> [--role worker\|orchestrator] [--workspace DIR] [--force]` | join the bus and stamp the heartbeat; orchestrator is a CAS singleton. |
 | `bridge ask --session SID --task ID "text"` | post a worker question; refused when another question is pending (`pending_exists`), the task hit the 3-question budget (`question_limit`), or no active orchestrator exists (`no_orchestrator`). |
 | `bridge ack --session SID [--up-to N]` | advance the session's mailbox ack watermark. |
+| `bridge directive <sid> "<text>"` | send a registered directive notification: the daemon relays it into the fs mailbox and the wake legs see it. Prefer this over hand-writing `msg_*.txt` files - foreign files get wakes via the file-pending leg but carry no registry evidence (v0.3.4). |
 | `bridge heartbeat <sid>` | refresh the session's liveness record (bumps the heartbeat generation; no takeover semantics). |
 | `bridge questions list [--session SID] [--task ID]` | list pending worker questions. |
 | `bridge questions claim <qid> --claimant SID` | atomically claim a question for answering. |
