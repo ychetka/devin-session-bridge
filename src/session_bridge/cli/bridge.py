@@ -861,18 +861,11 @@ def _cmd_push(args) -> int:
         # caller must see that nothing guarantees it. Flag the queue
         # row so `bridge inspect` surfaces the risk for as long as
         # the task sits.
-        con = db.connect(args.db)
-        try:
-            con.execute(
-                "UPDATE tasks SET note=? WHERE id=?",
-                (
-                    "push target is not a managed session - delivery not guaranteed",
-                    tid,
-                ),
-            )
-            con.commit()
-        finally:
-            con.close()
+        db.set_task_note(
+            tid,
+            "push target is not a managed session - delivery not guaranteed",
+            path=args.db,
+        )
     result = pump(args)
     task = db.get_task(tid, path=args.db)
     if task is None:
@@ -918,7 +911,6 @@ def _cmd_push(args) -> int:
             " contract; the task may sit undelivered"
         )
         instruction = warning if instruction is None else f"{instruction}; warning: {warning}"
-        error = warning if error is None else error
     resp = JsonResponse(
         session=args.session_id,
         status=task["status"],
@@ -1554,6 +1546,12 @@ def _cmd_inspect(args) -> int:
     else:
         wait = task["updated_at"] - task["created_at"]
     next_action = _next_action(task)
+    # derived guard surface (item_152): the push-time note flag can be
+    # overwritten by later lifecycle writers, so inspect re-derives the
+    # unmanaged warning live from the session row instead of trusting
+    # the stored note
+    target = db.get_session(task["session_id"], path=args.db)
+    unmanaged = target is None or target["mode"] != SessionMode.MANAGED.value
     data = {
         "task_id": task["id"],
         "session_id": task["session_id"],
@@ -1566,6 +1564,7 @@ def _cmd_inspect(args) -> int:
         "note": task["note"],
         "last_assistant_message": task["last_assistant_message"],
         "next_action": next_action,
+        "unmanaged_target": unmanaged,
     }
     resp = JsonResponse(
         session=task["session_id"],
@@ -1581,7 +1580,12 @@ def _cmd_inspect(args) -> int:
         f"  waited:    {wait}s\n"
         f"  task:      {task['task_text'] or task['task_file']}\n"
         f"  reason:    {task['note'] or '-'}\n"
-        f"  next:      {next_action}"
+        + (
+            "  warning:   target is not a managed session - delivery not guaranteed\n"
+            if unmanaged
+            else ""
+        )
+        + f"  next:      {next_action}"
     )
     return _emit(args, resp, ExitCode.OK, human)
 

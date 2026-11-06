@@ -2155,13 +2155,29 @@ def test_item152_gwt2_push_unmanaged_warns_and_flags(env, capsys):
     res = db.register(SID, "/repo/ws", path=env.db)
     assert res.accepted  # unmanaged by default
 
-    _rc, out = _run(["push", SID, "--task", "do it", "--json"], capsys)
+    rc, out = _run(["push", SID, "--task", "do it", "--json"], capsys)
+    assert rc == ExitCode.OK
     resp = JsonResponse.model_validate(out)
+    # warning lives in data/agent_instruction - error stays the
+    # failure channel (error!=null means failure by convention)
+    assert resp.error is None
     assert resp.data["warning"] is not None
     assert "not a managed" in resp.data["warning"]
+    assert resp.agent_instruction is not None and "warning" in resp.agent_instruction
     task = db.get_live_task(SID, path=env.db)
     assert task is not None
     assert task["note"] is not None and "not a managed" in task["note"]
+
+    # inspect re-derives the warning live - durable even if the note
+    # flag is overwritten by a later lifecycle writer
+    _rc2, out2 = _run(["inspect", SID, "--json"], capsys)
+    resp2 = JsonResponse.model_validate(out2)
+    assert resp2.data["unmanaged_target"] is True
+
+    # flag survives note loss: overwrite the note, inspect still warns
+    db.set_task_note(task["id"], "lease expired", path=env.db)
+    _rc3, out3 = _run(["inspect", SID, "--json"], capsys)
+    assert JsonResponse.model_validate(out3).data["unmanaged_target"] is True
 
 
 def test_item152_gwt3_push_managed_no_warning(env, capsys):

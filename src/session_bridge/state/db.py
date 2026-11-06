@@ -1023,6 +1023,29 @@ def retry(task_id: int, note: str | None = None, *, path=None) -> bool:
     return _retry(op)
 
 
+def set_task_note(task_id: int, note: str, *, path=None) -> bool:
+    """Overwrite ``tasks.note`` unconditionally (item_152 push flag).
+
+    Unlike the lifecycle writers' ``note=COALESCE(?,note)`` the guard
+    flag must exist even when a note is already set - a requeue's
+    "lease expired" may still overwrite it later, which is why
+    ``inspect`` also derives the unmanaged warning live.
+    """
+
+    def op():
+        con = connect(path)
+        try:
+            cur = con.execute(
+                "UPDATE tasks SET note=?, updated_at=? WHERE id=?",
+                (note, _now(), task_id),
+            )
+            return cur.rowcount == 1
+        finally:
+            con.close()
+
+    return _retry(op)
+
+
 def mark_notified(task_id: int, *, path=None) -> bool:
     """Flag a task as notified; deduplicated over NOTIFY_DEDUP_SECONDS.
 
