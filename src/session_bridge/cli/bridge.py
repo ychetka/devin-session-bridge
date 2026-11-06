@@ -1840,6 +1840,21 @@ def _cmd_directive(args) -> int:
             ExitCode.USAGE,
             "usage: bridge directive <session_id> <text>",
         )
+    if db.get_session(args.session_id, path=args.db) is None:
+        # a mistyped sid would sit undrained forever and eventually
+        # fire a phantom mail-stall escalation at the orchestrator
+        resp = JsonResponse(
+            session=args.session_id,
+            status="not_found",
+            error=f"session {args.session_id} is not registered on the bus",
+            agent_instruction="do not retry: check the session id and re-send",
+        )
+        return _emit(
+            args,
+            resp,
+            ExitCode.NOT_FOUND,
+            f"not found: session {args.session_id} is not registered",
+        )
     nid = db.notify(
         args.session_id,
         NotificationKind.DIRECTIVE,

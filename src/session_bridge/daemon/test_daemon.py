@@ -1276,12 +1276,14 @@ def _foreign_msg(env, sid, nid=99, body="foreign directive"):
 def test_item139_gwt10_foreign_msg_file_wakes_fresh_hb(env, monkeypatch):
     """[ITEM-139.GWT-10] fresh-hb managed session + an unconsumed
     msg_*.txt and NO notification rows -> wake candidate: file
-    presence is mail, whoever wrote it (the msg_003 incident)."""
+    presence is mail, whoever wrote it (the msg_003 incident). Runs
+    with queue_dir=None - the default resolution path the review
+    caught disabled: env.qdir IS <dir of env.db>/queue."""
     _managed_fresh(env)
     _foreign_msg(env, SID)
     calls = _wake_calls(env, monkeypatch)
 
-    assert daemon.run(env.db, env.qdir, once=True, notify_send=env.notifier) == daemon.RUN_OK
+    assert daemon.run(env.db, None, once=True, notify_send=env.notifier) == daemon.RUN_OK
     assert calls == [SID]
 
 
@@ -1304,6 +1306,13 @@ def test_item139_gwt11_bridge_directive_relays_and_wakes(env, monkeypatch, capsy
     assert calls == [SID]
     assert os.path.exists(os.path.join(env.qdir, SID, f"msg_{nid['id']}.txt"))
 
+    # an unknown sid is refused, not queued into the void
+    capsys.readouterr()
+    assert bridge.main(["--db", env.db, "directive", "ghost-sid", "steer"]) != 0
+    assert (
+        _one(env.db, "SELECT COUNT(*) c FROM notifications WHERE session_id='ghost-sid'")["c"] == 0
+    )
+
 
 def test_item139_gwt12_fs_only_pending_escalates_stall(env, monkeypatch):
     """[ITEM-139.GWT-12] a mailbox file from a foreign writer older
@@ -1317,7 +1326,7 @@ def test_item139_gwt12_fs_only_pending_escalates_stall(env, monkeypatch):
 
     daemon._mail_stall_pass(env.db, env.sdir, int(time.time()), env.notifier, env.qdir)
 
-    assert env.sent and SID in env.sent[0][1] and "pending mailbox file" in env.sent[0][1]
+    assert env.sent and SID in env.sent[0][1] and "unregistered mailbox file" in env.sent[0][1]
 
 
 def test_item139_gwt13_fs_pending_respects_managed_active_gate(env, monkeypatch):

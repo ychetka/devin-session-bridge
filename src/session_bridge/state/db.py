@@ -2423,14 +2423,22 @@ def sessions_with_undrained_mail(*, path=None) -> dict:
         try:
             rows = con.execute(
                 "SELECT session_id AS sid, MIN(created_at) AS oldest,"
-                " COUNT(*) AS count"
+                " COUNT(*) AS count,"
+                " GROUP_CONCAT(id) AS nids"
                 " FROM notifications"
                 " WHERE relayed_at IS NOT NULL AND ack_at IS NULL"
                 "  AND kind<>?"
                 " GROUP BY session_id",
                 (NotificationKind.HEARTBEAT_TICK.value,),
             ).fetchall()
-            return {r["sid"]: {"oldest": int(r["oldest"]), "count": int(r["count"])} for r in rows}
+            return {
+                r["sid"]: {
+                    "oldest": int(r["oldest"]),
+                    "count": int(r["count"]),
+                    "nids": {int(n) for n in (r["nids"] or "").split(",") if n},
+                }
+                for r in rows
+            }
         finally:
             con.close()
 
