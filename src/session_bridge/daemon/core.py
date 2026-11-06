@@ -539,40 +539,46 @@ def _pending_mailbox_dirs(db_path, queue_dir=None) -> dict:
         ]
         pending = {}
         for sid in sids:
-            mdir = mailbox_dir(sid, db_path=db_path, queue_dir=queue_dir)
-            try:
-                names = [n for n in os.listdir(mdir) if n.startswith("msg_") and n.endswith(".txt")]
-            except OSError:
-                continue
-            # stat each file individually: the consumer may delete it
-            # between listdir and getmtime (TOCTOU) - a vanished file
-            # is just already-drained mail, not a pass-killing error
-            stats = []
-            for n in names:
-                try:
-                    stats.append((n, int(os.path.getmtime(os.path.join(mdir, n)))))
-                except OSError:
-                    continue
-            if not stats:
-                continue
-            # a heartbeat_tick file is a liveness poke, never
-            # actionable mail - without the header check the file leg
-            # would re-break the "tick alone never wakes" contract
-            # every time the relay delivers a poke.  Provenance comes
-            # from the file's own relay headers (_msg_is_tick), not a
-            # bare id lookup: a foreign writer's msg_<N>.txt may
-            # collide with an unrelated row id.
-            actionable = [
-                (n, mt) for n, mt in stats if not _msg_is_tick(os.path.join(mdir, n), _msg_nid(n))
-            ]
-            if actionable:
-                pending[sid] = {
-                    "oldest": min(mt for _, mt in actionable),
-                    "names": [n for n, _ in actionable],
-                }
+            r = _dir_pending(db_path, queue_dir, sid)
+            if r is not None:
+                pending[sid] = r
         return pending
     finally:
         con.close()
+
+
+def _dir_pending(db_path, queue_dir, sid):
+    """Actionable mail on disk for ONE session, or None.
+
+    Same shape as a ``_pending_mailbox_dirs`` entry:
+    {"oldest": mtime, "names": [msg basenames]}.  A heartbeat_tick
+    file is a liveness poke, never actionable mail - without the
+    header check the file leg would re-break the "tick alone never
+    wakes" contract every time the relay delivers a poke.  Provenance
+    comes from the file's own relay headers (_msg_is_tick), not a
+    bare id lookup: a foreign writer's msg_<N>.txt may collide with
+    an unrelated row id.
+    """
+    mdir = mailbox_dir(sid, db_path=db_path, queue_dir=queue_dir)
+    try:
+        names = [n for n in os.listdir(mdir) if n.startswith("msg_") and n.endswith(".txt")]
+    except OSError:
+        return None
+    # stat each file individually: the consumer may delete it
+    # between listdir and getmtime (TOCTOU) - a vanished file
+    # is just already-drained mail, not a pass-killing error
+    stats = []
+    for n in names:
+        try:
+            stats.append((n, int(os.path.getmtime(os.path.join(mdir, n)))))
+        except OSError:
+            continue
+    actionable = [
+        (n, mt) for n, mt in stats if not _msg_is_tick(os.path.join(mdir, n), _msg_nid(n))
+    ]
+    if not actionable:
+        return None
+    return {"oldest": min(mt for _, mt in actionable), "names": [n for n, _ in actionable]}
 
 
 def _wake_candidates(db_path, now: int, queue_dir=None, pending=None):
@@ -837,13 +843,16 @@ def _mail_stall_pass(
     """Escalate undrained mail to the orchestrator, once per episode.
 
     For every session whose actionable mail (relayed, unacked,
-    non-heartbeat_tick) sits past ``_MAIL_STALL_SECONDS`` the daemon
-    pushes a directive into the active orchestrator's mailbox naming
-    the session and the wait age - the orchestrator can manual-wake
-    or escalate to the developer. The orchestrator's own stall goes
-    to ``notify_send`` instead (a self-addressed directive would sit
-    undrained too).
+    non-heartbeat_tick, still on disk) sits past
+    ``_MAIL_STALL_SECONDS`` the daemon pushes a directive into the
+    active orchestrator's mailbox naming the session and the wait
+    age - the orchestrator can manual-wake or escalate to the
+    developer. The orchestrator's own stall goes to ``notify_send``
+    instead (a self-addressed directive would sit undrained too).
 
+    "Still on disk" is load-bearing (task #143): consumed-but-unacked
+    mail - file deleted, ack pending at a turn boundary - is not a
+    stall, so an active session mid-drain is never escalated.
     Unconsumed ``msg_*.txt`` files count as undrained too (item_139
     amendment): foreign writers bypass the notifications table, so a
     hand-written directive that never reaches its session must still
@@ -857,23 +866,35 @@ def _mail_stall_pass(
     writes it into ``daemon_heartbeat.txt`` as the stall metric.
     """
     undrained = db.sessions_with_undrained_mail(path=db_path)
-    # merge fs-level pending mail: files the outbox never registered
-    # carry only their mtime as age evidence. Files whose msg_<nid>
-    # matches an unacked notification are the SAME mail counted two
-    # ways - only genuinely unregistered files join the count.
     if pending is None:
         pending = _pending_mailbox_dirs(db_path, queue_dir)
-    for sid, r in pending.items():
-        if sid in undrained:
-            u = undrained[sid]
-            u["oldest"] = min(u["oldest"], r["oldest"])
-            u["foreign"] = sum(1 for n in r["names"] if _msg_nid(n) not in u["nids"])
-        else:
-            undrained[sid] = {
-                "oldest": r["oldest"],
-                "count": 0,
-                "foreign": len(r["names"]),
-            }
+    # Undrained means STILL ON DISK: the drain duty is cat+rm THEN
+    # ack, so a notification row whose msg_<nid>.txt the session
+    # already deleted is consumed-but-unacked - ack lag at a turn
+    # boundary, not a stall. Counting it escalated for a session
+    # mid-drain (the mahogany-dryosaurus false positive, task #143).
+    # Registered nids not in pending were consumed; files in pending
+    # without a matching row are genuinely unregistered foreign mail
+    # (the msg_003 case) - only they join the count.
+    #
+    # The shared ``pending`` scan is only a candidate hint: it is
+    # taken before _wake_pass, and a wake can itself trigger a drain
+    # that removes files before this merge - every candidate dir is
+    # re-scanned fresh via _dir_pending so a mid-pass rm can never be
+    # counted (the same false positive in a narrower window).
+    for sid in list(set(undrained) | set(pending)):
+        r = _dir_pending(db_path, queue_dir, sid)
+        if r is None:
+            undrained.pop(sid, None)
+            continue
+        u = undrained.get(sid)
+        nids = u["nids"] if u is not None else set()
+        kept = sum(1 for n in r["names"] if _msg_nid(n) in nids)
+        undrained[sid] = {
+            "oldest": r["oldest"],
+            "count": kept,
+            "foreign": len(r["names"]) - kept,
+        }
     max_age = 0
     for r in undrained.values():
         max_age = max(max_age, now - r["oldest"])

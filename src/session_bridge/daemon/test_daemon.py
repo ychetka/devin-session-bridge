@@ -926,6 +926,27 @@ def _managed_fresh(env, sid=SID):
 def _unacked(env, sid, kind):
     nid = db.notify(sid, kind, "body", path=env.db)
     db.mark_relayed(nid, path=env.db)
+    return nid
+
+
+def _undrained_mail(env, sid, kind, age_seconds=None):
+    """Registered unacked mail whose relayed file really sits in the
+    mailbox - the post-#143 undrained shape: the row alone is not a
+    stall, consumed-but-unacked is not undrained.  The file carries
+    real relay_payload headers so tick files are recognisable as
+    ticks.  ``age_seconds`` backdates the file mtime - on-disk mail
+    ages by mtime, not by created_at."""
+    nid = db.notify(sid, kind, "body", path=env.db)
+    db.mark_relayed(nid, path=env.db)
+    row = _one(env.db, "SELECT * FROM notifications WHERE id=?", (nid,))
+    path = os.path.join(env.qdir, sid, f"msg_{nid}.txt")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as fh:
+        fh.write(daemon.relay_payload(dict(row)))
+    if age_seconds is not None:
+        old = int(time.time()) - age_seconds
+        os.utime(path, (old, old))
+    return nid
 
 
 def test_item102c_gwt1_directive_wakes_fresh_hb_drain(env, monkeypatch):
@@ -1116,8 +1137,7 @@ def test_item139_gwt3_mail_stall_escalates_once_per_episode(env, monkeypatch):
     res = db.register("orc", "/repo/orc", role="orchestrator", path=env.db)
     assert res.accepted
     db.set_session_mode("orc", SessionMode.MANAGED, path=env.db)
-    _unacked(env, SID, NotificationKind.DIRECTIVE)
-    _exec(env.db, "UPDATE notifications SET created_at=?", (int(time.time()) - 7200,))
+    nid = _undrained_mail(env, SID, NotificationKind.DIRECTIVE, age_seconds=7200)
     _wake_calls(env, monkeypatch)  # keep the wake path quiet
 
     now = int(time.time())
@@ -1139,7 +1159,9 @@ def test_item139_gwt3_mail_stall_escalates_once_per_episode(env, monkeypatch):
     daemon._mail_stall_pass(env.db, env.sdir, now + 60, env.notifier)
     assert _one(env.db, "SELECT COUNT(*) c FROM notifications WHERE session_id='orc'")["c"] == 1
 
-    # drain -> episode stamp cleared -> next stall re-escalates
+    # drain (rm + ack, the duty order) -> episode stamp cleared ->
+    # next stall re-escalates
+    os.remove(os.path.join(env.qdir, SID, f"msg_{nid}.txt"))
     db.ack_notifications(SID, path=env.db)
     assert daemon._mail_stall_pass(env.db, env.sdir, now + 120, env.notifier) == 0
     assert (
@@ -1148,12 +1170,7 @@ def test_item139_gwt3_mail_stall_escalates_once_per_episode(env, monkeypatch):
         ]
         is None
     )
-    _unacked(env, SID, NotificationKind.DIRECTIVE)
-    _exec(
-        env.db,
-        "UPDATE notifications SET created_at=? WHERE ack_at IS NULL",
-        (int(time.time()) - 7200,),
-    )
+    _undrained_mail(env, SID, NotificationKind.DIRECTIVE, age_seconds=7200)
     daemon._mail_stall_pass(env.db, env.sdir, now + 180, env.notifier)
     assert _one(env.db, "SELECT COUNT(*) c FROM notifications WHERE session_id='orc'")["c"] == 2
 
@@ -1162,8 +1179,7 @@ def test_item139_gwt4_tick_only_mail_never_stalls(env, monkeypatch):
     """[ITEM-139.GWT-4] an ancient unacked heartbeat_tick is not
     actionable mail: no escalation, metric stays 0."""
     _managed_stale(env)
-    _unacked(env, SID, NotificationKind.HEARTBEAT_TICK)
-    _exec(env.db, "UPDATE notifications SET created_at=?", (int(time.time()) - 7200,))
+    _undrained_mail(env, SID, NotificationKind.HEARTBEAT_TICK, age_seconds=7200)
     _wake_calls(env, monkeypatch)
 
     assert daemon._mail_stall_pass(env.db, env.sdir, int(time.time()), env.notifier) == 0
@@ -1178,8 +1194,7 @@ def test_item139_gwt5_orchestrator_self_stall_uses_notify_send(env, monkeypatch)
     res = db.register("orc", "/repo/orc", role="orchestrator", path=env.db)
     assert res.accepted
     db.set_session_mode("orc", SessionMode.MANAGED, path=env.db)
-    _unacked(env, "orc", NotificationKind.DIRECTIVE)
-    _exec(env.db, "UPDATE notifications SET created_at=?", (int(time.time()) - 7200,))
+    _undrained_mail(env, "orc", NotificationKind.DIRECTIVE, age_seconds=7200)
     _wake_calls(env, monkeypatch)
 
     daemon._mail_stall_pass(env.db, env.sdir, int(time.time()), env.notifier)
@@ -1192,8 +1207,7 @@ def test_item139_gwt6_no_orchestrator_falls_back_to_notify_send(env, monkeypatch
     """[ITEM-139.GWT-6] no active orchestrator holder -> the stall
     notice has nowhere to route but the OS notification."""
     _managed_stale(env)
-    _unacked(env, SID, NotificationKind.DIRECTIVE)
-    _exec(env.db, "UPDATE notifications SET created_at=?", (int(time.time()) - 7200,))
+    _undrained_mail(env, SID, NotificationKind.DIRECTIVE, age_seconds=7200)
     _wake_calls(env, monkeypatch)
 
     daemon._mail_stall_pass(env.db, env.sdir, int(time.time()), env.notifier)
@@ -1209,31 +1223,25 @@ def test_item139_gwt8_episode_rearms_on_new_mail_after_partial_drain(env, monkey
     _managed_stale(env)
     res = db.register("orc", "/repo/orc", role="orchestrator", path=env.db)
     assert res.accepted
-    _unacked(env, SID, NotificationKind.DIRECTIVE)
-    old_cutoff = int(time.time()) - 7200
-    _exec(env.db, "UPDATE notifications SET created_at=? WHERE ack_at IS NULL", (old_cutoff,))
+    nid = _undrained_mail(env, SID, NotificationKind.DIRECTIVE, age_seconds=7200)
     _wake_calls(env, monkeypatch)
 
     now = int(time.time())
     daemon._mail_stall_pass(env.db, env.sdir, now, env.notifier)
     assert _one(env.db, "SELECT COUNT(*) c FROM notifications WHERE session_id='orc'")["c"] == 1
 
-    # the escalated mail drains, a NEW directive arrives (created after
-    # the stamp) and itself stalls past the threshold
+    # the escalated mail drains (rm + ack), a NEW directive arrives
+    # (delivered after the stamp) and itself stalls past the threshold
+    os.remove(os.path.join(env.qdir, SID, f"msg_{nid}.txt"))
     db.ack_notifications(SID, path=env.db)
     _exec(
         env.db,
         "UPDATE wake_state SET mail_escalated_at=? WHERE session_id=?",
         (int(time.time()) - 3600, SID),
     )
-    _unacked(env, SID, NotificationKind.DIRECTIVE)
-    # created_at is newer than the (backdated) stamp but older than
+    # file mtime is newer than the (backdated) stamp but older than
     # the stall threshold -> a fresh episode, not the same stall
-    _exec(
-        env.db,
-        "UPDATE notifications SET created_at=? WHERE ack_at IS NULL",
-        (int(time.time()) - 2000,),
-    )
+    _undrained_mail(env, SID, NotificationKind.DIRECTIVE, age_seconds=2000)
     daemon._mail_stall_pass(env.db, env.sdir, now + 30, env.notifier)
     assert _one(env.db, "SELECT COUNT(*) c FROM notifications WHERE session_id='orc'")["c"] == 2
 
@@ -1243,8 +1251,7 @@ def test_item139_gwt9_no_target_defers_without_consuming_episode(env, monkeypatc
     -> mail_stall_deferred, the stamp is NOT consumed - the escalation
     still fires the first pass a target exists."""
     _managed_stale(env)
-    _unacked(env, SID, NotificationKind.DIRECTIVE)
-    _exec(env.db, "UPDATE notifications SET created_at=?", (int(time.time()) - 7200,))
+    _undrained_mail(env, SID, NotificationKind.DIRECTIVE, age_seconds=7200)
     _wake_calls(env, monkeypatch)
 
     daemon._mail_stall_pass(env.db, env.sdir, int(time.time()), None)
@@ -1385,3 +1392,61 @@ def test_item139_gwt15_foreign_file_colliding_with_tick_nid_wakes(env, monkeypat
 
     assert daemon.run(env.db, env.qdir, once=True, notify_send=env.notifier) == daemon.RUN_OK
     assert calls == [SID]
+
+
+def test_item139_gwt16_consumed_but_unacked_is_not_a_stall(env, monkeypatch):
+    """[ITEM-139.GWT-16] task #143 false positive: a session mid-drain
+    deletes the msg file and only acks at the turn boundary - the
+    unacked row alone must NOT escalate. Undrained means still on
+    disk."""
+    _managed_stale(env)
+    res = db.register("orc", "/repo/orc", role="orchestrator", path=env.db)
+    assert res.accepted
+    _unacked(env, SID, NotificationKind.DIRECTIVE)  # row, NO file
+    _exec(env.db, "UPDATE notifications SET created_at=?", (int(time.time()) - 7200,))
+    _wake_calls(env, monkeypatch)
+
+    assert daemon._mail_stall_pass(env.db, env.sdir, int(time.time()), env.notifier) == 0
+    assert _one(env.db, "SELECT COUNT(*) c FROM notifications WHERE session_id='orc'")["c"] == 0
+
+    # same, but the file is still on disk -> genuine stall escalates
+    _undrained_mail(env, SID, NotificationKind.DIRECTIVE, age_seconds=7200)
+    assert daemon._mail_stall_pass(env.db, env.sdir, int(time.time()), env.notifier) >= 7199
+    assert _one(env.db, "SELECT COUNT(*) c FROM notifications WHERE session_id='orc'")["c"] == 1
+
+
+def test_item139_gwt17_dead_session_still_escalates_on_disk_mail(env, monkeypatch):
+    """[ITEM-139.GWT-17] review fix: a dead session's mailbox is not in
+    the managed+active pending scan, but its still-on-disk mail is
+    undrainable - the ad-hoc _dir_pending path keeps it escalating."""
+    _managed_stale(env)
+    res = db.register("orc", "/repo/orc", role="orchestrator", path=env.db)
+    assert res.accepted
+    _undrained_mail(env, SID, NotificationKind.DIRECTIVE, age_seconds=7200)
+    db.set_session_status(SID, "dead", path=env.db)
+    _wake_calls(env, monkeypatch)
+
+    assert daemon._mail_stall_pass(env.db, env.sdir, int(time.time()), env.notifier) >= 7199
+    orch_mail = _one(
+        env.db,
+        "SELECT body FROM notifications WHERE session_id='orc' AND kind='directive'",
+    )
+    assert orch_mail is not None and SID in orch_mail["body"]
+
+    # but a dead session whose mail was consumed before it died is NOT
+    # a stall - the file-presence rule holds on the ad-hoc path too
+    _managed_stale(env, sid="gone")
+    _unacked(env, "gone", NotificationKind.DIRECTIVE)  # row, no file
+    db.set_session_status("gone", "dead", path=env.db)
+    daemon._mail_stall_pass(env.db, env.sdir, int(time.time()), env.notifier)
+    con = db.connect(env.db)
+    try:
+        bodies = [
+            r["body"]
+            for r in con.execute(
+                "SELECT body FROM notifications WHERE session_id='orc' AND kind='directive'"
+            ).fetchall()
+        ]
+    finally:
+        con.close()
+    assert not any("gone" in b for b in bodies)
