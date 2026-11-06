@@ -1413,3 +1413,40 @@ def test_item139_gwt16_consumed_but_unacked_is_not_a_stall(env, monkeypatch):
     _undrained_mail(env, SID, NotificationKind.DIRECTIVE, age_seconds=7200)
     assert daemon._mail_stall_pass(env.db, env.sdir, int(time.time()), env.notifier) >= 7199
     assert _one(env.db, "SELECT COUNT(*) c FROM notifications WHERE session_id='orc'")["c"] == 1
+
+
+def test_item139_gwt17_dead_session_still_escalates_on_disk_mail(env, monkeypatch):
+    """[ITEM-139.GWT-17] review fix: a dead session's mailbox is not in
+    the managed+active pending scan, but its still-on-disk mail is
+    undrainable - the ad-hoc _dir_pending path keeps it escalating."""
+    _managed_stale(env)
+    res = db.register("orc", "/repo/orc", role="orchestrator", path=env.db)
+    assert res.accepted
+    _undrained_mail(env, SID, NotificationKind.DIRECTIVE, age_seconds=7200)
+    db.set_session_status(SID, "dead", path=env.db)
+    _wake_calls(env, monkeypatch)
+
+    assert daemon._mail_stall_pass(env.db, env.sdir, int(time.time()), env.notifier) >= 7199
+    orch_mail = _one(
+        env.db,
+        "SELECT body FROM notifications WHERE session_id='orc' AND kind='directive'",
+    )
+    assert orch_mail is not None and SID in orch_mail["body"]
+
+    # but a dead session whose mail was consumed before it died is NOT
+    # a stall - the file-presence rule holds on the ad-hoc path too
+    _managed_stale(env, sid="gone")
+    _unacked(env, "gone", NotificationKind.DIRECTIVE)  # row, no file
+    db.set_session_status("gone", "dead", path=env.db)
+    daemon._mail_stall_pass(env.db, env.sdir, int(time.time()), env.notifier)
+    con = db.connect(env.db)
+    try:
+        bodies = [
+            r["body"]
+            for r in con.execute(
+                "SELECT body FROM notifications WHERE session_id='orc' AND kind='directive'"
+            ).fetchall()
+        ]
+    finally:
+        con.close()
+    assert not any("gone" in b for b in bodies)

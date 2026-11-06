@@ -876,36 +876,25 @@ def _mail_stall_pass(
     # Registered nids not in pending were consumed; files in pending
     # without a matching row are genuinely unregistered foreign mail
     # (the msg_003 case) - only they join the count.
-    for sid in list(undrained):
-        u = undrained[sid]
-        r = pending.get(sid)
+    #
+    # The shared ``pending`` scan is only a candidate hint: it is
+    # taken before _wake_pass, and a wake can itself trigger a drain
+    # that removes files before this merge - every candidate dir is
+    # re-scanned fresh via _dir_pending so a mid-pass rm can never be
+    # counted (the same false positive in a narrower window).
+    for sid in list(set(undrained) | set(pending)):
+        r = _dir_pending(db_path, queue_dir, sid)
         if r is None:
-            # pending only scans managed+active sessions; a dead or
-            # unmanaged session's undrained rows still need the
-            # file-presence check - its mail is equally
-            # consumed-but-unacked or equally still-on-disk.
-            r = _dir_pending(db_path, queue_dir, sid)
-            if r is None:
-                del undrained[sid]
-                continue
-        names = r["names"]
-        kept = sum(1 for n in names if _msg_nid(n) in u["nids"])
-        foreign = len(names) - kept
-        if kept + foreign == 0:
-            del undrained[sid]
+            undrained.pop(sid, None)
             continue
+        u = undrained.get(sid)
+        nids = u["nids"] if u is not None else set()
+        kept = sum(1 for n in r["names"] if _msg_nid(n) in nids)
         undrained[sid] = {
             "oldest": r["oldest"],
             "count": kept,
-            "foreign": foreign,
+            "foreign": len(r["names"]) - kept,
         }
-    for sid, r in pending.items():
-        if sid not in undrained:
-            undrained[sid] = {
-                "oldest": r["oldest"],
-                "count": 0,
-                "foreign": len(r["names"]),
-            }
     max_age = 0
     for r in undrained.values():
         max_age = max(max_age, now - r["oldest"])
