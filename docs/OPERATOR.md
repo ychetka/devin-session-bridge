@@ -729,7 +729,7 @@ Global flags: `--db PATH` (`SESSIONS_BRIDGE_DB`), `--queue-dir DIR`
 
 | Command | Effect |
 | --- | --- |
-| `bridge push <sid> --task "..."` / `--file <path>` | enqueue a task; pump picks the transport: managed session > outbox notification (mailbox) + `dispatch_decided` mark, locked session > hook queue, idle session > acp push worker. |
+| `bridge push <sid> --task "..."` / `--file <path>` | enqueue a task; pump picks the transport: managed session > outbox notification (mailbox) + `dispatch_decided` mark, locked session > hook queue, idle session > acp push worker. Push guard (item_152): a dead sid is **refused** before enqueue (undrainable by every transport); an unmanaged sid still dispatches via its transports but the response carries a warning, the human line is tagged `[UNMANAGED TARGET]`, and the task `note` is flagged so `bridge inspect` surfaces the risk. |
 | `bridge claim <task_id> --session SID` | managed worker claims its delivered task: `queued`/`dispatch_decided` > `running` + lease. Idempotent - a repeat claim on the session's own running task renews the lease (long-task heartbeat). Refusals: wrong session, task already claimed/running/done/failed, `queue_paused`. |
 | `bridge finish <task_id> --session SID [--fail] [--note T]` | close the managed lifecycle: `running` > `done` (or `failed` with `--fail`), CAS'd on the claiming session's deterministic lease owner. |
 | `bridge wait <task_id> --session SID [--reason T]` | external-wait signal (item_22): the claiming session renews its lease by one `LEASE_SECONDS` while blocked out-of-band (CI, reviews, partner consults) and the reason lands in the task note. Same owner CAS as claim/finish; a dead claimer stops renewing and the task requeues within one lease period. |

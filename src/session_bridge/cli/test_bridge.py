@@ -2126,3 +2126,65 @@ def test_item19_acp_owner_names_session(env, capsys):
     assert owner.endswith(f"-{tid}")
     row = db.get_task(tid, path=env.db)
     assert row["lease_owner"] == owner
+
+
+# --- item_152: push guard for unmanaged/dead sids ------------------------------
+
+
+def test_item152_gwt1_push_dead_session_refused(env, capsys):
+    """[ITEM-152.GWT-1] push to a dead sid is refused BEFORE enqueue:
+    a dead row is undrainable by every transport, queueing would drop
+    the task into a void (devin-telegram v2.2.6 incident)."""
+    res = db.register(SID, "/repo/ws", path=env.db)
+    assert res.accepted
+    db.set_session_status(SID, "dead", path=env.db)
+
+    rc, out = _run(["push", SID, "--task", "do it", "--json"], capsys)
+    assert rc == ExitCode.NOT_FOUND
+    resp = JsonResponse.model_validate(out)
+    assert "dead" in (resp.error or "")
+    # no task row was created at all
+    assert db.get_live_task(SID, path=env.db) is None
+
+
+def test_item152_gwt2_push_unmanaged_warns_and_flags(env, capsys):
+    """[ITEM-152.GWT-2] push to a known-but-unmanaged sid still goes
+    through its transport (hook queue here), but the response warns
+    loudly and the queue row is flagged for inspect."""
+    env.locks[SID] = (True, 4242)
+    res = db.register(SID, "/repo/ws", path=env.db)
+    assert res.accepted  # unmanaged by default
+
+    _rc, out = _run(["push", SID, "--task", "do it", "--json"], capsys)
+    resp = JsonResponse.model_validate(out)
+    assert resp.data["warning"] is not None
+    assert "not a managed" in resp.data["warning"]
+    task = db.get_live_task(SID, path=env.db)
+    assert task is not None
+    assert task["note"] is not None and "not a managed" in task["note"]
+
+
+def test_item152_gwt3_push_managed_no_warning(env, capsys):
+    """[ITEM-152.GWT-3] a managed+active target is the mailbox contract:
+    no warning, no flag."""
+    res = db.register(SID, "/repo/ws", path=env.db)
+    assert res.accepted
+    db.set_session_mode(SID, SessionMode.MANAGED, path=env.db)
+
+    _rc, out = _run(["push", SID, "--task", "do it", "--json"], capsys)
+    resp = JsonResponse.model_validate(out)
+    assert resp.data["warning"] is None
+    task = db.get_live_task(SID, path=env.db)
+    assert task is None or task["note"] is None
+
+
+def test_item152_gwt4_push_dead_unmanaged_also_refused(env, capsys):
+    """[ITEM-152.GWT-4] a dead UNMANAGED row is refused too - the dead
+    check applies before the mode check."""
+    res = db.register(SID, "/repo/ws", path=env.db)
+    assert res.accepted
+    db.set_session_status(SID, "dead", path=env.db)
+
+    rc, _out = _run(["push", SID, "--task", "do it", "--json"], capsys)
+    assert rc == ExitCode.NOT_FOUND
+    assert db.get_live_task(SID, path=env.db) is None
