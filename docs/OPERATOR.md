@@ -159,9 +159,9 @@ worker-only fleet shows `daemon: stopped` and `orchestrator: none`):
 $ bridge status
 daemon: running (pid 8123, hb 2s)
 orchestrator: <orc-sid> active (hb 14s)
-SID              REPO             TASK                 TSTAT  STATE       Q FAIL  SEEN WAKE
-<orc-sid>        ai_controller    -                    -      idle        -    -   14s sent
-<sid>            worker-repo      #7 fix flaky test    run    running   0/3  0/2   30s -
+SID              REPO             TASK                 TSTAT  STATE       Q FAIL  SEEN WAKE    MAIL
+<orc-sid>        ai_controller    -                    -      idle        -    -   14s sent    -
+<sid>            worker-repo      #7 fix flaky test    run    running   0/3  0/2   30s -      540s
 24h: done 0 | auto-decisions 0 | escalations 0
 ```
 
@@ -180,9 +180,13 @@ session/task updates and mailbox acks - a managed session between
 drain-mode turns is stale-hb by design, so bare heartbeat age would
 lie). `WAKE` shows the last recorded wake outcome (`sent`, `busy`,
 `verif`, `unc` = sent_unconfirmed) plus the unconfirmed streak
-(`uncx3`) and `!` once the human escalation fired. `--json` carries
+(`uncx3`) and `!` once the human escalation fired. `MAIL` is the age
+of the session's oldest undrained actionable notification (relayed
+to the mailbox, still unacked, `kind != heartbeat_tick`); `-` when
+the mailbox is clean - the stall gauge the daemon escalates on
+(`mail_stall_escalated`, see the daemon pass list). `--json` carries
 the full fields (`wake_outcome`, `wake_streak`, `wake_escalated`,
-`wake_age_seconds`, `activity_age_seconds`).
+`wake_age_seconds`, `activity_age_seconds`, `mail_age_seconds`).
 
 ## Playbook 2 - start / restart the orchestrator
 
@@ -356,14 +360,16 @@ Daemon files in the state dir:
 - `daemon.lock` - flock-held single instance; the file content is the
   daemon pid. Process death releases the lock.
 - `daemon_heartbeat.txt` - unix timestamp stamped before every pass,
-  so a hung pass ages the stamp (that is the watchdog signal).
+  so a hung pass ages the stamp (that is the watchdog signal). A
+  second line carries observability metrics
+  (`mail_undrained_max_age=<s>`) - readers take line 1 only.
 - `daemon_decisions.jsonl` - one `{ts, event, sid, detail}` JSON line
   per decision: `daemon_start`, `relayed`, `relay_error`,
   `orchestrator_dead`, `worker_dead`, `pass_error`, `lock_refused`,
   `daemon_stop`, `wake_sent`, `wake_skipped_busy`, `wake_failed`,
   `wake_breaker_open`, `wake_pass_deadline`, `wake_verified`,
   `wake_unconfirmed`, `wake_unconfirmed_escalated`,
-  `wake_verify_failed`.
+  `wake_verify_failed`, `mail_stall_escalated`.
 - `logs/daemon.log` - the detached daemon's stderr (decision lines are
   echoed there too).
 
@@ -385,7 +391,13 @@ Each pass (~5s, with up to ~1s startup jitter):
    on its own, so directives and answers would otherwise sit until a
    human typed. A `heartbeat_tick` alone never wakes a
    fresh-heartbeat session. A session mid-turn is never prompted.
-   Dead sessions are not candidates.
+   Dead sessions are not candidates. Two task states are excluded
+   from the stale-heartbeat leg (v0.3.3): an `awaiting_user` task is
+   parked on an out-of-band answer that itself arrives as actionable
+   mail, and a `running` task whose `wait_until` stamp is still fresh
+   declared an external wait via `bridge wait` - waking a session
+   that cannot act yet is noise; the stamp decays with the lease it
+   mirrors, so an abandoned wait becomes wake-worthy on its own.
 3. Sweep: **unmanaged** sessions whose `worker_heartbeats.last_seen_at`
    is older than `HEARTBEAT_STALE_SECONDS` (120s) flip to
    `status='dead'`. Managed sessions are excluded: between turns a
@@ -402,6 +414,20 @@ Each pass (~5s, with up to ~1s startup jitter):
    dead-worker-backup-<id>) and reset the worktree to the task's base
    ref before starting". A silent orchestrator raises one deduped
    `notify-send -u critical`.
+4. Mail stall: any session whose oldest undrained actionable mail is
+   older than `SESSIONS_BRIDGE_MAIL_STALL_SECONDS` (default 1800s)
+   gets one escalation per stall episode - a directive pushed into
+   the active orchestrator's mailbox naming the session and the wait
+   age (`mail_stall_escalated` decision), so the orchestrator can
+   manual-wake it or escalate to the developer. The orchestrator's
+   own stall (or the absence of an active holder) falls back to
+   `notify-send` - a self-addressed directive would sit undrained
+   too. The dedup stamp lives in `wake_state.mail_escalated_at` and
+   is cleared when the mailbox drains, so a drained-then-restalled
+   session re-escalates as a fresh episode. The pass also writes the
+   maximum undrained age as `mail_undrained_max_age=<s>` on the
+   second line of `daemon_heartbeat.txt` (line 1 stays the unix
+   timestamp - the watchdog contract is unchanged).
 
 ## Wake transport (acp-host)
 
@@ -420,9 +446,16 @@ Requirements:
 - an `acp-host-*.lock` file in `~/.devin-server/cli/` (JSON
   `{pid, port, token}`); the newest valid lockfile wins and is
   re-read on every attempt;
-- the session must report an idle `cognition.ai/statusEnum`
-  (`finished`/`idle`); a mid-turn session is skipped with a
-  `wake_skipped_busy` decision and retried next pass.
+- the session must not report a non-idle `cognition.ai/statusEnum`
+  (`working`, ...): an explicit busy status is skipped with a
+  `wake_skipped_busy` decision and retried next pass. A session
+  listed with no `statusEnum` at all - a persisted session whose
+  Desktop client was closed - counts as idle and gets the nudge:
+  the acp-host resumes it on demand and runs the prompt (verified
+  live on a days-closed session, v0.3.3). Before the fix such rows
+  were misclassified as busy, so a closed-client DRAIN session was
+  never woken and its mail sat undrained - the statusless-busy bug
+  behind the sleeping-DRAIN incident.
 
 Failure modes (all land in `daemon_decisions.jsonl`, none modify
 notification state):
@@ -723,3 +756,4 @@ the target workspace as `.devin/orchestrator/PLAYBOOK.md`).
 | `SESSIONS_BRIDGE_STOP_TIMEOUT` | 600 | Stop hook timeout written by install_hooks.sh. |
 | `SESSIONS_BRIDGE_CYCLE_SECONDS` | 150 | park cycle length for installed hooks. |
 | `SESSIONS_BRIDGE_CYCLES_MAX` | 5 | park budget for installed hooks. |
+| `SESSIONS_BRIDGE_MAIL_STALL_SECONDS` | 1800 | undrained-mail age before the daemon escalates to the orchestrator. |

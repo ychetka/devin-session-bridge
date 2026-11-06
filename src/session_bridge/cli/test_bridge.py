@@ -298,7 +298,7 @@ def test_item07_gwt5_status_human_table(env, capsys):
     assert rc == ExitCode.OK
     table = capsys.readouterr().out
     header = next(line for line in table.splitlines() if "STATE" in line)
-    for col in ("SID", "REPO", "TASK", "TSTAT", "STATE", "Q", "FAIL", "SEEN", "WAKE"):
+    for col in ("SID", "REPO", "TASK", "TSTAT", "STATE", "Q", "FAIL", "SEEN", "WAKE", "MAIL"):
         assert col in header
     # the pushed-but-never-registered session shows as a fleet row
     assert any(line.startswith("*s1") for line in table.splitlines())
@@ -397,6 +397,39 @@ def test_item23_gwt2_tstat_queued_vs_done_disambiguation(env, capsys):
     assert " queued " in lines[SID]
     assert " done " in lines["s2"]
     assert " idle " in lines["s2"]  # done still reads idle in STATE
+
+
+# --- item_139: MAIL column - oldest undrained actionable mail age -------------
+
+
+def test_item139_gwt7_mail_column_shows_oldest_undrained_age(env, capsys):
+    """[ITEM-139.GWT-7] the visibility half of the stall pack: MAIL
+    renders the age of the oldest relayed-but-unacked actionable
+    notification; a drained mailbox falls back to '-'."""
+    res = db.register(SID, "/repo/ws", path=env.db)
+    assert res.accepted
+    nid = db.notify(SID, NotificationKind.DIRECTIVE, "steer", path=env.db)
+    db.mark_relayed(nid, path=env.db)
+    con = db.connect(env.db)
+    try:
+        con.execute(
+            "UPDATE notifications SET created_at=? WHERE id=?",
+            (int(time.time()) - 300, nid),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+    rc = bridge.main(["status"])
+    assert rc == ExitCode.OK
+    line = next(ln for ln in capsys.readouterr().out.splitlines() if ln.startswith(SID))
+    assert re.search(r"\b30\ds\b", line), line
+
+    db.ack_notifications(SID, path=env.db)
+    rc = bridge.main(["status"])
+    assert rc == ExitCode.OK
+    line = next(ln for ln in capsys.readouterr().out.splitlines() if ln.startswith(SID))
+    assert line.rstrip().endswith("-"), line
 
 
 def test_item102a_gwt1_version_reports_checkout_version(env, capsys):
@@ -1283,7 +1316,7 @@ def test_item13e2_gwt2_healthy_fleet_compact_view(env, capsys):
     assert "daemon: running (pid " in text
     assert "orchestrator: orc1 active (hb " in text
     header = next(line for line in lines if "STATE" in line)
-    for col in ("SID", "REPO", "TASK", "TSTAT", "STATE", "Q", "FAIL", "SEEN", "WAKE"):
+    for col in ("SID", "REPO", "TASK", "TSTAT", "STATE", "Q", "FAIL", "SEEN", "WAKE", "MAIL"):
         assert col in header
     # orchestrator sorts first, worker row carries task + budgets
     assert lines[lines.index(header) + 1].startswith("orc1")

@@ -866,3 +866,57 @@ def test_item17_no_cwd_counts_as_seen_not_absent(env, tmp_path, monkeypatch):
     failed = [d for d in _decisions(env) if d["event"] == "wake_failed"]
     assert failed and all("no_cwd" in d["detail"] for d in failed)
     assert not any(d["event"] == "worker_dead" for d in _decisions(env))
+
+
+# --- item_139: statusless sessions are wakeable, not busy ---------------------
+
+
+def test_item139_gwt1_statusless_entry_is_not_busy():
+    """[ITEM-139.GWT-1] a persisted session row with no statusEnum is
+    inert (closed client, acp-host resumes on demand), so _is_busy
+    must return False; None stays conservatively busy and an explicit
+    working status still blocks."""
+    from session_bridge.wake.acp_host import _is_busy
+
+    assert not _is_busy({"sessionId": SID, "cwd": "/tmp/ws"})
+    assert not _is_busy({"sessionId": SID, "cwd": "/tmp/ws", "_meta": {}})
+    assert not _is_busy(IDLE_SESSION)
+    assert _is_busy(BUSY_SESSION)
+    assert _is_busy(None)
+
+
+def test_item139_gwt2_statusless_session_gets_wake_injected(env, tmp_path, monkeypatch):
+    """[ITEM-139.GWT-2] managed session + stale hb + relayed mail +
+    a statusless session/list entry -> attach+load+prompt: the exact
+    shore-felidae/elegant-scallion incident shape that used to be
+    skipped as busy forever."""
+    statusless = {"sessionId": SID, "cwd": "/tmp/ws"}  # no _meta at all
+    host = FakeAcpHost(sessions=[statusless])
+    _lockdir(tmp_path, host, monkeypatch)
+    _session(env.db, SID, managed=True)
+    _heartbeat(env.db, SID, age=999)
+    _relayed_mail(env.db, SID)
+    policy = WakePolicy(cooldown_seconds=0)
+
+    daemon._wake_pass(env.db, env.sdir, int(time.time()), policy)
+
+    assert "session/prompt" in host.methods()
+    events = [d["event"] for d in _decisions(env)]
+    assert "wake_skipped_busy" not in events
+
+
+def test_item139_gwt3_explicit_busy_status_still_skipped(env, tmp_path, monkeypatch):
+    """[ITEM-139.GWT-3] the fix widens only the statusless case: an
+    explicit non-idle statusEnum still skips the injection."""
+    host = FakeAcpHost(sessions=[BUSY_SESSION])
+    _lockdir(tmp_path, host, monkeypatch)
+    _session(env.db, SID, managed=True)
+    _heartbeat(env.db, SID, age=999)
+    _relayed_mail(env.db, SID)
+    policy = WakePolicy(cooldown_seconds=0)
+
+    daemon._wake_pass(env.db, env.sdir, int(time.time()), policy)
+
+    assert "session/prompt" not in host.methods()
+    events = [d["event"] for d in _decisions(env)]
+    assert "wake_skipped_busy" in events

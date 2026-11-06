@@ -2009,3 +2009,61 @@ def test_item122_gwt5_managed_heartbeat_does_not_revive(db_path):
     res = db.register("m1", "/repo", path=db_path)
     assert res.accepted
     assert db.get_session("m1", path=db_path)["status"] == "active"
+
+
+# --- item_139: wait_until stamp + undrained-mail stall bookkeeping -----------
+
+
+def test_item139_gwt1_wait_task_stamps_wait_until(db_path):
+    """[ITEM-139.GWT-1] `bridge wait` mirrors the renewed lease into
+    wait_until: the daemon wake query reads the stamp without a second
+    signal channel, and it decays with the lease on its own."""
+    db.register("w1", "/repo", path=db_path)
+    tid = _enqueue_running(db_path, "w1", owner="w1")
+
+    before = int(time.time())
+    assert db.wait_task(tid, "w1", "waiting on CI", path=db_path)
+    task = db.get_task(tid, path=db_path)
+    assert task["wait_until"] == task["lease_expires_at"]
+    assert task["wait_until"] >= before + db.LEASE_SECONDS - 2
+
+
+def test_item139_gwt2_sessions_with_undrained_mail(db_path):
+    """[ITEM-139.GWT-2] the stall query sees only relayed+unacked
+    actionable mail: pending, acked and heartbeat_tick rows are all
+    excluded; oldest is the MIN over what remains."""
+    db.register("s1", "/repo", path=db_path)
+    old = db.notify("s1", NotificationKind.DIRECTIVE, "old", path=db_path)
+    tick = db.notify("s1", NotificationKind.HEARTBEAT_TICK, "tick", path=db_path)
+    new = db.notify("s1", NotificationKind.TASK_DISPATCH, "new", path=db_path)
+    db.notify("s1", NotificationKind.DIRECTIVE, "not relayed", path=db_path)
+    for nid in (old, tick, new):
+        db.mark_relayed(nid, path=db_path)
+    ts = int(time.time())
+    _exec(
+        db_path,
+        "UPDATE notifications SET created_at=? WHERE id=?",
+        (ts - 3600, old),
+    )
+    _exec(
+        db_path,
+        "UPDATE notifications SET created_at=? WHERE id=?",
+        (ts - 9000, tick),
+    )
+
+    res = db.sessions_with_undrained_mail(path=db_path)
+    assert res["s1"]["count"] == 2  # directive + task_dispatch, not the tick
+    assert res["s1"]["oldest"] == ts - 3600  # oldest ACTIONABLE, not the tick's
+
+    db.ack_notifications("s1", path=db_path)
+    assert db.sessions_with_undrained_mail(path=db_path) == {}
+
+
+def test_item139_gwt3_mail_escalated_stamp_dedups_until_cleared(db_path):
+    """[ITEM-139.GWT-3] one escalation per stall episode: the second
+    mark returns False; clearing after drain arms the next episode."""
+    assert db.mark_mail_escalated("s1", path=db_path)
+    assert not db.mark_mail_escalated("s1", path=db_path)
+    assert db.list_wake_state(path=db_path)["s1"]["mail_escalated_at"] is not None
+    assert db.clear_mail_escalated("s1", path=db_path)
+    assert db.mark_mail_escalated("s1", path=db_path)
