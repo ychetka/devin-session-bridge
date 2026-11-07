@@ -373,7 +373,7 @@ Daemon files in the state dir:
   `wake_breaker_open`, `wake_pass_deadline`, `wake_verified`,
   `wake_unconfirmed`, `wake_unconfirmed_escalated`,
   `wake_verify_failed`, `mail_stall_escalated`,
-  `mail_stall_deferred`.
+  `mail_stall_deferred`, `mail_stall_deferred_busy`.
 - `logs/daemon.log` - the detached daemon's stderr (decision lines are
   echoed there too).
 
@@ -441,7 +441,13 @@ Each pass (~5s, with up to ~1s startup jitter):
    `notify-send` - a self-addressed directive would sit undrained
    too. With no delivery target at all the pass logs
    `mail_stall_deferred` and retries next pass without consuming the
-   episode. The dedup stamp lives in `wake_state.mail_escalated_at`;
+   episode. A session verifiably mid-turn (session/list statusEnum
+   reports live work) is never escalated at all: it cannot drain
+   mid-turn, so its undrained mail is expected ack lag - the pass
+   logs `mail_stall_deferred_busy` and consumes no stamp, so the same
+   mail escalates once the session goes idle (v0.3.10). Dead, absent,
+   unmanaged, statusless and unverifiable sessions get no grace. The
+   dedup stamp lives in `wake_state.mail_escalated_at`;
    it is cleared when the mailbox fully drains OR when the oldest
    remaining mail is newer than the stamp (the escalated items were
    drained - what sits there now is a new stall), so a chronically
