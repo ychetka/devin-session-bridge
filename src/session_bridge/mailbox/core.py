@@ -330,6 +330,9 @@ latency for a free input line.
      task with `bridge finish <task_id> --session {session_id}
      --fail`.
    - directive: obey the orchestrator directive.
+   - notice: an informational report - read and incorporate it; it
+     is not an instruction. Report back the same way:
+     `bridge notice <sid> "<text>"`.
    - heartbeat_tick: liveness poke - no work needed.
    - disarm: managed mode is off - do NOT re-arm a watcher; resume
      normal unmanaged operation.

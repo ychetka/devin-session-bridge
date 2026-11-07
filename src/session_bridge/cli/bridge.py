@@ -1873,24 +1873,24 @@ def _cmd_ask(args) -> int:
     )
 
 
-def _cmd_directive(args) -> int:
-    """``bridge directive``: the registered directive-push path
-    (item_139 amendment). The notification row rides the normal
-    outbox: the daemon relays it into the fs mailbox AND the
-    actionable-mail wake leg reaches the session. A hand-written
+def _push_registered(args, kind: NotificationKind) -> int:
+    """Shared body of ``bridge directive`` / ``bridge notice``: write a
+    notification row so the daemon relays it into the fs mailbox AND
+    the actionable-mail wake leg reaches the session. A hand-written
     msg_*.txt gets woken too (the file leg) but lacks registry
     evidence - no ack tracking, no dedup, no stall attribution."""
+    verb = kind.value
     if not args.text.strip():
         resp = JsonResponse(
             session=args.session_id,
             status="usage",
-            error="directive requires non-empty text",
+            error=f"{verb} requires non-empty text",
         )
         return _emit(
             args,
             resp,
             ExitCode.USAGE,
-            "usage: bridge directive <session_id> <text>",
+            f"usage: bridge {verb} <session_id> <text>",
         )
     target = db.get_session(args.session_id, path=args.db)
     if target is None or target["status"] != "active":
@@ -1916,7 +1916,7 @@ def _cmd_directive(args) -> int:
         )
     nid = db.notify(
         args.session_id,
-        NotificationKind.DIRECTIVE,
+        kind,
         args.text,
         path=args.db,
     )
@@ -1929,8 +1929,26 @@ def _cmd_directive(args) -> int:
         args,
         resp,
         ExitCode.OK,
-        f"directive notification {nid} queued for {args.session_id}",
+        f"{verb} notification {nid} queued for {args.session_id}",
     )
+
+
+def _cmd_directive(args) -> int:
+    """``bridge directive``: the registered directive-push path
+    (item_139 amendment). DIRECTIVE is a steering instruction the
+    recipient must obey - reports and status notes use
+    ``bridge notice`` instead."""
+    return _push_registered(args, NotificationKind.DIRECTIVE)
+
+
+def _cmd_notice(args) -> int:
+    """``bridge notice``: the registered informational-report path
+    (question_answer vs directive semantics backlog item). NOTICE is
+    read-and-incorporate, not an order - the worker-to-orchestrator
+    report flow rides it so the recipient's duty table can tell
+    "obey" apart from "read". Same delivery mechanics as
+    ``bridge directive``: outbox row, fs relay, actionable wake."""
+    return _push_registered(args, NotificationKind.NOTICE)
 
 
 def _cmd_ack(args) -> int:
@@ -3152,6 +3170,17 @@ def _parse_args(argv) -> argparse.Namespace:
     sp.add_argument("text", help="directive text")
     _add_json(sp)
 
+    # question_answer vs directive semantics backlog item: worker
+    # reports rode DIRECTIVE (obey) - NOTICE carries read-and-
+    # incorporate reports through the same delivery machinery
+    sp = sub.add_parser(
+        "notice",
+        help="send a registered informational notice to a session",
+    )
+    sp.add_argument("session_id")
+    sp.add_argument("text", help="notice text")
+    _add_json(sp)
+
     sp = sub.add_parser(
         "questions",
         help="orchestrator question queue: list / claim / answer",
@@ -3270,6 +3299,7 @@ _HANDLERS = {
     "ask": _cmd_ask,
     "ack": _cmd_ack,
     "directive": _cmd_directive,
+    "notice": _cmd_notice,
     "claim": _cmd_claim,
     "finish": _cmd_finish,
     "heartbeat": _cmd_heartbeat,

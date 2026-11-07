@@ -294,9 +294,11 @@ working fix: input stays free and deliveries drain on the next turn.
 ### Shared semantics (both modes)
 
 - Route by `kind:` in the payload header: `task_dispatch` (work item),
-  `question_answer`, `directive`, `heartbeat_tick` (liveness poke, no
-  work), `disarm` (stop re-arming/draining, resume unmanaged
-  operation).
+  `question_answer`, `directive` (an instruction - obey it), `notice`
+  (an informational report - read and incorporate; worker status and
+  task reports ride `bridge notice`, not `bridge directive`),
+  `heartbeat_tick` (liveness poke, no work), `disarm` (stop
+  re-arming/draining, resume unmanaged operation).
 - Deliveries are idempotent by notification id - skip ids already
   handled.
 - After processing, advance your restart watermark:

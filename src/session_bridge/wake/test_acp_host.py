@@ -356,6 +356,33 @@ def test_wake_unauthorized():
     assert exc.value.reason == "unauthorized"
 
 
+def test_item172_gwt2_hello_structured_error_code(tmp_path):
+    """[ITEM-172.GWT-2] a structured {"code", "message"} hello error is
+    classified by its code verbatim - the stable contract replaces the
+    substring match whenever the host provides it."""
+    host = FakeAcpHost(
+        sessions=[IDLE_SESSION],
+        hello_error={"code": "unauthorized", "message": "token rotated"},
+    )
+    with pytest.raises(WakeError) as exc:
+        wake_session(SID, "/tmp/ws", lock_data=host.lock_data())
+    assert exc.value.reason == "unauthorized"
+    assert "token rotated" in str(exc.value)
+
+
+def test_item172_gwt3_hello_unknown_code_maps_to_attach_failed(tmp_path):
+    """[ITEM-172.GWT-3] a structured code we do not know maps to the
+    generic attach failure - a novel host code cannot smuggle an
+    unrecognized reason into the daemon's switch arms."""
+    host = FakeAcpHost(
+        sessions=[IDLE_SESSION],
+        hello_error={"code": "quota_exceeded", "message": "nope"},
+    )
+    with pytest.raises(WakeError) as exc:
+        wake_session(SID, "/tmp/ws", lock_data=host.lock_data())
+    assert exc.value.reason == "attach_failed"
+
+
 def test_wake_truncated_hello_clean_error():
     host = FakeAcpHost(sessions=[IDLE_SESSION], truncate_hello=True)
     with pytest.raises(WakeError):
