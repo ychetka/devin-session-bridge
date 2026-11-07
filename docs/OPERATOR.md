@@ -463,7 +463,31 @@ Each pass (~5s, with up to ~1s startup jitter):
    is the same registered path for informational reports (worker
    status/task reports) - kind `notice` means "read and
    incorporate", while `directive` means "obey".
-3. Sweep: **unmanaged** sessions whose `worker_heartbeats.last_seen_at`
+3. Lease auto-renew (v0.3.13): `running`/`dispatch_decided` tasks of
+   managed+active sessions whose lease falls inside
+   `SESSIONS_BRIDGE_LEASE_RENEW_MARGIN` (default 300s) are renewed on
+   the worker's behalf when session/list verifies the owning session
+   busy - the same `_busy_sessions` batch the stall pass uses. A
+   DRAIN-mode session cannot renew inside a long ACP turn, so without
+   this pass a >lease-length turn died on schedule and `recover_stale`
+   burned an attempt (or failed the task) while the worker was
+   verifiably mid-turn doing the work; busy status IS the liveness
+   signal the worker cannot send itself. Renew-before-expiry is
+   required because `recover_stale` fires lazily inside every bridge
+   `_work` pump - a lapsed lease is gone regardless of what the daemon
+   does next. Bounded: `auto_renew_lease` never stamps
+   `lease_renewed_at`, so it stays the last EXPLICIT lease touch
+   (claim, mark_running, `bridge wait`, `bridge claim` re-claim); once
+   that touch is older than
+   `SESSIONS_BRIDGE_LEASE_AUTO_RENEW_SECONDS` (default 6x
+   `LEASE_SECONDS` ~= 3h, clamped to >= one lease length) the row no
+   longer qualifies and expiry recovery takes over - a wedged turn
+   that keeps reporting busy cannot hold the task forever. Idle,
+   absent, statusless, unmanaged and unverifiable sessions are simply
+   not renewed: their leases lapse into `recover_stale` exactly as
+   before (fail-closed - unverifiable is not busy). Each renewal logs
+   `lease_auto_renewed`.
+4. Sweep: **unmanaged** sessions whose `worker_heartbeats.last_seen_at`
    is older than `HEARTBEAT_STALE_SECONDS` (120s) flip to
    `status='dead'`. Managed sessions are excluded: between turns a
    managed drain-mode session is stale-hb by design, and that signal
@@ -479,7 +503,7 @@ Each pass (~5s, with up to ~1s startup jitter):
    dead-worker-backup-<id>) and reset the worktree to the task's base
    ref before starting". A silent orchestrator raises one deduped
    `notify-send -u critical`.
-4. Mail stall: any session whose oldest undrained actionable mail is
+5. Mail stall: any session whose oldest undrained actionable mail is
    older than `SESSIONS_BRIDGE_MAIL_STALL_SECONDS` (default 1800s)
    gets one escalation per stall episode - a directive pushed into
    the active orchestrator's mailbox naming the session and the wait

@@ -55,6 +55,7 @@ from session_bridge.state.contract import (
     SessionMode,
     SessionRole,
     SessionStatus,
+    TaskStatus,
 )
 from session_bridge.wake import (
     SESSION_ABSENT,
@@ -882,6 +883,25 @@ _BUSY_GRACE_SECONDS = max(
     _env_int("SESSIONS_BRIDGE_BUSY_GRACE_SECONDS", 4 * _MAIL_STALL_SECONDS),
 )
 
+#: Auto-renewal engages once the remaining lease falls under this
+#: margin (task #189): renew-before-expiry rather than
+#: recover-after-expiry keeps ``recover_stale`` from ever seeing a
+#: live busy task as stale. Far wider than one daemon interval, so
+#: consecutive passes amortize to one write per task per lease.
+_LEASE_RENEW_MARGIN = _env_int("SESSIONS_BRIDGE_LEASE_RENEW_MARGIN", 300)
+
+#: Upper bound on the auto-renewed window (task #189): the wall-clock
+#: age of the last EXPLICIT lease touch (claim / mark_running / renew
+#: / wait) beyond which auto-renewal stops and expiry recovery takes
+#: over - a wedged turn that keeps reporting busy cannot hold the
+#: task forever. Default = 6 lease lengths (~3h); clamped at one
+#: lease length so a misconfigured override cannot silently disable
+#: the mechanism.
+_LEASE_AUTO_RENEW_LIMIT = max(
+    db.LEASE_SECONDS,
+    _env_int("SESSIONS_BRIDGE_LEASE_AUTO_RENEW_SECONDS", 6 * db.LEASE_SECONDS),
+)
+
 
 def _msg_nid(name: str):
     """Numeric notification id from ``msg_<nid>.txt``; None when the
@@ -953,6 +973,69 @@ def _busy_sessions(sids, state_directory=None) -> set:
         for sid, st in statuses.items()
         if st is not None and st != SESSION_ABSENT and not status_is_idle(st)
     }
+
+
+def _lease_renew_pass(db_path, state_directory, now: int) -> None:
+    """Renew leases about to lapse on verifiably-busy sessions (task #189).
+
+    A DRAIN-mode session cannot renew its own lease inside a long ACP
+    turn, so without this pass a >lease-length turn dies on schedule:
+    ``recover_stale`` burns an attempt - or fails the task at the
+    attempt budget - while the worker is verifiably mid-turn doing
+    the work. Session/list busy status IS the liveness signal the
+    worker cannot send itself, so the pass renews on its behalf.
+    Renew-before-expiry is required, not renew-after: ``recover_stale``
+    fires lazily inside every bridge ``_work`` pump, so a lease that
+    has already lapsed is gone regardless of what the daemon does
+    next.
+
+    Eligibility is deliberately narrow - a missed renewal must fail
+    closed into the pre-existing recovery path, never resurrect work
+    the owner abandoned: managed+active sessions only (the churn the
+    task addresses), lease within the margin, owning session
+    verifiably busy per the shared session/list batch, and the last
+    explicit lease touch younger than ``_LEASE_AUTO_RENEW_LIMIT`` so
+    a wedged turn cannot hold the task forever. Idle, absent,
+    statusless, halted-and-idle or unverifiable sessions are simply
+    not renewed - their leases lapse into ``recover_stale`` exactly
+    as before.
+    """
+    con = db.connect(db_path)
+    try:
+        rows = con.execute(
+            "SELECT t.id, t.lease_owner, t.session_id"
+            " FROM tasks t JOIN sessions s ON s.session_id=t.session_id"
+            " WHERE t.status IN (?,?)"
+            " AND s.mode=? AND s.status=?"
+            " AND t.lease_expires_at IS NOT NULL AND t.lease_expires_at<=?",
+            (
+                TaskStatus.RUNNING.value,
+                TaskStatus.DISPATCH_DECIDED.value,
+                SessionMode.MANAGED.value,
+                SessionStatus.ACTIVE.value,
+                now + _LEASE_RENEW_MARGIN,
+            ),
+        ).fetchall()
+    finally:
+        con.close()
+    if not rows:
+        return
+    busy = _busy_sessions([r["session_id"] for r in rows], state_directory)
+    for r in rows:
+        if r["session_id"] not in busy:
+            continue
+        if db.auto_renew_lease(
+            r["id"],
+            r["lease_owner"],
+            ceiling_seconds=_LEASE_AUTO_RENEW_LIMIT,
+            path=db_path,
+        ):
+            _decision(
+                state_directory,
+                "lease_auto_renewed",
+                r["session_id"],
+                f"task={r['id']}",
+            )
 
 
 def _mail_stall_pass(
@@ -1361,6 +1444,7 @@ def run(
                 # wasted second connection + listdir round)
                 pending = _pending_mailbox_dirs(db_path, queue_dir)
                 _wake_pass(db_path, state_directory, now, wake_policy, notify, queue_dir, pending)
+                _lease_renew_pass(db_path, state_directory, now)
                 _sweep_pass(db_path, state_directory, notify, now)
                 stall_age = _mail_stall_pass(
                     db_path, state_directory, now, notify, queue_dir, pending

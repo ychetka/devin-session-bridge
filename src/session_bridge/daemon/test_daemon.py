@@ -1811,3 +1811,169 @@ def test_item184_gwt9_unit_missing_bridge_binary_refused(tmp_path):
     assert res.returncode != 0
     assert "bridge binary not" in res.stderr
     assert not (tmp_path / "units").exists()
+
+
+# --- task #189: lease auto-renewal for verifiably-busy sessions -----------------
+
+
+def _lease_row(env, tid):
+    return _one(
+        env.db,
+        "SELECT status,lease_expires_at,lease_renewed_at,attempt FROM tasks WHERE id=?",
+        (tid,),
+    )
+
+
+def _lease_window(env, tid, expires_in, renewed_ago):
+    now = int(time.time())
+    _exec(
+        env.db,
+        "UPDATE tasks SET lease_expires_at=?, lease_renewed_at=? WHERE id=?",
+        (now + expires_in, now - renewed_ago, tid),
+    )
+    return now
+
+
+def test_item189_gwt1_busy_session_lease_auto_renewed(env, monkeypatch):
+    """[ITEM-189.GWT-1] managed session verifiably busy with the lease
+    inside the renew margin -> the daemon renews on the worker's
+    behalf: lease_expires_at is pushed a full lease ahead, the
+    explicit-touch stamp (lease_renewed_at) is preserved as the
+    ceiling baseline, and the renewal is decision-logged."""
+    res = db.register(SID, "/repo/ws", path=env.db)
+    assert res.accepted
+    db.set_session_mode(SID, SessionMode.MANAGED, path=env.db)
+    tid = _running_task(env)
+    _lease_window(env, tid, expires_in=60, renewed_ago=100)
+    _stall_verify(env, monkeypatch, {SID: "working"})
+
+    daemon._lease_renew_pass(env.db, env.sdir, int(time.time()))
+
+    row = _lease_row(env, tid)
+    now = int(time.time())
+    assert row["status"] == "running"
+    assert row["lease_expires_at"] >= now + db.LEASE_SECONDS - 5
+    # the ceiling baseline is the last EXPLICIT touch - untouched
+    assert row["lease_renewed_at"] == now - 100
+    assert any(d["event"] == "lease_auto_renewed" and d["sid"] == SID for d in _decisions(env))
+
+
+def test_item189_gwt2_idle_session_not_renewed(env, monkeypatch):
+    """[ITEM-189.GWT-2] verifiably IDLE session -> no auto-renewal:
+    the lease lapses and recover_stale folds the task back exactly
+    like before (busy status is the only liveness signal the
+    mid-turn worker can produce)."""
+    res = db.register(SID, "/repo/ws", path=env.db)
+    assert res.accepted
+    db.set_session_mode(SID, SessionMode.MANAGED, path=env.db)
+    tid = _running_task(env)
+    _lease_window(env, tid, expires_in=60, renewed_ago=100)
+    _stall_verify(env, monkeypatch, {SID: "idle"})
+
+    daemon._lease_renew_pass(env.db, env.sdir, int(time.time()))
+
+    row = _lease_row(env, tid)
+    assert row["lease_expires_at"] <= int(time.time()) + 60
+    # and once it does lapse, recovery owns it - unchanged semantics
+    _exec(env.db, "UPDATE tasks SET lease_expires_at=? WHERE id=?", (1, tid))
+    assert db.recover_stale(path=env.db) == [tid]
+    assert _lease_row(env, tid)["status"] == "queued"
+
+
+def test_item189_gwt3_ceiling_stops_renewal(env, monkeypatch):
+    """[ITEM-189.GWT-3] busy past the auto-renew limit -> not renewed:
+    the last EXPLICIT lease touch older than
+    _LEASE_AUTO_RENEW_LIMIT means a wedged/zombie turn cannot hold
+    the task forever; recovery still owns the expired row."""
+    res = db.register(SID, "/repo/ws", path=env.db)
+    assert res.accepted
+    db.set_session_mode(SID, SessionMode.MANAGED, path=env.db)
+    tid = _running_task(env)
+    _lease_window(
+        env,
+        tid,
+        expires_in=60,
+        renewed_ago=daemon._LEASE_AUTO_RENEW_LIMIT + 60,
+    )
+    _stall_verify(env, monkeypatch, {SID: "working"})
+
+    daemon._lease_renew_pass(env.db, env.sdir, int(time.time()))
+
+    row = _lease_row(env, tid)
+    assert row["lease_expires_at"] <= int(time.time()) + 60
+    _exec(env.db, "UPDATE tasks SET lease_expires_at=? WHERE id=?", (1, tid))
+    assert db.recover_stale(path=env.db) == [tid]
+
+
+def test_item189_gwt4_unmanaged_session_skipped(env, monkeypatch):
+    """[ITEM-189.GWT-4] unmanaged session -> not a candidate at all:
+    auto-renewal is scoped to the managed/DRAIN churn the task
+    addresses; unmanaged leases recover exactly as before."""
+    res = db.register(SID, "/repo/ws", path=env.db)
+    assert res.accepted
+    tid = _running_task(env)
+    _lease_window(env, tid, expires_in=60, renewed_ago=0)
+    _stall_verify(env, monkeypatch, {SID: "working"})
+
+    daemon._lease_renew_pass(env.db, env.sdir, int(time.time()))
+
+    assert _lease_row(env, tid)["lease_expires_at"] <= int(time.time()) + 60
+
+
+def test_item189_gwt5_staged_dispatch_renewed_while_busy(env, monkeypatch):
+    """[ITEM-189.GWT-5] dispatch_decided lease + verifiably-busy
+    session -> renewed: the incident shape was a staged dispatch
+    bouncing queued<->dispatch_decided mid-turn and burning
+    attempts; while the worker is busy the claim window extends."""
+    res = db.register(SID, "/repo/ws", path=env.db)
+    assert res.accepted
+    db.set_session_mode(SID, SessionMode.MANAGED, path=env.db)
+    tid = db.enqueue(SID, "work", path=env.db)
+    assert db.dispatch_managed(tid, SID, path=env.db)
+    _lease_window(env, tid, expires_in=60, renewed_ago=0)
+    _stall_verify(env, monkeypatch, {SID: "working"})
+
+    daemon._lease_renew_pass(env.db, env.sdir, int(time.time()))
+
+    row = _lease_row(env, tid)
+    assert row["status"] == "dispatch_decided"
+    assert row["lease_expires_at"] >= int(time.time()) + db.LEASE_SECONDS - 5
+
+
+def test_item189_gwt6_verify_failure_fails_closed(env, monkeypatch):
+    """[ITEM-189.GWT-6] session/list attach fails -> nothing renewed:
+    unverifiable is not busy, the same fail-closed convention the
+    mail-stall busy check uses."""
+    res = db.register(SID, "/repo/ws", path=env.db)
+    assert res.accepted
+    db.set_session_mode(SID, SessionMode.MANAGED, path=env.db)
+    tid = _running_task(env)
+    _lease_window(env, tid, expires_in=60, renewed_ago=0)
+    monkeypatch.setattr(daemon, "find_lockfile", lambda *a, **k: {"_path": "fake"})
+
+    def boom(sids, **k):
+        raise daemon.WakeError("attach_failed", "nope")
+
+    monkeypatch.setattr(daemon, "verify_sessions", boom)
+
+    daemon._lease_renew_pass(env.db, env.sdir, int(time.time()))
+
+    assert _lease_row(env, tid)["lease_expires_at"] <= int(time.time()) + 60
+
+
+def test_item189_gwt7_end_to_end_run_survives_expiry(env, monkeypatch):
+    """[ITEM-189.GWT-7] full daemon pass: a busy session's expiring
+    lease is extended by run(once=True), so a later recover_stale
+    sees a live lease - 'lease expired' can no longer fire while the
+    owner is verifiably mid-turn."""
+    res = db.register(SID, "/repo/ws", path=env.db)
+    assert res.accepted
+    db.set_session_mode(SID, SessionMode.MANAGED, path=env.db)
+    tid = _running_task(env)
+    _lease_window(env, tid, expires_in=10, renewed_ago=0)
+    _stall_verify(env, monkeypatch, {SID: "working"})
+
+    assert daemon.run(env.db, env.qdir, once=True, notify_send=env.notifier) == daemon.RUN_OK
+
+    assert _lease_row(env, tid)["lease_expires_at"] > int(time.time()) + 60
+    assert db.recover_stale(path=env.db) == []
