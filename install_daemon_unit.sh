@@ -56,6 +56,11 @@ while [ $# -gt 0 ]; do
     esac
 done
 
+# argparse would crash-loop the unit on a non-numeric interval - the
+# mistake is cheaper here than under Restart=on-failure
+[ -z "$INTERVAL" ] || [[ "$INTERVAL" =~ ^[0-9]+$ ]] \
+    || die "--interval must be a non-negative integer, got: $INTERVAL"
+
 BRIDGE="${SESSIONS_BRIDGE_BIN:-}"
 if [ -z "$BRIDGE" ]; then
     BRIDGE="$(command -v bridge 2>/dev/null || true)"
@@ -63,15 +68,30 @@ fi
 [ -n "$BRIDGE" ] || die "bridge binary not found on PATH (set SESSIONS_BRIDGE_BIN)"
 [ -x "$BRIDGE" ] || die "bridge binary not executable: $BRIDGE"
 
-DAEMON_ARGS=""
-[ -n "$DB_PATH" ] && DAEMON_ARGS+=" --db '$DB_PATH'"
-[ -n "$QUEUE_DIR" ] && DAEMON_ARGS+=" --queue-dir '$QUEUE_DIR'"
-[ -n "$INTERVAL" ] && DAEMON_ARGS+=" --interval '$INTERVAL'"
+# --db/--queue-dir are TOP-LEVEL bridge flags and must precede the
+# daemon subcommand; only --interval belongs after `run`
+GLOBAL_ARGS=""
+[ -n "$DB_PATH" ] && GLOBAL_ARGS+=" --db '$DB_PATH'"
+[ -n "$QUEUE_DIR" ] && GLOBAL_ARGS+=" --queue-dir '$QUEUE_DIR'"
+RUN_ARGS=""
+[ -n "$INTERVAL" ] && RUN_ARGS+=" --interval '$INTERVAL'"
 
-# render the template (delimiter | keeps paths with / intact)
+# escape for the sed replacement first (\, &, |), then for systemd
+# specifier expansion (%) - a literal % in a path would otherwise be
+# specifier-eaten or corrupt the render
+_esc() {
+    local s=$1
+    s=${s//\\/\\\\}
+    s=${s//|/\\|}
+    s=${s//&/\\&}
+    s=${s//%/%%}
+    printf '%s' "$s"
+}
+
 rendered="$(sed \
-    -e "s|@BRIDGE_BIN@|$BRIDGE|g" \
-    -e "s|@DAEMON_ARGS@|$DAEMON_ARGS|g" \
+    -e "s|@BRIDGE_BIN@|$(_esc "$BRIDGE")|g" \
+    -e "s|@GLOBAL_ARGS@|$(_esc "$GLOBAL_ARGS")|g" \
+    -e "s|@RUN_ARGS@|$(_esc "$RUN_ARGS")|g" \
     "$TEMPLATE")"
 
 if [ "$PRINT_ONLY" -eq 1 ]; then
@@ -101,8 +121,12 @@ if [ "$DO_START" -eq 1 ]; then
 fi
 
 # linger is what actually delivers "auto-start on boot"; without it
-# the user manager (and this unit) stops at logout.
-if command -v loginctl >/dev/null 2>&1; then
+# the user manager (and this unit) stops at logout. Only relevant
+# when the unit is meant to persist - a --no-enable staging install
+# skips the attempt.
+if [ "$DO_ENABLE" -eq 0 ]; then
+    :
+elif command -v loginctl >/dev/null 2>&1; then
     if loginctl enable-linger "$USER" 2>/dev/null; then
         echo "linger enabled for $USER - the daemon survives reboots and logout"
     else

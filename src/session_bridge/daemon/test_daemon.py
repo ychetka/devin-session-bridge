@@ -1753,7 +1753,8 @@ def test_item184_gwt6_unit_print_renders_paths(tmp_path):
     res, unit_file, _ = _install_unit(tmp_path, "--print", "--db", "/data/state.db")
     assert res.returncode == 0, res.stderr
     bridge_bin = str(tmp_path / "bin" / "bridge")
-    assert f"ExecStart={bridge_bin} daemon run --db '/data/state.db'" in res.stdout
+    # --db is a TOP-LEVEL flag: it precedes the daemon subcommand
+    assert f"ExecStart={bridge_bin} --db '/data/state.db' daemon run" in res.stdout
     assert "Restart=on-failure" in res.stdout
     assert "WantedBy=default.target" in res.stdout
     assert not unit_file.exists()  # print writes nothing

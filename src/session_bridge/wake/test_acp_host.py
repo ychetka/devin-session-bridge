@@ -59,6 +59,7 @@ class FakeAcpHost:
         on_prompt=None,
         protocol_version=1,
         resume_error=None,
+        reject_above=None,
     ):
         self.sessions = list(sessions)
         self.hello_error = hello_error
@@ -69,6 +70,7 @@ class FakeAcpHost:
         self.on_prompt = on_prompt
         self.protocol_version = protocol_version
         self.resume_error = resume_error
+        self.reject_above = reject_above
         self.hellos: list[dict] = []
         self.calls: list[tuple[str, dict]] = []
         self.errors: list[str] = []
@@ -122,10 +124,21 @@ class FakeAcpHost:
                 self.calls.append((method, params))
                 out = {"jsonrpc": "2.0", "id": msg["id"]}
                 if method == "initialize":
-                    out["result"] = {
-                        "protocolVersion": self.protocol_version,
-                        "agentCapabilities": {},
-                    }
+                    offered = params.get("protocolVersion", 1)
+                    if self.reject_above is not None and offered > self.reject_above:
+                        # a non-compliant host rejects the offer
+                        # outright instead of negotiating down
+                        out["error"] = {
+                            "code": -32600,
+                            "message": "unsupported protocol version",
+                        }
+                    else:
+                        # spec negotiation: the host answers the
+                        # version it will use (<= the offer)
+                        out["result"] = {
+                            "protocolVersion": min(offered, self.protocol_version),
+                            "agentCapabilities": {},
+                        }
                 elif method == "session/resume":
                     if self.resume_error is not None:
                         out["error"] = {"code": -32601, "message": self.resume_error}
@@ -379,6 +392,37 @@ def test_item184_gwt5_resume_rpc_error_falls_back_to_load():
         "session/load",
         "session/prompt",
     ]
+
+
+def test_item184_gwt10_v2_offer_rejected_reattaches_with_v1():
+    """[ITEM-184.GWT-10] a host that refuses the >=2 initialize offer
+    outright (instead of negotiating down) gets a fresh attach with
+    the proven v1 handshake - the wake still lands on session/load."""
+    host = FakeAcpHost(sessions=[IDLE_SESSION], protocol_version=1, reject_above=1)
+    outcome = wake_session(SID, "/tmp/ws", lock_data=host.lock_data())
+    assert outcome == "sent"
+    # two attaches happened; the second ran the full v1 flow
+    assert len(host.hellos) == 2
+    assert host.methods() == [
+        "initialize",
+        "initialize",
+        "session/list",
+        "session/load",
+        "session/prompt",
+    ]
+    # the retry really offered v1
+    assert host.calls[1][1]["protocolVersion"] == 1
+
+
+def test_item184_gwt11_v1_host_negotiates_down_no_reattach():
+    """[ITEM-184.GWT-11] a spec-compliant v1 host answers the >=2
+    offer with 1 - one attach, session/load path, no resume."""
+    host = FakeAcpHost(sessions=[IDLE_SESSION], protocol_version=1)
+    outcome = wake_session(SID, "/tmp/ws", lock_data=host.lock_data())
+    assert outcome == "sent"
+    assert len(host.hellos) == 1
+    assert host.calls[0][1]["protocolVersion"] == 2  # offered high
+    assert host.methods() == ["initialize", "session/list", "session/load", "session/prompt"]
 
 
 def test_wake_busy_session_not_prompted():

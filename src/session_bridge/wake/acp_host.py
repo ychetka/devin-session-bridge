@@ -303,9 +303,17 @@ def _is_busy(entry: dict | None) -> bool:
     return status is not None and not status_is_idle(status)
 
 
-def _initialize_params() -> dict:
+#: highest ACP protocol version the wake transport can drive. The
+#: initialize response negotiates down (a v1 host answers 1 and the
+#: session/load path stays); only a negotiated >= 2 unlocks
+#: session/resume (PR #81 review: offering 1 would cap the response
+#: at 1 and make the resume branch unreachable forever).
+_OFFERED_PROTOCOL = 2
+
+
+def _initialize_params(version=_OFFERED_PROTOCOL) -> dict:
     return {
-        "protocolVersion": 1,
+        "protocolVersion": version,
         "clientCapabilities": {"fs": {"readTextFile": False, "writeTextFile": False}},
         "clientInfo": {"name": "sessions-bridge-wake", "version": "0"},
     }
@@ -410,7 +418,24 @@ def wake_session(
                 return _await_response(chan, req, timeout, cap)
 
             try:
-                init_resp = call("initialize", _initialize_params())
+                try:
+                    init_resp = call("initialize", _initialize_params())
+                except WakeError as e:
+                    if e.reason != "rpc_error":
+                        raise
+                    # a host that cannot honour the >=2 offer may
+                    # reject initialize outright instead of
+                    # negotiating down - re-attach and offer the
+                    # proven v1 handshake; the socket itself is
+                    # version-agnostic
+                    try:
+                        chan._sock.close()
+                    except OSError:
+                        pass
+                    chan = _attach(lock_data, agent_id)
+                    sock = chan._sock
+                    req = 0
+                    init_resp = call("initialize", _initialize_params(1))
                 chan.send({"jsonrpc": "2.0", "method": "initialized", "params": {}})
 
                 listing = call("session/list", {})

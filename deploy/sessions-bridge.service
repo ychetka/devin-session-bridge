@@ -13,7 +13,7 @@ Type=simple
 # `daemon run` is the foreground supervisor loop; daemon.lock inside
 # the state dir keeps double starts impossible even if something
 # races this unit.
-ExecStart=@BRIDGE_BIN@ daemon run@DAEMON_ARGS@
+ExecStart=@BRIDGE_BIN@@GLOBAL_ARGS@ daemon run@RUN_ARGS@
 Restart=on-failure
 RestartSec=5s
 # state (db, mailboxes, daemon.log) already lives under the state
