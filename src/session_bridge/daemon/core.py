@@ -941,7 +941,7 @@ def _msg_is_tick(path: str, nid) -> bool:
     )
 
 
-def _busy_sessions(sids, state_directory=None) -> set:
+def _busy_sessions(sids, state_directory=None, verify_failed_event=None) -> set:
     """Sids verifiably mid-turn per session/list, best-effort.
 
     One shared attach answers for the whole stall-candidate batch -
@@ -952,6 +952,9 @@ def _busy_sessions(sids, state_directory=None) -> set:
     conservative). The busy check is the escalation-grace signal for
     task #174: a mid-turn session cannot drain by definition, so its
     undrained mail is expected lag, not a stall.
+    ``verify_failed_event`` names the caller in the decision log -
+    the same attach failure must not read as a stall-pass event when
+    the lease pass asked.
     """
     if not sids:
         return set()
@@ -963,7 +966,7 @@ def _busy_sessions(sids, state_directory=None) -> set:
     except WakeError as e:
         _decision(
             state_directory,
-            "mail_stall_verify_failed",
+            verify_failed_event or "mail_stall_verify_failed",
             None,
             f"{e.reason}: {e}",
         )
@@ -999,6 +1002,11 @@ def _lease_renew_pass(db_path, state_directory, now: int) -> None:
     statusless, halted-and-idle or unverifiable sessions are simply
     not renewed - their leases lapse into ``recover_stale`` exactly
     as before.
+
+    The shared ``_busy_sessions`` polarity (any non-idle statusEnum
+    counts as busy) is deliberately liberal for a liveness grant: a
+    status that merely LOOKS mid-turn still renews, but only inside
+    the ceiling window - the bound absorbs the false-positive risk.
     """
     con = db.connect(db_path)
     try:
@@ -1007,20 +1015,28 @@ def _lease_renew_pass(db_path, state_directory, now: int) -> None:
             " FROM tasks t JOIN sessions s ON s.session_id=t.session_id"
             " WHERE t.status IN (?,?)"
             " AND s.mode=? AND s.status=?"
-            " AND t.lease_expires_at IS NOT NULL AND t.lease_expires_at<=?",
+            " AND t.lease_expires_at IS NOT NULL AND t.lease_expires_at<=?"
+            " AND t.lease_renewed_at IS NOT NULL"
+            " AND t.lease_renewed_at+?>=?",
             (
                 TaskStatus.RUNNING.value,
                 TaskStatus.DISPATCH_DECIDED.value,
                 SessionMode.MANAGED.value,
                 SessionStatus.ACTIVE.value,
                 now + _LEASE_RENEW_MARGIN,
+                _LEASE_AUTO_RENEW_LIMIT,
+                now,
             ),
         ).fetchall()
     finally:
         con.close()
     if not rows:
         return
-    busy = _busy_sessions([r["session_id"] for r in rows], state_directory)
+    busy = _busy_sessions(
+        [r["session_id"] for r in rows],
+        state_directory,
+        verify_failed_event="lease_renew_verify_failed",
+    )
     for r in rows:
         if r["session_id"] not in busy:
             continue

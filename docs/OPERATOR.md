@@ -476,9 +476,11 @@ Each pass (~5s, with up to ~1s startup jitter):
    required because `recover_stale` fires lazily inside every bridge
    `_work` pump - a lapsed lease is gone regardless of what the daemon
    does next. Bounded: `auto_renew_lease` never stamps
-   `lease_renewed_at`, so it stays the last EXPLICIT lease touch
-   (claim, mark_running, `bridge wait`, `bridge claim` re-claim); once
-   that touch is older than
+   `lease_renewed_at`, so it stays the last worker-initiated lease
+   touch (claim, mark_running, `bridge wait`, `bridge claim`
+   re-claim; `recover_stale`'s question-blocked renewal also stamps
+   it, bounded by the question janitor TTLs); once that touch is
+   older than
    `SESSIONS_BRIDGE_LEASE_AUTO_RENEW_SECONDS` (default 6x
    `LEASE_SECONDS` ~= 3h, clamped to >= one lease length) the row no
    longer qualifies and expiry recovery takes over - a wedged turn

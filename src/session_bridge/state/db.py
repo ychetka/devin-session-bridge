@@ -714,13 +714,14 @@ def auto_renew_lease(task_id: int, owner: str, *, ceiling_seconds: int, path=Non
 
     Same CAS shape as ``renew_lease`` with two deliberate deviations:
     ``lease_renewed_at`` is NOT stamped - it stays the timestamp of
-    the last EXPLICIT lease touch (claim, mark_running, renew, wait),
-    and the row qualifies only while that explicit touch is younger
-    than ``ceiling_seconds``. The ceiling is therefore the maximum
-    time a task may run without its worker touching the lease: a
-    wedged or zombie turn that keeps reporting busy cannot hold the
-    task forever - expiry recovery takes over once the ceiling is
-    crossed.
+    the last worker-initiated lease touch (claim, mark_running,
+    renew, wait - plus ``recover_stale``'s question-blocked renewal,
+    which is bounded by the question janitor TTLs), and the row
+    qualifies only while that touch is younger than
+    ``ceiling_seconds``. The ceiling is therefore the maximum time a
+    task may run without its worker touching the lease: a wedged or
+    zombie turn that keeps reporting busy cannot hold the task
+    forever - expiry recovery takes over once the ceiling is crossed.
     """
     ts = _now()
 
