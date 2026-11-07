@@ -902,6 +902,14 @@ def _env_int(name: str, default: int) -> int:
 #: unacked this long is unreachable by every other signal we have.
 _MAIL_STALL_SECONDS = _env_int("SESSIONS_BRIDGE_MAIL_STALL_SECONDS", 1800)
 
+#: Busy grace has a ceiling (task #174 review): a session whose
+#: statusEnum reports live work defers escalation only while the mail
+#: is younger than this. Past it the session may be wedged mid-turn -
+#: managed sessions are exempt from the heartbeat sweep, so this pass
+#: is the last operator signal for that shape. Default = 4 stall
+#: lengths.
+_BUSY_GRACE_SECONDS = _env_int("SESSIONS_BRIDGE_BUSY_GRACE_SECONDS", 4 * _MAIL_STALL_SECONDS)
+
 
 def _msg_nid(name: str):
     """Numeric notification id from ``msg_<nid>.txt``; None when the
@@ -941,7 +949,7 @@ def _msg_is_tick(path: str, nid) -> bool:
     )
 
 
-def _busy_sessions(sids) -> set:
+def _busy_sessions(sids, state_directory=None) -> set:
     """Sids verifiably mid-turn per session/list, best-effort.
 
     One shared attach answers for the whole stall-candidate batch -
@@ -960,7 +968,13 @@ def _busy_sessions(sids) -> set:
         return set()
     try:
         statuses = verify_sessions(list(sids), lock_data=lock_data)
-    except WakeError:
+    except WakeError as e:
+        _decision(
+            state_directory,
+            "mail_stall_verify_failed",
+            "-",
+            f"{e.reason}: {e}",
+        )
         return set()
     return {
         sid
@@ -1018,8 +1032,10 @@ def _mail_stall_pass(
     # instead of escalation (task #174): it cannot drain mid-turn, so
     # its undrained mail is expected lag. The deferral consumes no
     # episode stamp - once it goes idle with the mail still on disk,
-    # the same stall escalates. Dead, absent, unmanaged and
-    # unverifiable sessions are never graced.
+    # the same stall escalates. Grace is bounded by
+    # ``_BUSY_GRACE_SECONDS`` so a wedged turn cannot silence the
+    # signal forever. Dead, absent, unmanaged and unverifiable
+    # sessions are never graced.
     #
     # The shared ``pending`` scan is only a candidate hint: it is
     # taken before _wake_pass, and a wake can itself trigger a drain
@@ -1072,17 +1088,21 @@ def _mail_stall_pass(
     # not a stall, so the escalation is deferred instead of fired.
     # The episode stamp is NOT consumed: when the session goes idle
     # with the mail still undrained it escalates on a later pass, so
-    # busy buys grace, not amnesty. Dead, absent, unmanaged and
-    # unverifiable sessions escalate exactly as before.
+    # busy buys grace, not amnesty. The grace is also bounded by
+    # _BUSY_GRACE_SECONDS: mail older than that on a still-busy
+    # session may mean a wedged turn, so it escalates anyway. Dead,
+    # absent, unmanaged and unverifiable sessions escalate exactly
+    # as before.
     busy = _busy_sessions(
-        [sid for sid, r in undrained.items() if now - r["oldest"] >= _MAIL_STALL_SECONDS]
+        [sid for sid, r in undrained.items() if now - r["oldest"] >= _MAIL_STALL_SECONDS],
+        state_directory,
     )
 
     for sid, r in undrained.items():
         age = now - r["oldest"]
         if age < _MAIL_STALL_SECONDS:
             continue
-        if sid in busy:
+        if sid in busy and age < _BUSY_GRACE_SECONDS:
             _decision(
                 state_directory,
                 "mail_stall_deferred_busy",

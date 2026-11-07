@@ -1540,10 +1540,10 @@ def test_item174_gwt1_busy_session_defers_stall_escalation(env, monkeypatch):
     escalation, mail_stall_deferred_busy decision, episode stamp not
     consumed - the mahogany-dryosaurus false positive."""
     _stall_env(env)
-    _undrained_mail(env, SID, NotificationKind.DIRECTIVE, age_seconds=7200)
+    _undrained_mail(env, SID, NotificationKind.DIRECTIVE, age_seconds=3600)
     _stall_verify(env, monkeypatch, {SID: "working"})
 
-    assert daemon._mail_stall_pass(env.db, env.sdir, int(time.time()), env.notifier) >= 7199
+    assert daemon._mail_stall_pass(env.db, env.sdir, int(time.time()), env.notifier) >= 3599
     assert _orch_stall_count(env) == 0
     assert [d["event"] for d in _decisions(env)] == ["mail_stall_deferred_busy"]
     ws = _one(env.db, "SELECT mail_escalated_at FROM wake_state WHERE session_id=?", (SID,))
@@ -1555,15 +1555,15 @@ def test_item174_gwt2_idle_after_busy_escalates(env, monkeypatch):
     mail escalates once the session goes idle - the deferral consumed
     no stamp."""
     _stall_env(env)
-    _undrained_mail(env, SID, NotificationKind.DIRECTIVE, age_seconds=7200)
+    _undrained_mail(env, SID, NotificationKind.DIRECTIVE, age_seconds=3600)
     monkeypatch.setattr(daemon, "find_lockfile", lambda *a, **k: {"_path": "fake-host"})
 
     monkeypatch.setattr(daemon, "verify_sessions", lambda sids, **k: {SID: "working"})
-    assert daemon._mail_stall_pass(env.db, env.sdir, int(time.time()), env.notifier) >= 7199
+    assert daemon._mail_stall_pass(env.db, env.sdir, int(time.time()), env.notifier) >= 3599
     assert _orch_stall_count(env) == 0
 
     monkeypatch.setattr(daemon, "verify_sessions", lambda sids, **k: {SID: "idle"})
-    assert daemon._mail_stall_pass(env.db, env.sdir, int(time.time()), env.notifier) >= 7199
+    assert daemon._mail_stall_pass(env.db, env.sdir, int(time.time()), env.notifier) >= 3599
     assert _orch_stall_count(env) == 1
     orch_mail = _one(
         env.db,
@@ -1603,6 +1603,7 @@ def test_item174_gwt4_verify_failure_still_escalates(env, monkeypatch):
     monkeypatch.setattr(daemon, "verify_sessions", _down)
     assert daemon._mail_stall_pass(env.db, env.sdir, int(time.time()), env.notifier) >= 7199
     assert _orch_stall_count(env) == 1
+    assert any(d["event"] == "mail_stall_verify_failed" for d in _decisions(env))
 
 
 def test_item174_gwt5_no_lockfile_still_escalates(env, monkeypatch):
@@ -1620,9 +1621,24 @@ def test_item174_gwt6_busy_check_covers_orch_itself(env, monkeypatch):
     """[ITEM-174.GWT-6] a busy orchestrator's own stall defers too -
     notify_send is not fired while it is verifiably mid-turn."""
     _stall_env(env)
-    _undrained_mail(env, "orc", NotificationKind.DIRECTIVE, age_seconds=7200)
+    _undrained_mail(env, "orc", NotificationKind.DIRECTIVE, age_seconds=3600)
     _stall_verify(env, monkeypatch, {"orc": "working"})
 
     daemon._mail_stall_pass(env.db, env.sdir, int(time.time()), env.notifier)
     assert env.sent == []
     assert [d["event"] for d in _decisions(env)] == ["mail_stall_deferred_busy"]
+
+
+def test_item174_gwt7_busy_grace_has_a_ceiling(env, monkeypatch):
+    """[ITEM-174.GWT-7] review fix: a session still 'working' with mail
+    older than _BUSY_GRACE_SECONDS is wedged, not lagging - the stall
+    escalates; the grace ceiling is the last operator signal for a
+    shape the heartbeat sweep never reaches."""
+    _stall_env(env)
+    _undrained_mail(
+        env, SID, NotificationKind.DIRECTIVE, age_seconds=daemon._BUSY_GRACE_SECONDS + 600
+    )
+    _stall_verify(env, monkeypatch, {SID: "working"})
+
+    assert daemon._mail_stall_pass(env.db, env.sdir, int(time.time()), env.notifier) >= 7199
+    assert _orch_stall_count(env) == 1

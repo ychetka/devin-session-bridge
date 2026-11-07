@@ -373,7 +373,8 @@ Daemon files in the state dir:
   `wake_breaker_open`, `wake_pass_deadline`, `wake_verified`,
   `wake_unconfirmed`, `wake_unconfirmed_escalated`,
   `wake_verify_failed`, `mail_stall_escalated`,
-  `mail_stall_deferred`, `mail_stall_deferred_busy`.
+  `mail_stall_deferred`, `mail_stall_deferred_busy`,
+  `mail_stall_verify_failed`.
 - `logs/daemon.log` - the detached daemon's stderr (decision lines are
   echoed there too).
 
@@ -445,8 +446,12 @@ Each pass (~5s, with up to ~1s startup jitter):
    reports live work) is never escalated at all: it cannot drain
    mid-turn, so its undrained mail is expected ack lag - the pass
    logs `mail_stall_deferred_busy` and consumes no stamp, so the same
-   mail escalates once the session goes idle (v0.3.10). Dead, absent,
-   unmanaged, statusless and unverifiable sessions get no grace. The
+   mail escalates once the session goes idle (v0.3.10). The grace is
+   bounded by `SESSIONS_BRIDGE_BUSY_GRACE_SECONDS` (default 4x the
+   stall threshold): mail older than that on a still-busy session
+   escalates anyway - a wedged turn cannot silence the signal.
+   Dead, absent, unmanaged, statusless and unverifiable sessions
+   (attach failure logs `mail_stall_verify_failed`) get no grace. The
    dedup stamp lives in `wake_state.mail_escalated_at`;
    it is cleared when the mailbox fully drains OR when the oldest
    remaining mail is newer than the stamp (the escalated items were
