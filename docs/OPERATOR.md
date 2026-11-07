@@ -433,33 +433,32 @@ Each pass (~5s, with up to ~1s startup jitter):
    is CAS-marked. Delivery is at-least-once; consumers dedup by
    notification id.
 2. Wake: managed+armed sessions get a nudge prompt through the
-   acp-host wake transport (see below) when either (a) their
-   heartbeat is stale (or absent) and they carry unacked relayed
-   mail - this closes the delivery loop for idle sessions - or
-   (b) any unacked actionable mail
-   (kind != `heartbeat_tick`) waits, whatever the heartbeat age
-   (item_102c): a DRAIN session idle at the prompt never opens a turn
-   on its own, so directives and answers would otherwise sit until a
-   human typed. A `heartbeat_tick` alone never wakes a
-   fresh-heartbeat session. A session mid-turn is never prompted.
-   Dead sessions are not candidates. Two task states are excluded
-   from the live-task probe (v0.3.3): an `awaiting_user` task is
-   parked on an out-of-band answer that itself arrives as actionable
-   mail, and a `running` task whose `wait_until` stamp is still fresh
-   declared an external wait via `bridge wait` - probing a session
-   that cannot act yet is noise; the stamp decays with the lease it
-   mirrors, so an abandoned wait becomes probe-worthy on its own.
+   acp-host wake transport (see below) when they carry actionable
+   mail ON DISK - any unconsumed non-tick `msg_*.txt` in the
+   session's mailbox dir, whatever heartbeat or notification rows
+   say (v0.3.12). The fs mailbox is the authoritative channel: a
+   notification row whose file exists is covered by this leg, a row
+   whose file was drained but never acked is ack lag, not mail, and
+   can no longer wake (the earlier DB-row legs produced a permanent
+   ~5-minute wake loop on physically empty mailboxes - the
+   mahogany-dryosaurus consumed-but-unacked noise). Foreign writers
+   (hand-written directives) qualify too since files are the only
+   trigger. `heartbeat_tick` files never wake - a liveness poke is
+   not mail. A session mid-turn is never prompted. Dead sessions are
+   not candidates. Two task states are excluded from the live-task
+   probe (v0.3.3): an `awaiting_user` task is parked on an
+   out-of-band answer that itself arrives as actionable mail, and a
+   `running` task whose `wait_until` stamp is still fresh declared an
+   external wait via `bridge wait` - probing a session that cannot
+   act yet is noise; the stamp decays with the lease it mirrors, so
+   an abandoned wait becomes probe-worthy on its own.
    A stale-heartbeat session whose ONLY qualification is a live task
    is never prompted (v0.3.7): it gets a batched `session/list`
    presence probe instead, so no_session dead-marking still runs on
    an empty outbox while an empty mailbox can never wake - the
    buttered-tilapia drain-prompt loop incident.
-   The third leg is file-level (v0.3.4): any unconsumed `msg_*.txt`
-   in the session's mailbox dir qualifies whatever rows or heartbeats
-   say - the fs mailbox is the authoritative channel, and foreign
-   writers (hand-written directives) bypass the notifications table
-   entirely. Use `bridge directive <sid> "<text>"` instead of writing
-   files by hand: it creates the notification row so relay, wake and
+   Use `bridge directive <sid> "<text>"` instead of writing files by
+   hand: it creates the notification row so relay, wake and
    stall-escalation all see the mail. `bridge notice <sid> "<text>"`
    is the same registered path for informational reports (worker
    status/task reports) - kind `notice` means "read and
@@ -614,15 +613,18 @@ bridge wake <session_id>          # attach + idle check + nudge prompt
 bridge wake <session_id> --prompt "custom nudge text"
 ```
 
-### session/resume - deferred design (protocol >= 2)
+### session/resume (protocol >= 2)
 
 The item_139 spike established that an explicit resume step is not
-needed at the current protocol: `session/load` + `session/prompt`
-on a persisted session whose Desktop client is closed already
-produces a real turn (`stopReason: end_turn` verified live on a
-days-closed session). If acp-host protocol >= 2 splits this into a
-dedicated `session/resume` method, adopt it behind the wake
-transport with these flagged risks:
+needed at protocol 1: `session/load` + `session/prompt` on a
+persisted session whose Desktop client is closed already produces a
+real turn (`stopReason: end_turn` verified live on a days-closed
+session). Since v0.3.12 the wake transport reads the
+`protocolVersion` the host advertises in the `initialize` response:
+version >= 2 prefers `session/resume` (same params as load, no
+replay drain), and a resume `rpc_error` degrades to `session/load`
+on the same channel - the advert is a hint, not a contract. The
+flagged risks from the deferred design stay in force:
 
 - **duplicate turns**: a resume racing an in-flight wake prompt (or
   a human reopening the tab) could open a second turn on one
@@ -641,6 +643,35 @@ transport with these flagged risks:
 `bridge wake` bypasses the cooldown but keeps the busy check - it
 refuses (conflict) while the session is mid-turn. Useful to verify
 the transport or to nudge a session on demand.
+
+## systemd --user service (auto-start on boot)
+
+On systemd machines the daemon runs best as a user unit (v0.3.12):
+`install_daemon_unit.sh` renders `deploy/sessions-bridge.service`
+with the resolved `bridge` binary, installs it to
+`~/.config/systemd/user/sessions-bridge.service`, and enables +
+starts it:
+
+```bash
+./install_daemon_unit.sh                    # install + enable + start
+./install_daemon_unit.sh --print            # render to stdout only
+./install_daemon_unit.sh --db /data/state.db --interval 10
+./install_daemon_unit.sh --no-start         # stage without starting
+```
+
+The unit runs `bridge daemon run` (the same foreground loop
+`daemon start` detaches) with `Restart=on-failure`; `daemon.lock`
+inside the state dir still prevents double starts if the unit and a
+manual `daemon start` race. Auto-start **on boot** additionally
+requires lingering - the installer attempts `loginctl
+enable-linger "$USER"` and warns if it needs root; without linger
+the unit runs only while a login session is open.
+
+A systemd-managed daemon makes the external watchdog below mostly
+redundant - `Restart=on-failure` covers a dead process and the
+heartbeat file still marks a hung one (a hung process is not a
+failure exit, so keep the watchdog if hang-restart matters). On
+non-systemd machines the watchdog stays the only supervision.
 
 ## External watchdog (cron / systemd)
 

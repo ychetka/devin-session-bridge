@@ -585,21 +585,21 @@ def _wake_candidates(db_path, now: int, queue_dir=None, pending=None):
     """Sessions the daemon should poke, in two disjoint classes.
 
     Wake rows (``probe_only=False``) get the fixed drain prompt. A
-    session qualifies only through real pending mail:
+    session qualifies through one leg only - actionable mail on disk:
 
-    Stale-heartbeat mail leg (item_16/17): no turn is open (heartbeat
-    stale or never seen) while unacked relayed mail waits.
-
-    Actionable-mail leg (item_102c): any unacked relayed notification
-    with kind != heartbeat_tick qualifies whatever the heartbeat age -
-    a DRAIN session idle at the prompt opens no turn on its own, so
-    directives would sit until a human typed. heartbeat_tick alone
-    never qualifies a fresh-heartbeat session.
-
-    File-pending leg (item_139 amendment): any unconsumed msg_*.txt
-    in the session's mailbox dir qualifies whatever the heartbeat or
-    notification rows say - the fs mailbox is the authoritative
-    delivery channel, and foreign writers bypass the outbox entirely.
+    File-pending leg (item_139 amendment, sole trigger since task
+    #184): any unconsumed non-tick msg_*.txt in the session's mailbox
+    dir qualifies whatever the heartbeat or notification rows say -
+    the fs mailbox is the authoritative delivery channel, and foreign
+    writers bypass the outbox entirely. The older DB legs (unacked
+    relayed rows with a stale or fresh heartbeat) were dropped: they
+    kept qualifying consumed-but-unacked mail long after the file was
+    drained, producing the very wake-on-empty-mailbox loop this
+    function exists to prevent (mahogany-dryosaurus ran a permanent
+    ~5-minute wake cadence on a physically empty mailbox - task #184).
+    Rows whose file is gone are ack lag, not mail; rows whose file
+    exists are already covered by this leg. heartbeat_tick files are
+    excluded by ``_dir_pending`` - a liveness poke is never mail.
 
     Probe rows (``probe_only=True``) get a session/list presence check
     only - never a prompt (item_162). A live task with a stale
@@ -618,6 +618,30 @@ def _wake_candidates(db_path, now: int, queue_dir=None, pending=None):
     cutoff = now - db.HEARTBEAT_STALE_SECONDS
     con = db.connect(db_path)
     try:
+        # file-pending leg: unconsumed msg_*.txt is mail even when no
+        # notification row exists for it (foreign writers bypass the
+        # outbox - the msg_003 sleeping-DRAIN evidence, item_139). No
+        # queue_dir guard: mailbox_dir resolves the default queue root
+        # from db_path, so the leg is on in every configuration.
+        if pending is None:
+            pending = _pending_mailbox_dirs(db_path, queue_dir)
+        result = []
+        if pending:
+            marks = ",".join("?" * len(pending))
+            rows = con.execute(
+                "SELECT session_id AS sid, cwd AS cwd FROM sessions"
+                f" WHERE session_id IN ({marks})"
+                " AND mode=? AND status='active'",
+                (*pending, SessionMode.MANAGED.value),
+            ).fetchall()
+            result = [{"sid": r["sid"], "cwd": r["cwd"], "probe_only": False} for r in rows]
+        # liveness probe rows (item_162): stale-heartbeat sessions with
+        # a live task get a session/list presence check so no_session
+        # dead-marking still runs on an empty outbox - but the drain
+        # prompt is for mail only, so these rows carry probe_only and
+        # are never sent a wake. Sessions already qualified through a
+        # mail leg stay wake rows.
+        wake_sids = {r["sid"] for r in result}
         # Two statuses are excluded from the task probe deliberately
         # (item_139): awaiting_user is a parked task whose blocker is
         # out-of-band (its answer arrives as actionable mail, which has
@@ -626,62 +650,6 @@ def _wake_candidates(db_path, now: int, queue_dir=None, pending=None):
         # session that by definition cannot act yet is noise. The stamp
         # decays with the lease it mirrors, so an abandoned wait becomes
         # probe-worthy again on its own.
-        rows = con.execute(
-            "SELECT DISTINCT s.session_id AS sid, s.cwd AS cwd"
-            " FROM sessions s"
-            " LEFT JOIN worker_heartbeats wh ON wh.session_id=s.session_id"
-            " WHERE s.mode=? AND s.status='active'"
-            " AND ("
-            # stale-heartbeat mail leg (item_16/17): unacked relayed
-            # mail while no turn is open.
-            "      ((wh.last_seen_at IS NULL OR wh.last_seen_at<=?)"
-            "       AND EXISTS (SELECT 1 FROM notifications n"
-            "                    WHERE n.session_id=s.session_id"
-            "                      AND n.relayed_at IS NOT NULL"
-            "                      AND n.ack_at IS NULL))"
-            # actionable-mail leg (item_102c) wakes even a
-            # fresh-heartbeat DRAIN session: idle at the prompt it
-            # never opens a turn on its own, so the directive would
-            # sit until a human typed. heartbeat_tick alone stays
-            # non-waking here - its liveness-poke role only matters on
-            # the stale-hb path above. A busy session answers `busy` -
-            # harmless.
-            "      OR EXISTS (SELECT 1 FROM notifications n"
-            "                 WHERE n.session_id=s.session_id"
-            "                   AND n.relayed_at IS NOT NULL"
-            "                   AND n.ack_at IS NULL"
-            "                   AND n.kind != ?))",
-            (
-                SessionMode.MANAGED.value,
-                cutoff,
-                NotificationKind.HEARTBEAT_TICK.value,
-            ),
-        ).fetchall()
-        # file-pending leg: unconsumed msg_*.txt is mail even when no
-        # notification row exists for it (foreign writers bypass the
-        # outbox - the msg_003 sleeping-DRAIN evidence, item_139). No
-        # queue_dir guard: mailbox_dir resolves the default queue root
-        # from db_path, so the leg is on in every configuration.
-        if pending is None:
-            pending = _pending_mailbox_dirs(db_path, queue_dir)
-        have = {r["sid"] for r in rows}
-        extra = [sid for sid in pending if sid not in have]
-        if extra:
-            marks = ",".join("?" * len(extra))
-            rows += con.execute(
-                "SELECT session_id AS sid, cwd AS cwd FROM sessions"
-                f" WHERE session_id IN ({marks})"
-                " AND mode=? AND status='active'",
-                (*extra, SessionMode.MANAGED.value),
-            ).fetchall()
-        result = [{"sid": r["sid"], "cwd": r["cwd"], "probe_only": False} for r in rows]
-        # liveness probe rows (item_162): stale-heartbeat sessions with
-        # a live task get a session/list presence check so no_session
-        # dead-marking still runs on an empty outbox - but the drain
-        # prompt is for mail only, so these rows carry probe_only and
-        # are never sent a wake. Sessions already qualified through a
-        # mail leg stay wake rows.
-        wake_sids = {r["sid"] for r in result}
         probe = con.execute(
             "SELECT DISTINCT s.session_id AS sid, s.cwd AS cwd"
             " FROM sessions s"

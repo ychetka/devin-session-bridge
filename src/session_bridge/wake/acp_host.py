@@ -18,8 +18,11 @@ Wire protocol (verified against the production host):
    process;
 3. ACP: ``initialize`` -> ``session/list`` (busy check via
    ``cognition.ai/statusEnum``) -> ``session/load`` (replayed
-   ``session/update`` notifications are drained and discarded) ->
-   ``session/prompt`` with the nudge -> detach.
+   ``session/update`` notifications are drained and discarded;
+   a host advertising ``protocolVersion`` >= 2 gets
+   ``session/resume`` instead - same params, no replay drain,
+   rpc_error falls back to load) -> ``session/prompt`` with the
+   nudge -> detach.
 
 Every step is bounded - a wake attempt has an overall deadline and
 can never stall the daemon loop. ``ATTACH_LOCK`` serializes attaches
@@ -300,9 +303,17 @@ def _is_busy(entry: dict | None) -> bool:
     return status is not None and not status_is_idle(status)
 
 
-def _initialize_params() -> dict:
+#: highest ACP protocol version the wake transport can drive. The
+#: initialize response negotiates down (a v1 host answers 1 and the
+#: session/load path stays); only a negotiated >= 2 unlocks
+#: session/resume (PR #81 review: offering 1 would cap the response
+#: at 1 and make the resume branch unreachable forever).
+_OFFERED_PROTOCOL = 2
+
+
+def _initialize_params(version=_OFFERED_PROTOCOL) -> dict:
     return {
-        "protocolVersion": 1,
+        "protocolVersion": version,
         "clientCapabilities": {"fs": {"readTextFile": False, "writeTextFile": False}},
         "clientInfo": {"name": "sessions-bridge-wake", "version": "0"},
     }
@@ -407,7 +418,24 @@ def wake_session(
                 return _await_response(chan, req, timeout, cap)
 
             try:
-                call("initialize", _initialize_params())
+                try:
+                    init_resp = call("initialize", _initialize_params())
+                except WakeError as e:
+                    if e.reason != "rpc_error":
+                        raise
+                    # a host that cannot honour the >=2 offer may
+                    # reject initialize outright instead of
+                    # negotiating down - re-attach and offer the
+                    # proven v1 handshake; the socket itself is
+                    # version-agnostic
+                    try:
+                        chan._sock.close()
+                    except OSError:
+                        pass
+                    chan = _attach(lock_data, agent_id)
+                    sock = chan._sock
+                    req = 0
+                    init_resp = call("initialize", _initialize_params(1))
                 chan.send({"jsonrpc": "2.0", "method": "initialized", "params": {}})
 
                 listing = call("session/list", {})
@@ -434,14 +462,24 @@ def wake_session(
                 # dead-streak (item_17 review)
                 raise WakeError("no_cwd", f"no cwd known for {session_id}")
 
-            # load replays stored session/update notifications to this
-            # client - drained with a hard cap; a transcript too big to
-            # finish within the bound still lets the prompt go out
+            # session/load replays stored session/update notifications
+            # to this client - drained with a hard cap; a transcript
+            # too big to finish within the bound still lets the prompt
+            # go out. A host advertising protocolVersion >= 2 gets
+            # session/resume instead (deferred design, OPERATOR.md):
+            # resume attaches without the replay drain, so there is no
+            # transcript flood to bound and resume's own response is
+            # the only wait. A resume rpc_error degrades to load -
+            # the version advert is a hint, not a contract.
+            proto = init_resp.get("protocolVersion")
+            load_method = (
+                "session/resume" if isinstance(proto, int) and proto >= 2 else "session/load"
+            )
             req += 1
             _rpc(
                 chan,
                 req,
-                "session/load",
+                load_method,
                 {"sessionId": session_id, "cwd": wake_cwd, "mcpServers": []},
             )
             load_id = req
@@ -449,15 +487,31 @@ def wake_session(
             try:
                 _await_response(chan, load_id, replay_timeout, replay_cap)
             except WakeError as e:
-                if e.reason != "timeout":
+                if e.reason == "rpc_error" and load_method == "session/resume":
+                    req += 1
+                    _rpc(
+                        chan,
+                        req,
+                        "session/load",
+                        {"sessionId": session_id, "cwd": wake_cwd, "mcpServers": []},
+                    )
+                    load_id = req
+                    try:
+                        _await_response(chan, load_id, replay_timeout, replay_cap)
+                    except WakeError as e2:
+                        if e2.reason != "timeout":
+                            raise
+                        load_done = False
+                elif e.reason != "timeout":
                     raise
-                # replay overflow: the load response is display data,
-                # so a flooded channel is tolerated - press on. But
-                # unread replay still queued on the socket can mention
-                # this session_id, so post-prompt session/update frames
-                # no longer prove a live turn - only a matching prompt
-                # response does.
-                load_done = False
+                else:
+                    # replay overflow: the load response is display
+                    # data, so a flooded channel is tolerated - press
+                    # on. But unread replay still queued on the socket
+                    # can mention this session_id, so post-prompt
+                    # session/update frames no longer prove a live
+                    # turn - only a matching prompt response does.
+                    load_done = False
 
             nudge = nudge or nudge_text(session_id)
             req += 1
@@ -545,7 +599,12 @@ def verify_sessions(
                 return _await_response(chan, req, timeout, cap)
 
             try:
-                call("initialize", _initialize_params())
+                # probes never drive session/resume, so they keep the
+                # proven v1 handshake (PR #81 review: inheriting the
+                # v2 offer without the re-attach fallback would let a
+                # non-compliant host silently disable presence probes
+                # and no_session dead-marking)
+                call("initialize", _initialize_params(1))
                 chan.send({"jsonrpc": "2.0", "method": "initialized", "params": {}})
                 listing = call("session/list", {})
             except WakeError as e:
