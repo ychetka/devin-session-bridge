@@ -701,6 +701,57 @@ def renew_lease(task_id: int, owner: str, *, path=None) -> bool:
     return _retry(op)
 
 
+def auto_renew_lease(task_id: int, owner: str, *, ceiling_seconds: int, path=None) -> bool:
+    """Daemon-side renewal for a verifiably-busy owner (task #189).
+
+    A DRAIN-mode session cannot call ``renew_lease`` inside a long
+    ACP turn, so the lease dies on schedule regardless of liveness:
+    ``recover_stale`` then burns an attempt - or fails the task -
+    while the worker is verifiably mid-turn doing the work. When the
+    daemon's session/list verify reports the owning session busy,
+    that status IS the liveness signal; this CAS performs the renewal
+    the worker itself cannot issue.
+
+    Same CAS shape as ``renew_lease`` with two deliberate deviations:
+    ``lease_renewed_at`` is NOT stamped - it stays the timestamp of
+    the last worker-initiated lease touch (claim, mark_running,
+    renew, wait - plus ``recover_stale``'s question-blocked renewal,
+    which is bounded by the question janitor TTLs), and the row
+    qualifies only while that touch is younger than
+    ``ceiling_seconds``. The ceiling is therefore the maximum time a
+    task may run without its worker touching the lease: a wedged or
+    zombie turn that keeps reporting busy cannot hold the task
+    forever - expiry recovery takes over once the ceiling is crossed.
+    """
+    ts = _now()
+
+    def op():
+        con = connect(path)
+        try:
+            cur = con.execute(
+                "UPDATE tasks SET lease_expires_at=?, updated_at=?"
+                " WHERE id=? AND status IN (?,?) AND lease_owner=?"
+                " AND lease_expires_at IS NOT NULL"
+                " AND lease_renewed_at IS NOT NULL"
+                " AND lease_renewed_at+?>=?",
+                (
+                    ts + LEASE_SECONDS,
+                    ts,
+                    task_id,
+                    TaskStatus.RUNNING.value,
+                    TaskStatus.DISPATCH_DECIDED.value,
+                    owner,
+                    ceiling_seconds,
+                    ts,
+                ),
+            )
+            return cur.rowcount == 1
+        finally:
+            con.close()
+
+    return _retry(op)
+
+
 def wait_task(task_id: int, owner: str, note: str | None = None, *, path=None) -> bool:
     """Claimer-side external-wait signal (item_22).
 

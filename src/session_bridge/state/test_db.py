@@ -2067,3 +2067,34 @@ def test_item139_gwt3_mail_escalated_stamp_dedups_until_cleared(db_path):
     assert db.list_wake_state(path=db_path)["s1"]["mail_escalated_at"] is not None
     assert db.clear_mail_escalated("s1", path=db_path)
     assert db.mark_mail_escalated("s1", path=db_path)
+
+
+def test_item189_gwt8_auto_renew_cas_and_ceiling(db_path):
+    """[ITEM-189.GWT-8] auto_renew_lease CAS shape: renews only a
+    running/dispatch_decided row under the given owner whose last
+    explicit lease touch is younger than the ceiling; preserves
+    lease_renewed_at so the ceiling baseline never moves."""
+    tid = db.enqueue("s1", "x", path=db_path)
+    assert db.claim_managed(tid, "s1", "w1", path=db_path)
+    row = db.get_task(tid, path=db_path)
+    touched = row["lease_renewed_at"]
+
+    # wrong owner -> refused
+    assert db.auto_renew_lease(tid, "w2", ceiling_seconds=3600, path=db_path) is False
+    # right owner, fresh touch -> renewed a full lease ahead
+    assert db.auto_renew_lease(tid, "w1", ceiling_seconds=3600, path=db_path) is True
+    row = db.get_task(tid, path=db_path)
+    assert row["lease_expires_at"] >= int(time.time()) + LEASE_SECONDS - 5
+    assert row["lease_renewed_at"] == touched  # baseline preserved
+
+    # explicit touch aged past the ceiling -> refused (zombie bound)
+    _exec(
+        db_path,
+        "UPDATE tasks SET lease_renewed_at=? WHERE id=?",
+        (int(time.time()) - 7200, tid),
+    )
+    assert db.auto_renew_lease(tid, "w1", ceiling_seconds=3600, path=db_path) is False
+
+    # non-lease-live statuses never qualify
+    assert db.finish_task(tid, "w1", ok=True, note="done", path=db_path) is True
+    assert db.auto_renew_lease(tid, "w1", ceiling_seconds=3600, path=db_path) is False
