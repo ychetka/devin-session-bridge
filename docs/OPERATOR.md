@@ -348,6 +348,54 @@ What it does not do:
 - `bridge daemon stop` is idempotent: "daemon not running" is a
   normal (exit 0) answer.
 
+## Fleet halt (bridge halt / bridge resume)
+
+`bridge halt` is the graceful fleet stop (v0.3.11) - the managed
+counterpart to the big red button. Where `disarm` is a permanent
+exit from managed mode, `halt` is a pause: sessions finish their
+current atomic action, save state, stop claiming new tasks and end
+their turn, parked until a `resume` delivery.
+
+```bash
+bridge halt <sid>               # flag + HALT notification + wake + state report
+bridge halt --all               # broadcast to every managed+active session
+bridge halt --all --stop-daemon # ... then SIGTERM the supervisor
+bridge resume <sid>             # lift: clear the flag + RESUME notification + wake
+bridge resume --all             # fleet-wide
+```
+
+Design answers (task #180):
+
+- **Semantic, not free text**: `halt`/`resume` are real
+  `NotificationKind` values, so the duty routing table, relay, ack
+  tracking and stall attribution all apply - a hand-written
+  "HALT:" directive rides none of that.
+- **Shared priority pipeline, not a second channel**: HALT is the
+  first member of the priority-flagged delivery class the deferred
+  urgent-interrupt item needs. Preemption lives in the drain
+  contract - the duty tells the session to apply `halt`/`disarm`
+  deliveries before the numeric file order - not in a parallel
+  transport. Mailbox files persist, so HALT survives a daemon
+  restart untouched; the wake is best-effort, delivery is the file.
+- **`sessions.halted_at` is the durable flag**: `claim_managed`
+  refuses new claims while it is set (the enforced half of "do not
+  claim new queued tasks" - a claim refusal that says `halted` is
+  the contract, not a race). A lease renewal on an already-running
+  task still passes: finishing the current atomic action is exactly
+  what HALT asks for.
+- **Parked mail is not a stall**: the mail-stall pass treats
+  halted sessions' undrained mail as parked
+  (`mail_stall_deferred_halted`) - stronger evidence than the busy
+  grace, so it has no ceiling.
+- **Resume is required, and exists**: without RESUME a halted
+  session has no way to distinguish "park until woken" from "park
+  forever" - `bridge resume` clears the flag and delivers the
+  `resume` semantic. `disarm` stays the permanent variant.
+- **Honest limits**: halt cannot kill a mid-turn Desktop session -
+  it is a drain-on-boundary contract. A busy session sees the HALT
+  at its next drain; `--all` reports every target's wake outcome,
+  mailbox depth and live task so the operator sees who is mid-turn.
+
 ## Daemon lifecycle
 
 | Command | Effect |
@@ -374,7 +422,7 @@ Daemon files in the state dir:
   `wake_unconfirmed`, `wake_unconfirmed_escalated`,
   `wake_verify_failed`, `mail_stall_escalated`,
   `mail_stall_deferred`, `mail_stall_deferred_busy`,
-  `mail_stall_verify_failed`.
+  `mail_stall_verify_failed`, `mail_stall_deferred_halted`.
 - `logs/daemon.log` - the detached daemon's stderr (decision lines are
   echoed there too).
 
@@ -760,6 +808,8 @@ Global flags: `--db PATH` (`SESSIONS_BRIDGE_DB`), `--queue-dir DIR`
 | `bridge retry <sid\|task_id>` | requeue a failed task; attempt resets. |
 | `bridge arm <sid>` | enroll the session into managed mode; also clears a leftover `queue_paused` flag so tasks stay claimable. |
 | `bridge disarm <sid>` / `bridge disarm --all` | leave managed mode + send a `disarm` mailbox message. |
+| `bridge halt <sid>` / `bridge halt --all [--stop-daemon]` | graceful fleet stop: sets `halted_at`, queues the `halt` semantic and wakes; `--all` reports each target's wake outcome, mailbox depth and live task; `--stop-daemon` SIGTERMs the supervisor after the broadcast (v0.3.11). |
+| `bridge resume <sid>` / `bridge resume --all` | lift a halt: clears `halted_at`, queues the `resume` semantic and wakes the session (v0.3.11). |
 | `bridge register <sid> [--role worker\|orchestrator] [--workspace DIR] [--force]` | join the bus and stamp the heartbeat; orchestrator is a CAS singleton. |
 | `bridge ask --session SID --task ID "text"` | post a worker question; refused when another question is pending (`pending_exists`), the task hit the 3-question budget (`question_limit`), or no active orchestrator exists (`no_orchestrator`). |
 | `bridge ack --session SID [--up-to N]` | advance the session's mailbox ack watermark. |

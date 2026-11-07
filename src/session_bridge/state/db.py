@@ -149,6 +149,10 @@ CREATE TABLE IF NOT EXISTS sessions (
   role TEXT NOT NULL DEFAULT 'worker',
   mode TEXT NOT NULL DEFAULT 'unmanaged',
   status TEXT NOT NULL DEFAULT 'active',
+  -- fleet-stop flag (task #180): NOT NULL = the session is halted
+  -- until `bridge resume` clears it; claim_managed refuses claims
+  -- and the stall pass parks its mail while it is set.
+  halted_at INTEGER,
   note TEXT,
   updated_at INTEGER NOT NULL
 );
@@ -274,14 +278,15 @@ CREATE TABLE IF NOT EXISTS wake_state (
 PRAGMA user_version=1;
 """
 
-# Columns the v2 schema adds to sessions. CREATE TABLE IF NOT EXISTS
-# cannot extend a pre-v2 sessions table, so init() applies these
-# ALTERs idempotently (guarded on PRAGMA table_info inside one
-# BEGIN IMMEDIATE transaction).
+# Columns added to sessions after the original schema. CREATE TABLE
+# IF NOT EXISTS cannot extend a pre-existing sessions table, so
+# init() applies these ALTERs idempotently (guarded on PRAGMA
+# table_info inside one BEGIN IMMEDIATE transaction).
 _SESSION_COLUMN_MIGRATIONS = (
     ("role", "TEXT NOT NULL DEFAULT 'worker'"),
     ("mode", "TEXT NOT NULL DEFAULT 'unmanaged'"),
     ("status", "TEXT NOT NULL DEFAULT 'active'"),
+    ("halted_at", "INTEGER"),
 )
 
 # Columns the v3 schema adds to tasks, applied idempotently for
@@ -500,7 +505,11 @@ def claim_managed(task_id: int, session_id: str, owner: str, *, path=None) -> bo
     keeps a worker from claiming a task addressed to someone else,
     the ``lease_owner`` binding keeps a staged dispatch from being
     claimed under a foreign owner, and ``queue_paused`` sessions are
-    skipped exactly like ``claim_queued``.
+    skipped exactly like ``claim_queued``. Halted sessions are
+    refused the same way (task #180): HALT's "claim no new tasks" is
+    an enforced invariant, not a duty-text request - a lease RENEWAL
+    on an already-running task is unaffected because finishing the
+    current atomic action is exactly what HALT asks for.
     """
     ts = _now()
 
@@ -513,7 +522,9 @@ def claim_managed(task_id: int, session_id: str, owner: str, *, path=None) -> bo
                 " WHERE id=? AND session_id=? AND (status=? OR (status=?"
                 " AND lease_owner=?)) AND COALESCE("
                 "  (SELECT queue_paused FROM sessions"
-                "   WHERE session_id=tasks.session_id), 0) = 0",
+                "   WHERE session_id=tasks.session_id), 0) = 0"
+                " AND (SELECT halted_at FROM sessions"
+                "  WHERE session_id=tasks.session_id) IS NULL",
                 (
                     TaskStatus.RUNNING.value,
                     owner,
@@ -1466,6 +1477,28 @@ def set_session_mode(session_id: str, mode, *, path=None) -> None:
 
 
 _SESSION_STATUSES = frozenset(s.value for s in SessionStatus)
+
+
+def set_session_halted(session_id: str, halted: bool, *, path=None) -> None:
+    """Set/clear the fleet-stop flag on a session (task #180).
+
+    ``halted_at`` NOT NULL means the session is parked until
+    ``bridge resume``: claim_managed refuses new claims and the mail
+    stall pass treats its undrained mail as parked, not stalled.
+    """
+    ts = _now() if halted else None
+
+    def op():
+        con = connect(path)
+        try:
+            con.execute(
+                "UPDATE sessions SET halted_at=?, updated_at=? WHERE session_id=?",
+                (ts, _now(), session_id),
+            )
+        finally:
+            con.close()
+
+    _retry(op)
 
 
 def set_session_status(session_id: str, status, *, path=None) -> bool:

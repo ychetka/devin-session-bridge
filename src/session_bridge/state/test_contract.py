@@ -392,6 +392,8 @@ def test_item13a_gwt3_notification_outbox_semantics() -> None:
         "notice",
         "disarm",
         "heartbeat_tick",
+        "halt",
+        "resume",
     }
 
 

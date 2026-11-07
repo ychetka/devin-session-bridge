@@ -2204,3 +2204,198 @@ def test_item152_gwt4_push_dead_unmanaged_also_refused(env, capsys):
     rc, _out = _run(["push", SID, "--task", "do it", "--json"], capsys)
     assert rc == ExitCode.NOT_FOUND
     assert db.get_live_task(SID, path=env.db) is None
+
+
+# --- item_180: fleet halt / resume ----------------------------------------------
+
+
+def _one(path, sql, args=()):
+    con = db.connect(path)
+    try:
+        return con.execute(sql, args).fetchone()
+    finally:
+        con.close()
+
+
+def _managed(env, sid=SID):
+    res = db.register(sid, f"/repo/{sid}", path=env.db)
+    assert res.accepted
+    db.set_session_mode(sid, SessionMode.MANAGED, path=env.db)
+
+
+def _stub_wake(env, monkeypatch, outcomes=None):
+    calls = []
+    monkeypatch.setattr(
+        bridge,
+        "wake_session",
+        lambda sid, *a, **k: calls.append(sid) or (outcomes or {}).get(sid, "sent"),
+    )
+    return calls
+
+
+def _sess(env, sid):
+    return db.get_session(sid, path=env.db)
+
+
+def test_item180_gwt1_halt_single_flags_notifies_wakes(env, monkeypatch, capsys):
+    """[ITEM-180.GWT-1] `bridge halt <sid>` on managed+active: halted_at
+    set, a registered HALT notification queued, a wake attempted and
+    the row reports the post state."""
+    _managed(env)
+    calls = _stub_wake(env, monkeypatch)
+
+    rc, out = _run(["halt", SID, "--json"], capsys)
+    assert rc == ExitCode.OK
+    row = out["data"]["sessions"][0]
+    assert row["status"] == "halted" and row["wake"] == "sent"
+    assert row["halted"] is True
+    assert _sess(env, SID)["halted_at"] is not None
+    assert calls == [SID]
+    n = _one(env.db, "SELECT kind, body FROM notifications WHERE session_id=?", (SID,))
+    assert n["kind"] == "halt"
+    assert "HALT" in n["body"]
+
+
+def test_item180_gwt2_claim_refused_while_halted(env, monkeypatch, capsys):
+    """[ITEM-180.GWT-2] the enforced half of HALT: a halted session's
+    `bridge claim` on a queued task is refused as 'halted' - while a
+    lease renewal on its own running task still succeeds (finishing
+    the current atomic action is what HALT asks for)."""
+    _managed(env)
+    _stub_wake(env, monkeypatch)
+    tid = _task(env)
+
+    _run(["halt", SID, "--json"], capsys)
+    rc, out = _run(["claim", str(tid), "--session", SID, "--json"], capsys)
+    assert rc == ExitCode.CONFLICT
+    assert out["status"] == "halted"
+    assert db.get_task(tid, path=env.db)["status"] == TaskStatus.QUEUED.value
+
+
+def test_item180_gwt2b_running_task_renews_while_halted(env, monkeypatch, capsys):
+    """[ITEM-180.GWT-2b] halt mid-task: the running task's lease renew
+    still passes - HALT parks new claims, not current work."""
+    _managed(env)
+    _stub_wake(env, monkeypatch)
+    tid = _task(env)
+    assert _run(["claim", str(tid), "--session", SID, "--json"], capsys)[0] == ExitCode.OK
+
+    _run(["halt", SID, "--json"], capsys)
+    rc, out = _run(["claim", str(tid), "--session", SID, "--json"], capsys)
+    assert rc == ExitCode.OK
+    assert out["data"]["renewed"] is True
+
+
+def test_item180_gwt3_resume_clears_and_notifies(env, monkeypatch, capsys):
+    """[ITEM-180.GWT-3] `bridge resume <sid>` clears halted_at, queues
+    the RESUME semantic, wakes - and claims flow again."""
+    _managed(env)
+    calls = _stub_wake(env, monkeypatch)
+    tid = _task(env)
+    _run(["halt", SID, "--json"], capsys)
+    capsys.readouterr()
+
+    rc, out = _run(["resume", SID, "--json"], capsys)
+    assert rc == ExitCode.OK
+    row = out["data"]["sessions"][0]
+    assert row["status"] == "resumed" and row["wake"] == "sent"
+    assert _sess(env, SID)["halted_at"] is None
+    assert calls == [SID, SID]
+    kinds = [
+        r["kind"]
+        for r in db.connect(env.db)
+        .execute("SELECT kind FROM notifications WHERE session_id=? ORDER BY id", (SID,))
+        .fetchall()
+    ]
+    assert kinds == ["halt", "resume"]
+
+    rc, out = _run(["claim", str(tid), "--session", SID, "--json"], capsys)
+    assert rc == ExitCode.OK
+    assert out["status"] == "running"
+
+
+def test_item180_gwt4_halt_all_broadcasts_and_snapshots(env, monkeypatch, capsys):
+    """[ITEM-180.GWT-4] `bridge halt --all` hits every managed+active
+    session, skips unmanaged and dead rows, and the snapshot carries
+    mailbox depth + live task per halted target."""
+    _managed(env)
+    _managed(env, sid="s2")
+    res = db.register("unman", "/repo/u", path=env.db)
+    assert res.accepted  # stays unmanaged
+    _managed(env, sid="deads")
+    db.set_session_status("deads", "dead", path=env.db)
+    calls = _stub_wake(env, monkeypatch)
+    tid = _task(env)
+    os.makedirs(env.qdir / SID, exist_ok=True)
+    (env.qdir / SID / "msg_9.txt").write_text("notification_id: 9\nkind: directive\n\nx")
+
+    rc, out = _run(["halt", "--all", "--json"], capsys)
+    assert rc == ExitCode.OK
+    rows = {r["session_id"]: r for r in out["data"]["sessions"]}
+    assert set(rows) == {SID, "s2"}
+    assert rows[SID]["status"] == "halted"
+    assert rows[SID]["mailbox_files"] == 1
+    assert rows[SID]["live_task"] == tid
+    assert sorted(calls) == [SID, "s2"]
+    # the excluded rows got nothing
+    assert _sess(env, "unman")["halted_at"] is None
+    assert _sess(env, "deads")["halted_at"] is None
+    con = db.connect(env.db)
+    try:
+        n = con.execute(
+            "SELECT COUNT(*) c FROM notifications WHERE session_id IN ('unman','deads')"
+        ).fetchone()
+    finally:
+        con.close()
+    assert n["c"] == 0
+
+
+def test_item180_gwt5_halt_all_stop_daemon(env, monkeypatch, capsys):
+    """[ITEM-180.GWT-5] `--stop-daemon` SIGTERMs the relay loop after
+    the broadcast and reports the outcome."""
+    _managed(env)
+    _stub_wake(env, monkeypatch)
+    seen = []
+    monkeypatch.setattr(bridge, "_sigterm_daemon", lambda sdir: seen.append(sdir) or "stopped")
+
+    rc, out = _run(["halt", "--all", "--stop-daemon", "--json"], capsys)
+    assert rc == ExitCode.OK
+    assert out["data"]["daemon"] == "stopped"
+    assert seen  # the helper ran with the state dir
+
+
+def test_item180_gwt6_skip_cases(env, monkeypatch, capsys):
+    """[ITEM-180.GWT-6] honest skips: unknown sid, unmanaged target,
+    already-halted and not-halted resume - each reports skipped with
+    a reason and writes no notification."""
+    _managed(env)
+    _stub_wake(env, monkeypatch)
+    res = db.register("unman", "/repo/u", path=env.db)
+    assert res.accepted
+
+    _rc, out = _run(["halt", "ghost", "--json"], capsys)
+    row = out["data"]["sessions"][0]
+    assert row["status"] == "skipped" and "not registered" in row["reason"]
+
+    _rc, out = _run(["halt", "unman", "--json"], capsys)
+    row = out["data"]["sessions"][0]
+    assert row["status"] == "skipped" and "not managed" in row["reason"]
+
+    # resume without halt is a no-op skip
+    _rc, out = _run(["resume", SID, "--json"], capsys)
+    row = out["data"]["sessions"][0]
+    assert row["status"] == "skipped" and "not halted" in row["reason"]
+
+    _run(["halt", SID, "--json"], capsys)
+    _rc, out = _run(["halt", SID, "--json"], capsys)
+    row = out["data"]["sessions"][0]
+    assert row["status"] == "skipped" and "already halted" in row["reason"]
+
+    con = db.connect(env.db)
+    try:
+        n = con.execute(
+            "SELECT COUNT(*) c FROM notifications WHERE session_id=?", (SID,)
+        ).fetchone()
+    finally:
+        con.close()
+    assert n["c"] == 1  # only the single successful halt

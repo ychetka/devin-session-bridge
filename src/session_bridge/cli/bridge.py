@@ -1773,6 +1773,153 @@ def _cmd_disarm(args) -> int:
     return _emit(args, resp, ExitCode.OK, human)
 
 
+_HALT_BODY = (
+    "HALT: finish your current atomic action only, save state"
+    " (commit/push WIP, notes in the task file), then end your turn."
+    " Do not claim new queued tasks - they persist and resume later."
+)
+_RESUME_BODY = "RESUME: the halt is lifted - normal mailbox duty resumes"
+
+
+def _halt_targets(args) -> tuple[list[str], int | None]:
+    """Session ids the halt/resume applies to; empty + usage rc.
+
+    ``--all`` broadcasts to every managed+active session - the same
+    fleet set ``bridge disarm --all`` addresses.
+    """
+    if args.all:
+        return [
+            r["session_id"]
+            for r in _all_session_rows(args)
+            if r["mode"] == SessionMode.MANAGED.value and r["status"] == SessionStatus.ACTIVE.value
+        ], None
+    if args.session_id:
+        return [args.session_id], None
+    resp = JsonResponse(
+        status="usage",
+        error=f"{args.command} requires a session id or --all",
+    )
+    rc = _emit(
+        args,
+        resp,
+        ExitCode.USAGE,
+        f"usage: bridge {args.command} <session_id> | bridge {args.command} --all",
+    )
+    return [], rc
+
+
+def _mailbox_file_count(args, sid: str) -> int:
+    """Unconsumed ``msg_*.txt`` files in the sid's mailbox - the
+    "whose mail is undrained" column of the halt snapshot."""
+    try:
+        return sum(
+            1
+            for name in os.listdir(os.path.join(_queue_dir(args), sid))
+            if name.startswith("msg_") and name.endswith(".txt")
+        )
+    except OSError:
+        return 0
+
+
+def _halt_apply(args, sid: str, halt: bool) -> dict:
+    """Flag + notify + wake one session; fold the result into a row.
+
+    HALT is a drain-on-boundary contract (task #180): the flag and
+    notification persist regardless of wake outcome, so a mid-turn
+    session picks it up at its own boundary - the wake is a
+    best-effort speedup, not the delivery path.
+    """
+    sess = db.get_session(sid, path=args.db)
+    row = {"session_id": sid}
+    if sess is None or sess["status"] != SessionStatus.ACTIVE.value:
+        row["status"] = "skipped"
+        row["reason"] = "not registered" if sess is None else f"is {sess['status']}"
+        return row
+    if halt and sess["mode"] != SessionMode.MANAGED.value:
+        row["status"] = "skipped"
+        row["reason"] = "not managed - halt duty is managed-only"
+        return row
+    if halt and sess["halted_at"] is not None:
+        row["status"] = "skipped"
+        row["reason"] = "already halted"
+        return row
+    if not halt and sess["halted_at"] is None:
+        row["status"] = "skipped"
+        row["reason"] = "not halted"
+        return row
+    db.set_session_halted(sid, halt, path=args.db)
+    kind = NotificationKind.HALT if halt else NotificationKind.RESUME
+    body = _HALT_BODY if halt else _RESUME_BODY
+    if args.reason:
+        body += f" ({args.reason})"
+    row["notification_id"] = db.notify(sid, kind, body, path=args.db)
+    try:
+        row["wake"] = wake_session(sid, _session_cwd(sid, args))
+    except WakeError as e:
+        row["wake"] = f"failed:{e.reason}"
+    row["mailbox_files"] = _mailbox_file_count(args, sid)
+    task = db.get_live_task(sid, path=args.db)
+    row["live_task"] = task["id"] if task is not None else None
+    row["halted"] = halt
+    row["status"] = "halted" if halt else "resumed"
+    return row
+
+
+def _cmd_halt(args) -> int:
+    """``bridge halt <sid>|--all [--stop-daemon]``: graceful fleet stop.
+
+    Sets the durable halted flag, enqueues the HALT semantic
+    notification and best-effort wakes each target; ``--all`` adds a
+    fleet snapshot (who is mid-turn, whose mail is undrained, which
+    tasks are in flight and will resume) and ``--stop-daemon`` SIGTERMs
+    the relay loop afterwards.
+    """
+    sids, rc = _halt_targets(args)
+    if rc is not None:
+        return rc
+    rows = [_halt_apply(args, sid, True) for sid in sids]
+    data: dict = {"sessions": rows}
+    daemon_state = None
+    if getattr(args, "stop_daemon", False):
+        daemon_state = _sigterm_daemon(_state_dir(args))
+        data["daemon"] = daemon_state
+    resp = JsonResponse(status="ok", data=data)
+    lines = [
+        f"halt {r['session_id']}: {r['status']}"
+        + (f" ({r['reason']})" if r.get("reason") else "")
+        + (f" wake={r['wake']}" if r.get("wake") else "")
+        + (
+            f" mail={r['mailbox_files']} task=#{r['live_task']}"
+            if r.get("status") == "halted"
+            else ""
+        )
+        for r in rows
+    ]
+    if daemon_state is not None:
+        lines.append(f"daemon {daemon_state}")
+    return _emit(args, resp, ExitCode.OK, "\n".join(lines))
+
+
+def _cmd_resume(args) -> int:
+    """``bridge resume <sid>|--all``: lift the fleet halt.
+
+    Clears halted_at, enqueues the RESUME semantic and wakes the
+    session so queued work flows again.
+    """
+    sids, rc = _halt_targets(args)
+    if rc is not None:
+        return rc
+    rows = [_halt_apply(args, sid, False) for sid in sids]
+    resp = JsonResponse(status="ok", data={"sessions": rows})
+    lines = [
+        f"resume {r['session_id']}: {r['status']}"
+        + (f" ({r['reason']})" if r.get("reason") else "")
+        + (f" wake={r['wake']}" if r.get("wake") else "")
+        for r in rows
+    ]
+    return _emit(args, resp, ExitCode.OK, "\n".join(lines))
+
+
 # --- orchestration bus: register / ask / ack (item_13e1) -------------------------
 
 
@@ -2007,6 +2154,24 @@ def _cmd_claim(args) -> int:
             ),
         )
         return _emit(args, resp, ExitCode.CONFLICT, f"conflict: {sid} is not managed")
+    sess = db.get_session(sid, path=args.db)
+    if sess is not None and sess["halted_at"] is not None:
+        # the enforced half of the HALT contract (task #180): while
+        # halted a session finishes its CURRENT atomic action only -
+        # the lease renewal path below stays open (finishing is what
+        # HALT asks for), but no new task may be claimed
+        if task["status"] != TaskStatus.RUNNING.value or task["lease_owner"] != _managed_owner(
+            sid, tid
+        ):
+            resp = JsonResponse(
+                session=sid,
+                status="halted",
+                error=f"{sid} is halted - awaiting `bridge resume`; task {tid} persists queued",
+                agent_instruction=(
+                    "do not claim: the session is halted; the task persists until resume"
+                ),
+            )
+            return _emit(args, resp, ExitCode.CONFLICT, f"halted: claim refused for task {tid}")
     owner = _managed_owner(sid, tid)
     if task["status"] == TaskStatus.RUNNING.value and task["lease_owner"] == owner:
         if db.renew_lease(tid, owner, path=args.db):
@@ -2823,34 +2988,54 @@ def _daemon_start(args) -> int:
     return _emit(args, resp, ExitCode.OK, f"daemon started (pid {proc.pid})")
 
 
-def _daemon_stop(args) -> int:
-    sdir = _state_dir(args)
+def _sigterm_daemon(sdir) -> str:
+    """SIGTERM the running daemon, wait for the lock to release.
+
+    Result word for reports - shared by ``bridge daemon stop`` and
+    ``bridge halt --all --stop-daemon`` (task #180): "stopped",
+    "not_running", "pid_unreadable", "sigterm_failed:<err>" or
+    "timeout".
+    """
     if not daemon.daemon_running(sdir):
-        resp = JsonResponse(status="not_running", data={"state_dir": sdir})
-        return _emit(args, resp, ExitCode.OK, "daemon not running")
+        return "not_running"
     pid = daemon.daemon_pid(sdir)
     if pid is None:
-        resp = JsonResponse(
-            status="running",
-            error="daemon running but its pid is unreadable in daemon.lock",
-        )
-        return _emit(args, resp, ExitCode.INTERNAL, "error: daemon running but pid unreadable")
+        return "pid_unreadable"
     try:
         os.kill(pid, signal.SIGTERM)
     except ProcessLookupError:
         pass  # already gone; the lock release check below reports it
     except OSError as e:
-        resp = JsonResponse(status="running", error=f"SIGTERM to pid {pid} failed: {e}")
-        return _emit(args, resp, ExitCode.INTERNAL, f"error: SIGTERM failed: {e}")
+        return f"sigterm_failed:{e}"
     deadline = time.time() + DAEMON_STOP_TIMEOUT_SECONDS
     while time.time() < deadline:
         if not daemon.daemon_running(sdir):
-            resp = JsonResponse(status="stopped", data={"pid": pid, "state_dir": sdir})
-            return _emit(args, resp, ExitCode.OK, f"daemon stopped (pid {pid})")
+            return "stopped"
         time.sleep(0.1)
+    return "timeout"
+
+
+def _daemon_stop(args) -> int:
+    sdir = _state_dir(args)
+    result = _sigterm_daemon(sdir)
+    if result == "not_running":
+        resp = JsonResponse(status="not_running", data={"state_dir": sdir})
+        return _emit(args, resp, ExitCode.OK, "daemon not running")
+    if result == "pid_unreadable":
+        resp = JsonResponse(
+            status="running",
+            error="daemon running but its pid is unreadable in daemon.lock",
+        )
+        return _emit(args, resp, ExitCode.INTERNAL, "error: daemon running but pid unreadable")
+    if result == "stopped":
+        resp = JsonResponse(status="stopped", data={"state_dir": sdir})
+        return _emit(args, resp, ExitCode.OK, "daemon stopped")
+    if result.startswith("sigterm_failed:"):
+        resp = JsonResponse(status="running", error=f"SIGTERM failed: {result[15:]}")
+        return _emit(args, resp, ExitCode.INTERNAL, f"error: SIGTERM failed: {result[15:]}")
     resp = JsonResponse(
         status="running",
-        error=f"daemon pid {pid} did not exit within {DAEMON_STOP_TIMEOUT_SECONDS}s",
+        error=f"daemon pid did not exit within {DAEMON_STOP_TIMEOUT_SECONDS}s",
     )
     return _emit(args, resp, ExitCode.INTERNAL, "error: daemon did not stop")
 
@@ -3041,6 +3226,35 @@ def _parse_args(argv) -> argparse.Namespace:
         action="store_true",
         help="disarm every managed session (big red button)",
     )
+    _add_json(sp)
+
+    # fleet stop (task #180): HALT parks managed sessions until RESUME
+    sp = sub.add_parser(
+        "halt",
+        help="graceful fleet stop: park managed sessions until resume",
+    )
+    sp.add_argument("session_id", nargs="?", default=None)
+    sp.add_argument(
+        "--all",
+        action="store_true",
+        help="halt every managed+active session (fleet stop)",
+    )
+    sp.add_argument(
+        "--stop-daemon",
+        action="store_true",
+        help="SIGTERM the supervisor daemon after the broadcast",
+    )
+    sp.add_argument("--reason", default=None, help="optional note appended to the HALT body")
+    _add_json(sp)
+
+    sp = sub.add_parser("resume", help="lift a fleet halt (--all for the fleet)")
+    sp.add_argument("session_id", nargs="?", default=None)
+    sp.add_argument(
+        "--all",
+        action="store_true",
+        help="resume every managed+active session",
+    )
+    sp.add_argument("--reason", default=None, help="optional note appended to the RESUME body")
     _add_json(sp)
 
     # supervisor daemon (item_13d); literal command name like
@@ -3294,6 +3508,8 @@ _HANDLERS = {
     "wake": _cmd_wake,
     "wait": _cmd_wait,
     "disarm": _cmd_disarm,
+    "halt": _cmd_halt,
+    "resume": _cmd_resume,
     "daemon": _cmd_daemon,
     "register": _cmd_register,
     "ask": _cmd_ask,
