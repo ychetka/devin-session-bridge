@@ -582,13 +582,13 @@ def _dir_pending(db_path, queue_dir, sid):
 
 
 def _wake_candidates(db_path, now: int, queue_dir=None, pending=None):
-    """Active managed sessions the mailbox alone cannot reach, in three
-    legs.
+    """Sessions the daemon should poke, in two disjoint classes.
 
-    Stale-heartbeat leg (item_16/17): no turn is open (heartbeat stale
-    or never seen) while mail waits or a live task exists - the live
-    task keeps the liveness probe, and thus no_session death
-    detection, running even when the outbox is empty.
+    Wake rows (``probe_only=False``) get the fixed drain prompt. A
+    session qualifies only through real pending mail:
+
+    Stale-heartbeat mail leg (item_16/17): no turn is open (heartbeat
+    stale or never seen) while unacked relayed mail waits.
 
     Actionable-mail leg (item_102c): any unacked relayed notification
     with kind != heartbeat_tick qualifies whatever the heartbeat age -
@@ -601,41 +601,44 @@ def _wake_candidates(db_path, now: int, queue_dir=None, pending=None):
     notification rows say - the fs mailbox is the authoritative
     delivery channel, and foreign writers bypass the outbox entirely.
 
+    Probe rows (``probe_only=True``) get a session/list presence check
+    only - never a prompt (item_162). A live task with a stale
+    heartbeat is the liveness/death-detection input: it keeps the
+    no_session streak running when the outbox is empty, but the drain
+    prompt it used to trigger produced a permanent wake loop - a
+    managed DRAIN session's heartbeat is structurally stale between
+    turns, so the task leg re-qualified every retry window while the
+    mailbox stayed physically empty (the buttered-tilapia incident:
+    three drain prompts, zero files, ack zero). A task alone can no
+    longer wake a session; an empty mailbox never wakes.
+
     Dead sessions are excluded so a no_session-marked session is not
     probed forever.
     """
     cutoff = now - db.HEARTBEAT_STALE_SECONDS
     con = db.connect(db_path)
     try:
-        # Two statuses are excluded from the task leg deliberately
+        # Two statuses are excluded from the task probe deliberately
         # (item_139): awaiting_user is a parked task whose blocker is
         # out-of-band (its answer arrives as actionable mail, which has
-        # its own leg), and a running task with a fresh wait_until stamp
-        # declared an external wait via `bridge wait` - poking a session
-        # that by definition cannot act yet is noise. The stamp decays
-        # with the lease it mirrors, so an abandoned wait becomes
-        # wake-worthy again on its own.
+        # its own wake leg), and a running task with a fresh wait_until
+        # stamp declared an external wait via `bridge wait` - probing a
+        # session that by definition cannot act yet is noise. The stamp
+        # decays with the lease it mirrors, so an abandoned wait becomes
+        # probe-worthy again on its own.
         rows = con.execute(
             "SELECT DISTINCT s.session_id AS sid, s.cwd AS cwd"
             " FROM sessions s"
             " LEFT JOIN worker_heartbeats wh ON wh.session_id=s.session_id"
             " WHERE s.mode=? AND s.status='active'"
             " AND ("
-            # stale-heartbeat leg (item_16/17): mail or live task while
-            # no turn is open. A live task keeps liveness probing (and
-            # thus no_session death detection) alive even when the
-            # outbox is empty (item_17 review).
+            # stale-heartbeat mail leg (item_16/17): unacked relayed
+            # mail while no turn is open.
             "      ((wh.last_seen_at IS NULL OR wh.last_seen_at<=?)"
-            "       AND (EXISTS (SELECT 1 FROM notifications n"
-            "                     WHERE n.session_id=s.session_id"
-            "                       AND n.relayed_at IS NOT NULL"
-            "                       AND n.ack_at IS NULL)"
-            "            OR EXISTS (SELECT 1 FROM tasks t"
-            "                       WHERE t.session_id=s.session_id"
-            "                         AND (t.status IN ('queued','dispatch_decided')"
-            "                              OR (t.status='running'"
-            "                                  AND (t.wait_until IS NULL"
-            "                                       OR t.wait_until<=?))))))"
+            "       AND EXISTS (SELECT 1 FROM notifications n"
+            "                    WHERE n.session_id=s.session_id"
+            "                      AND n.relayed_at IS NOT NULL"
+            "                      AND n.ack_at IS NULL))"
             # actionable-mail leg (item_102c) wakes even a
             # fresh-heartbeat DRAIN session: idle at the prompt it
             # never opens a turn on its own, so the directive would
@@ -651,7 +654,6 @@ def _wake_candidates(db_path, now: int, queue_dir=None, pending=None):
             (
                 SessionMode.MANAGED.value,
                 cutoff,
-                now,
                 NotificationKind.HEARTBEAT_TICK.value,
             ),
         ).fetchall()
@@ -672,7 +674,32 @@ def _wake_candidates(db_path, now: int, queue_dir=None, pending=None):
                 " AND mode=? AND status='active'",
                 (*extra, SessionMode.MANAGED.value),
             ).fetchall()
-        return rows
+        result = [{"sid": r["sid"], "cwd": r["cwd"], "probe_only": False} for r in rows]
+        # liveness probe rows (item_162): stale-heartbeat sessions with
+        # a live task get a session/list presence check so no_session
+        # dead-marking still runs on an empty outbox - but the drain
+        # prompt is for mail only, so these rows carry probe_only and
+        # are never sent a wake. Sessions already qualified through a
+        # mail leg stay wake rows.
+        wake_sids = {r["sid"] for r in result}
+        probe = con.execute(
+            "SELECT DISTINCT s.session_id AS sid, s.cwd AS cwd"
+            " FROM sessions s"
+            " LEFT JOIN worker_heartbeats wh ON wh.session_id=s.session_id"
+            " WHERE s.mode=? AND s.status='active'"
+            " AND (wh.last_seen_at IS NULL OR wh.last_seen_at<=?)"
+            " AND EXISTS (SELECT 1 FROM tasks t"
+            "             WHERE t.session_id=s.session_id"
+            "               AND (t.status IN ('queued','dispatch_decided')"
+            "                    OR (t.status='running'"
+            "                        AND (t.wait_until IS NULL"
+            "                             OR t.wait_until<=?))))",
+            (SessionMode.MANAGED.value, cutoff, now),
+        ).fetchall()
+        for r in probe:
+            if r["sid"] not in wake_sids:
+                result.append({"sid": r["sid"], "cwd": r["cwd"], "probe_only": True})
+        return result
     finally:
         con.close()
 
@@ -702,10 +729,23 @@ def _wake_pass(
     wake_state streak, and a streak crossing
     WAKE_UNCONFIRMED_ESCALATE_STREAK escalates to the human once per
     episode via ``notify``.
+
+    Probe-only candidates (item_162): stale-heartbeat sessions whose
+    sole qualification is a live task never reach the prompt path -
+    ``_probe_pass`` checks their presence on one batched session/list
+    after the candidate loop so no_session dead-marking still runs
+    while an empty mailbox provably never wakes.
     """
     deadline = time.monotonic() + _WAKE_PASS_DEADLINE_SECONDS
     unverified: list[str] = []
+    probes: list[str] = []
     for row in _wake_candidates(db_path, now, queue_dir, pending):
+        if row.get("probe_only"):
+            # liveness-only candidate (item_162): presence is checked
+            # in one batched session/list below - the drain prompt is
+            # for pending mail only, so an empty mailbox never wakes.
+            probes.append(row["sid"])
+            continue
         if time.monotonic() >= deadline:
             _decision(
                 state_directory,
@@ -774,8 +814,77 @@ def _wake_pass(
             policy.record_confirmed(sid)
         _decision(state_directory, "wake_sent", sid, f"outcome={outcome}")
 
+    if probes:
+        _probe_pass(db_path, state_directory, probes, policy)
+
     if unverified:
         _verify_unconfirmed_wakes(db_path, state_directory, unverified, policy, notify)
+
+
+def _probe_pass(db_path, state_directory, sids, policy) -> None:
+    """Batched session/list presence check for probe-only candidates.
+
+    The liveness probe that the old task wake leg provided by side
+    effect (item_162): a stale-heartbeat managed session with a live
+    task still needs no_session dead-marking to run while its mailbox
+    is empty, but the drain prompt is for mail only - so presence is
+    checked with a single shared session/list and no prompt is ever
+    injected. Absent sids feed the durable no_session streak (and the
+    dead-mark at the threshold); listed sids reset it. The shared
+    cooldown paces probes like wakes; a failed attach is a host
+    problem, not session evidence, so it leaves streaks untouched and
+    counts toward the breaker like any wake failure.
+    """
+    lock_data = find_lockfile()
+    host_key = lock_data["_path"] if lock_data else "none"
+    due = [sid for sid in sids if policy.check(sid, host_key) is None]
+    if not due or lock_data is None:
+        return
+    for sid in due:
+        policy.record_attempt(sid)
+    try:
+        statuses = verify_sessions(due, lock_data=lock_data)
+    except WakeError as e:
+        opened = policy.record_result(host_key, False)
+        _decision(
+            state_directory,
+            "wake_probe_failed",
+            detail=f"sessions={len(due)} reason={e.reason} {e}",
+        )
+        if opened:
+            _decision(
+                state_directory,
+                "wake_breaker_open",
+                detail=f"host={host_key} suspended",
+            )
+        return
+    policy.record_result(host_key, True)
+    now = int(time.time())
+    for sid in due:
+        # Parity with _verify_unconfirmed_wakes: a fresh ack proves a
+        # live drain turn even when session/list raced and reported
+        # the session absent - absent-with-fresh-ack is not no_session
+        # evidence.
+        ack = db.last_ack_at(sid, path=db_path)
+        absent = statuses.get(sid, SESSION_ABSENT) == SESSION_ABSENT
+        if absent and not (ack is not None and now - int(ack) <= _VERIFY_ACK_GRACE_SECONDS):
+            streak = policy.record_no_session(sid)
+            _decision(
+                state_directory,
+                "wake_probe_absent",
+                sid,
+                f"streak={streak}",
+            )
+            if streak >= _NO_SESSION_DEAD_STREAK:
+                _mark_dead_no_session(db_path, state_directory, sid, streak)
+        else:
+            policy.record_session_seen(sid)
+            _decision(
+                state_directory,
+                "wake_probe",
+                sid,
+                "present" if not absent else "absent_but_acked",
+            )
 
 
 def _env_int(name: str, default: int) -> int:

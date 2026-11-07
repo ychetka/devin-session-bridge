@@ -72,8 +72,17 @@ class WakePolicy:
         self._next_allowed[session_id] = self._clock() + min(backoff, self._cooldown)
 
     def record_confirmed(self, session_id: str) -> None:
-        """Reset the unconfirmed streak after a fully confirmed wake."""
+        """Reset the unconfirmed streak after a fully confirmed wake.
+
+        Also restores the full cooldown: ``record_retry_soon`` shortens
+        the next-allowed stamp to ~60s so a silently missed nudge
+        retries fast, but once verification proves the wake landed
+        (session turned busy) the short window would re-fire a stale
+        candidate far sooner than intended - the confirmed stamp
+        re-arms the standard pacing window (item_162).
+        """
         self._unconfirmed_streak.pop(session_id, None)
+        self._next_allowed[session_id] = self._clock() + self._cooldown
 
     def record_no_session(self, session_id: str) -> int:
         """Bump the consecutive ``no_session`` count; return it.
