@@ -907,10 +907,18 @@ def test_item21_alive_outcome_resets_escalated_episode(env, monkeypatch):
 
 
 def _wake_calls(env, monkeypatch):
-    """Record wake_session call sids; verify is a no-op (outcome 'sent')."""
+    """Record wake_session call sids; verify is a no-op (outcome 'sent').
+
+    find_lockfile is stubbed too: probe-only candidates (item_162) need
+    a lockfile to reach verify_sessions, and relying on whatever
+    acp-host lock the dev machine happens to hold made tests
+    environment-dependent (CI red on PR #69). The fake host_key keeps
+    the cooldown/breaker accounting exercised without a real host.
+    """
     calls = []
     monkeypatch.setattr(daemon, "wake_session", lambda sid, *a, **k: calls.append(sid) or "sent")
     monkeypatch.setattr(daemon, "verify_sessions", lambda sids, **k: {})
+    monkeypatch.setattr(daemon, "find_lockfile", lambda *a, **k: {"_path": "fake-host"})
     return calls
 
 

@@ -893,6 +893,27 @@ def test_item162_probe_paced_by_cooldown(env, tmp_path, monkeypatch):
     assert sum(d["event"] == "wake_probe" for d in _decisions(env)) == 1
 
 
+def test_item162_probe_absent_with_fresh_ack_is_live(env, tmp_path, monkeypatch):
+    """[ITEM-162.GWT-7] Parity with _verify_unconfirmed_wakes: a probe
+    whose session is absent from session/list but acked within the
+    grace window is alive evidence, not no_session - the streak does
+    not move and no dead-marking happens."""
+    host = FakeAcpHost(sessions=[])
+    _lockdir(tmp_path, host, monkeypatch)
+    _session(env.db, SID, managed=True)
+    _heartbeat(env.db, SID, age=999)
+    _live_task(env.db, SID)
+    _relayed_mail(env.db, SID)
+    db.ack_notifications(SID, path=env.db)  # fresh watermark, mail drained
+
+    daemon._wake_pass(env.db, env.sdir, int(time.time()), WakePolicy())
+
+    probe = [d for d in _decisions(env) if d["event"] == "wake_probe"]
+    assert probe and probe[0]["detail"] == "absent_but_acked"
+    assert db.get_session(SID, path=env.db)["status"] == "active"
+    assert not any(d["event"] == "wake_probe_absent" for d in _decisions(env))
+
+
 def test_item162_probe_attach_failure_leaves_streak(env, tmp_path, monkeypatch):
     """[ITEM-162.GWT-6] A failed probe attach is host evidence, not
     session evidence: wake_probe_failed is journaled, the no_session
