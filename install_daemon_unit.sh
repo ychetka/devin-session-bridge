@@ -24,6 +24,8 @@
 #                         override ~/.config/systemd/user (tests)
 #   SESSIONS_BRIDGE_SYSTEMCTL
 #                         override the systemctl binary (tests)
+#   SESSIONS_BRIDGE_LOGINCTL
+#                         override the loginctl binary (tests)
 
 set -euo pipefail
 
@@ -49,7 +51,7 @@ while [ $# -gt 0 ]; do
         --no-enable) DO_ENABLE=0; shift ;;
         --print) PRINT_ONLY=1; shift ;;
         -h|--help)
-            sed -n '2,26p' "$0"
+            sed -n '2,28p' "$0"
             exit 0
             ;;
         *) die "unknown flag: $1 (try --help)" ;;
@@ -59,7 +61,7 @@ done
 # argparse would crash-loop the unit on a non-numeric interval - the
 # mistake is cheaper here than under Restart=on-failure (--interval
 # is type=float in the CLI)
-[ -z "$INTERVAL" ] || [[ "$INTERVAL" =~ ^[0-9]+([.][0-9]+)?$ ]] \
+[ -z "$INTERVAL" ] || [[ "$INTERVAL" =~ ^([0-9]+([.][0-9]*)?|[.][0-9]+)$ ]] \
     || die "--interval must be a non-negative number, got: $INTERVAL"
 
 BRIDGE="${SESSIONS_BRIDGE_BIN:-}"
