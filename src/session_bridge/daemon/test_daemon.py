@@ -711,8 +711,7 @@ def _managed_with_mail(env, sid=SID):
     assert res.accepted
     db.set_session_mode(sid, SessionMode.MANAGED, path=env.db)
     _stale_heartbeat(env.db, sid)
-    nid = db.notify(sid, NotificationKind.DIRECTIVE, "steer", path=env.db)
-    db.mark_relayed(nid, path=env.db)
+    _undrained_mail(env, sid, NotificationKind.DIRECTIVE)
 
 
 def _fake_unconfirmed(env, monkeypatch, statuses):
@@ -932,9 +931,10 @@ def _managed_fresh(env, sid=SID):
 
 
 def _unacked(env, sid, kind):
-    nid = db.notify(sid, kind, "body", path=env.db)
-    db.mark_relayed(nid, path=env.db)
-    return nid
+    """Unacked relayed mail in its true on-disk shape (task #184): a
+    relayed row without its msg file is consumed-but-unacked - ack
+    lag, not mail - so every unacked fixture writes the file."""
+    return _undrained_mail(env, sid, kind)
 
 
 def _undrained_mail(env, sid, kind, age_seconds=None):
@@ -990,9 +990,11 @@ def test_item102c_gwt3_live_task_alone_keeps_fresh_hb_calm(env, monkeypatch):
     assert calls == []
 
 
-def test_item102c_gwt4_tick_still_wakes_stale_hb(env, monkeypatch):
-    """[ITEM-102C.GWT-4] stale-hb session + only a heartbeat_tick ->
-    still a candidate: the liveness probe path is unchanged."""
+def test_item102c_gwt4_tick_file_alone_does_not_wake_stale_hb(env, monkeypatch):
+    """[ITEM-102C.GWT-4, retargeted by task #184] stale-hb session +
+    only a heartbeat_tick -> not a candidate: the tick is a liveness
+    poke, and a stale session that cannot act on it must not be
+    woken just to drain a poke file."""
     res = db.register(SID, "/repo/ws", path=env.db)
     assert res.accepted
     db.set_session_mode(SID, SessionMode.MANAGED, path=env.db)
@@ -1001,15 +1003,18 @@ def test_item102c_gwt4_tick_still_wakes_stale_hb(env, monkeypatch):
     calls = _wake_calls(env, monkeypatch)
 
     assert daemon.run(env.db, env.qdir, once=True, notify_send=env.notifier) == daemon.RUN_OK
-    assert calls == [SID]
+    assert calls == []
 
 
-def test_item102c_gwt5_acked_actionable_mail_does_not_rewake(env, monkeypatch):
-    """[ITEM-102C.GWT-5] fresh-hb session whose actionable mail is
-    already acked -> not a candidate: the re-wake loop boundary."""
+def test_item102c_gwt5_consumed_actionable_mail_does_not_rewake(env, monkeypatch):
+    """[ITEM-102C.GWT-5, retargeted by task #184] fresh-hb session whose
+    actionable mail is consumed AND acked -> not a candidate: the
+    re-wake loop boundary. (Ack without consumption still wakes -
+    the file on disk is undrained mail.)"""
     _managed_fresh(env)
-    _unacked(env, SID, NotificationKind.DIRECTIVE)
+    nid = _unacked(env, SID, NotificationKind.DIRECTIVE)
     db.ack_notifications(SID, path=env.db)
+    os.remove(os.path.join(env.qdir, SID, f"msg_{nid}.txt"))
     calls = _wake_calls(env, monkeypatch)
 
     assert daemon.run(env.db, env.qdir, once=True, notify_send=env.notifier) == daemon.RUN_OK
@@ -1663,3 +1668,141 @@ def test_item180_gwt8_halted_session_mail_is_parked(env, monkeypatch):
     db.set_session_halted(SID, False, path=env.db)
     assert daemon._mail_stall_pass(env.db, env.sdir, int(time.time()), env.notifier) >= 7199
     assert _orch_stall_count(env) == 1
+
+
+# --- item_184: file-only wake trigger (consumed-but-unacked noise) ------------
+
+
+def test_item184_gwt1_consumed_but_unacked_never_wakes(env, monkeypatch):
+    """[ITEM-184.GWT-1] the mahogany-dryosaurus loop: a relayed
+    notification whose file was drained but never acked kept
+    qualifying the DB mail legs forever (~5min wake cadence on a
+    physically empty mailbox). File truth is the only wake leg:
+    no file, no wake - the row is ack lag, not mail."""
+    _managed_fresh(env)
+    nid = _unacked(env, SID, NotificationKind.TASK_DISPATCH)
+    os.remove(os.path.join(env.qdir, SID, f"msg_{nid}.txt"))  # drained, not acked
+    calls = _wake_calls(env, monkeypatch)
+
+    assert daemon.run(env.db, env.qdir, once=True, notify_send=env.notifier) == daemon.RUN_OK
+    assert calls == []
+
+
+def test_item184_gwt2_unacked_row_with_file_still_wakes(env, monkeypatch):
+    """[ITEM-184.GWT-2] regression pair: the same unacked row DOES wake
+    while its file is still on disk - the leg dropped was the
+    row-only path, not real undrained mail."""
+    _managed_fresh(env)
+    _unacked(env, SID, NotificationKind.DIRECTIVE)
+    calls = _wake_calls(env, monkeypatch)
+
+    assert daemon.run(env.db, env.qdir, once=True, notify_send=env.notifier) == daemon.RUN_OK
+    assert calls == [SID]
+
+
+def test_item184_gwt3_stale_hb_mail_on_disk_still_wakes(env, monkeypatch):
+    """[ITEM-184.GWT-3] the item_16/17 stale-heartbeat contract survives
+    the leg drop: undrained mail on a sleeping session still wakes -
+    only the heartbeat-freshness gate is gone, not the mail check."""
+    _managed_with_mail(env)
+    calls = _wake_calls(env, monkeypatch)
+
+    assert daemon.run(env.db, env.qdir, once=True, notify_send=env.notifier) == daemon.RUN_OK
+    assert calls == [SID]
+
+
+# --- item_184: systemd --user unit installer ----------------------------------
+
+INSTALL_UNIT_SH = Path(__file__).resolve().parents[3] / "install_daemon_unit.sh"
+
+
+def _install_unit(tmp_path, *args):
+    """Run the installer with a fake systemctl + isolated unit dir; no
+    real user manager is touched."""
+    import subprocess
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    bridge_bin = bin_dir / "bridge"
+    bridge_bin.write_text("#!/bin/sh\n")
+    bridge_bin.chmod(0o755)
+    log = tmp_path / "systemctl.log"
+    systemctl = bin_dir / "systemctl"
+    systemctl.write_text(f'#!/bin/sh\necho "$@" >> "{log}"\n')
+    systemctl.chmod(0o755)
+    env = dict(
+        os.environ,
+        SESSIONS_BRIDGE_BIN=str(bridge_bin),
+        SESSIONS_BRIDGE_UNIT_DIR=str(tmp_path / "units"),
+        SESSIONS_BRIDGE_SYSTEMCTL=str(systemctl),
+    )
+    res = subprocess.run(
+        ["bash", str(INSTALL_UNIT_SH), *args],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env=env,
+    )
+    return res, tmp_path / "units" / "sessions-bridge.service", log
+
+
+def test_item184_gwt6_unit_print_renders_paths(tmp_path):
+    """[ITEM-184.GWT-6] --print renders the template with the resolved
+    bridge binary and daemon flags - the file a user manager would
+    get, without touching systemd."""
+    res, unit_file, _ = _install_unit(tmp_path, "--print", "--db", "/data/state.db")
+    assert res.returncode == 0, res.stderr
+    bridge_bin = str(tmp_path / "bin" / "bridge")
+    assert f"ExecStart={bridge_bin} daemon run --db '/data/state.db'" in res.stdout
+    assert "Restart=on-failure" in res.stdout
+    assert "WantedBy=default.target" in res.stdout
+    assert not unit_file.exists()  # print writes nothing
+
+
+def test_item184_gwt7_unit_install_enable_start(tmp_path):
+    """[ITEM-184.GWT-7] a full install writes the unit under
+    ~/.config/systemd/user, reloads the manager, enables and starts
+    the service - the auto-start-on-boot path (linger is attempted
+    and only warns on failure)."""
+    res, unit_file, log = _install_unit(tmp_path)
+    assert res.returncode == 0, res.stderr
+    text = unit_file.read_text()
+    bridge_bin = str(tmp_path / "bin" / "bridge")
+    assert f"ExecStart={bridge_bin} daemon run" in text
+    calls = log.read_text().splitlines()
+    assert calls[0] == "--user daemon-reload"
+    assert "--user enable sessions-bridge.service" in calls
+    assert "--user start sessions-bridge.service" in calls
+
+
+def test_item184_gwt8_unit_no_start_no_enable(tmp_path):
+    """[ITEM-184.GWT-8] --no-start/--no-enable install the unit file
+    only - the operator's staging path."""
+    res, unit_file, log = _install_unit(tmp_path, "--no-start", "--no-enable")
+    assert res.returncode == 0, res.stderr
+    assert unit_file.exists()
+    calls = log.read_text().splitlines()
+    assert calls == ["--user daemon-reload"]
+
+
+def test_item184_gwt9_unit_missing_bridge_binary_refused(tmp_path):
+    """[ITEM-184.GWT-9] no bridge binary -> refuse before touching
+    systemd (no half-installed unit)."""
+    import subprocess
+
+    env = dict(
+        os.environ,
+        SESSIONS_BRIDGE_BIN=str(tmp_path / "no-such-bridge"),
+        SESSIONS_BRIDGE_UNIT_DIR=str(tmp_path / "units"),
+        SESSIONS_BRIDGE_SYSTEMCTL="/nonexistent/systemctl",
+    )
+    res = subprocess.run(
+        ["bash", str(INSTALL_UNIT_SH)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env=env,
+    )
+    assert res.returncode != 0
+    assert "bridge binary not" in res.stderr
+    assert not (tmp_path / "units").exists()

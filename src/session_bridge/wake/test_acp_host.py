@@ -57,6 +57,8 @@ class FakeAcpHost:
         prompt_update=True,
         truncate_hello=False,
         on_prompt=None,
+        protocol_version=1,
+        resume_error=None,
     ):
         self.sessions = list(sessions)
         self.hello_error = hello_error
@@ -65,6 +67,8 @@ class FakeAcpHost:
         self.prompt_update = prompt_update
         self.truncate_hello = truncate_hello
         self.on_prompt = on_prompt
+        self.protocol_version = protocol_version
+        self.resume_error = resume_error
         self.hellos: list[dict] = []
         self.calls: list[tuple[str, dict]] = []
         self.errors: list[str] = []
@@ -118,7 +122,15 @@ class FakeAcpHost:
                 self.calls.append((method, params))
                 out = {"jsonrpc": "2.0", "id": msg["id"]}
                 if method == "initialize":
-                    out["result"] = {"protocolVersion": 1, "agentCapabilities": {}}
+                    out["result"] = {
+                        "protocolVersion": self.protocol_version,
+                        "agentCapabilities": {},
+                    }
+                elif method == "session/resume":
+                    if self.resume_error is not None:
+                        out["error"] = {"code": -32601, "message": self.resume_error}
+                    else:
+                        out["result"] = {}
                 elif method == "session/list":
                     out["result"] = {"sessions": self.sessions}
                 elif method == "session/load":
@@ -209,8 +221,16 @@ def _heartbeat(path, sid, *, age):
 
 
 def _relayed_mail(path, sid):
+    """Relayed unacked mail in its true on-disk shape (task #184): a
+    relayed row without its msg file is consumed-but-unacked - ack
+    lag, not mail - so the fixture writes the file the relay would."""
+    from session_bridge.mailbox.core import mailbox_dir
+
     nid = db.notify(sid, NotificationKind.TASK_DISPATCH, "do the thing", task_id=1, path=path)
     db.mark_relayed(nid, path=path)
+    mdir = mailbox_dir(sid, db_path=path)
+    os.makedirs(mdir, exist_ok=True)
+    Path(mdir, f"msg_{nid}.txt").write_text(f"notification_id: {nid}\nkind: task_dispatch\n\nbody")
     return nid
 
 
@@ -333,6 +353,32 @@ def test_wake_full_flow_sent():
     assert hello["token"] == "fake-token"
     assert hello["agent"] == {"id": "devin-cli"}
     assert hello["protocol"] == 1
+
+
+def test_item184_gwt4_protocol2_prefers_resume_over_load():
+    """[ITEM-184.GWT-4] a host advertising protocolVersion >= 2 gets
+    session/resume instead of session/load - no replay drain (the
+    deferred OPERATOR.md design adopted behind the wake transport)."""
+    host = FakeAcpHost(sessions=[IDLE_SESSION], protocol_version=2)
+    outcome = wake_session(SID, "/tmp/ws", lock_data=host.lock_data())
+    assert outcome == "sent"
+    assert host.methods() == ["initialize", "session/list", "session/resume", "session/prompt"]
+
+
+def test_item184_gwt5_resume_rpc_error_falls_back_to_load():
+    """[ITEM-184.GWT-5] a >=2 advert is a hint, not a contract: a
+    resume rpc_error degrades to session/load on the same channel
+    rather than failing the wake."""
+    host = FakeAcpHost(sessions=[IDLE_SESSION], protocol_version=2, resume_error="method not found")
+    outcome = wake_session(SID, "/tmp/ws", lock_data=host.lock_data())
+    assert outcome == "sent"
+    assert host.methods() == [
+        "initialize",
+        "session/list",
+        "session/resume",
+        "session/load",
+        "session/prompt",
+    ]
 
 
 def test_wake_busy_session_not_prompted():
@@ -930,8 +976,13 @@ def test_item162_probe_absent_with_fresh_ack_is_live(env, tmp_path, monkeypatch)
     _session(env.db, SID, managed=True)
     _heartbeat(env.db, SID, age=999)
     _live_task(env.db, SID)
-    _relayed_mail(env.db, SID)
+    nid = _relayed_mail(env.db, SID)
     db.ack_notifications(SID, path=env.db)  # fresh watermark, mail drained
+    # drained means the file is gone too - an on-disk file is real
+    # undrained mail and would wake, not probe (task #184)
+    from session_bridge.mailbox.core import mailbox_dir
+
+    os.remove(os.path.join(mailbox_dir(SID, db_path=env.db), f"msg_{nid}.txt"))
 
     daemon._wake_pass(env.db, env.sdir, int(time.time()), WakePolicy())
 
