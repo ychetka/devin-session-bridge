@@ -1872,6 +1872,13 @@ def _halt_apply(args, sid: str, halt: bool) -> dict:
     except Exception as e:
         row["status"] = "error"
         row["reason"] = f"{type(e).__name__}: {e}"
+        try:
+            # the flag may have been applied before the failing step
+            # (e.g. notify raised after set_session_halted) - report
+            # the true durable state, not just the exception
+            row["halted"] = db.get_session(sid, path=args.db)["halted_at"] is not None
+        except Exception:
+            pass
     return row
 
 
@@ -1900,8 +1907,13 @@ def _cmd_halt(args) -> int:
             # materialize as mailbox files - the woken sessions would
             # drain nothing and skip the save-state step. Relay them
             # synchronously now that the lock is free.
-            daemon._relay_pass(args.db, _queue_dir(args), sdir)
-            data["relayed"] = True
+            try:
+                daemon._relay_pass(args.db, _queue_dir(args), sdir)
+                data["relayed"] = True
+            except Exception as e:
+                # state is already safe (flag set + outbox rows exist);
+                # report instead of tracebacking past the JSON emit
+                data["relay_error"] = f"{type(e).__name__}: {e}"
     resp = JsonResponse(status="ok", data=data)
     lines = [
         f"halt {r['session_id']}: {r['status']}"
