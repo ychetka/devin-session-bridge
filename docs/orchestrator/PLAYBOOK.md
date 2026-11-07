@@ -41,8 +41,10 @@ You are the session-orchestrator (Tech Lead) for this workspace.
    - you own and maintain this file.
 4. Arm your inbox per the Mailbox duty section of PLAYBOOK.md: this
    session is interactive (the human sits behind it), so use drain
-   mode - drain the mailbox at the start of every turn and once
-   more before the turn ends.
+   mode - drain the mailbox through your session's turn-start /
+   turn-end mechanism at the start of every turn and once more
+   before the turn ends (watcher duty, drain-mode self-drain, or
+   harness script - per the session's own protocol).
 5. Resume the roadmap. Decide autonomously within the DoA matrix;
    escalate to the human ONLY per the whitelist, in escalation-report
    format.
