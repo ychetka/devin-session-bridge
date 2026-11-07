@@ -503,6 +503,22 @@ def test_policy_retry_soon_shortens_cooldown():
     assert p.check("s", "h") is None  # retried well before 300s
 
 
+def test_policy_confirmed_rearms_full_cooldown():
+    """[ITEM-162.GWT-4] A verified wake must not inherit the retry_soon
+    window: record_confirmed re-arms the full cooldown, so a session
+    still qualifying as a candidate is paced at 300s, not ~60s -
+    the second half of the buttered-tilapia wake-loop fix."""
+    clock = [1000.0]
+    p = WakePolicy(cooldown_seconds=300, clock=lambda: clock[0])
+    p.record_attempt("s")
+    p.record_retry_soon("s")  # next allowed at t+60
+    p.record_confirmed("s")  # verified working -> full cooldown
+    clock[0] += 61
+    assert p.check("s", "h") == "cooldown"  # was None before the fix
+    clock[0] += 240
+    assert p.check("s", "h") is None
+
+
 def test_policy_unconfirmed_streak_grows_backoff():
     """Repeated unconfirmed wakes back off exponentially (60,120,240,
     capped at cooldown) instead of polling the host every 60s."""
@@ -857,6 +873,49 @@ def test_item162_live_task_plus_mail_still_wakes(env, tmp_path, monkeypatch):
     assert "session/prompt" in host.methods()
     assert any(d["event"] == "wake_sent" for d in _decisions(env))
     assert not any(d["event"] == "wake_probe" for d in _decisions(env))
+
+
+def test_item162_probe_paced_by_cooldown(env, tmp_path, monkeypatch):
+    """[ITEM-162.GWT-5] The probe shares the per-session cooldown: a
+    second pass inside the window does not re-attach session/list."""
+    host = FakeAcpHost(sessions=[IDLE_SESSION])
+    _lockdir(tmp_path, host, monkeypatch)
+    _session(env.db, SID, managed=True)
+    _heartbeat(env.db, SID, age=999)
+    _live_task(env.db, SID)
+    policy = WakePolicy()
+
+    daemon._wake_pass(env.db, env.sdir, int(time.time()), policy)
+    probes = sum(d["event"] == "wake_probe" for d in _decisions(env))
+    assert probes == 1
+
+    daemon._wake_pass(env.db, env.sdir, int(time.time()), policy)
+    assert sum(d["event"] == "wake_probe" for d in _decisions(env)) == 1
+
+
+def test_item162_probe_attach_failure_leaves_streak(env, tmp_path, monkeypatch):
+    """[ITEM-162.GWT-6] A failed probe attach is host evidence, not
+    session evidence: wake_probe_failed is journaled, the no_session
+    streak stays at zero, the session is not dead-marked, and the
+    failure still counts toward the host breaker."""
+    host = FakeAcpHost(sessions=[IDLE_SESSION])
+    _lockdir(tmp_path, host, monkeypatch)
+    _session(env.db, SID, managed=True)
+    _heartbeat(env.db, SID, age=999)
+    _live_task(env.db, SID)
+    policy = WakePolicy()
+    monkeypatch.setattr(
+        daemon,
+        "verify_sessions",
+        lambda sids, **k: (_ for _ in ()).throw(WakeError("attach_failed", "boom")),
+    )
+
+    daemon._wake_pass(env.db, env.sdir, int(time.time()), policy)
+
+    assert any(d["event"] == "wake_probe_failed" for d in _decisions(env))
+    assert db.get_session(SID, path=env.db)["status"] == "active"
+    assert policy._no_session_streak.get(SID, 0) == 0
+    assert list(policy._consecutive_failures.values()) == [1]
 
 
 def test_item17_dead_session_not_a_wake_candidate(env, tmp_path, monkeypatch):

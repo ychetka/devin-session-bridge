@@ -729,6 +729,12 @@ def _wake_pass(
     wake_state streak, and a streak crossing
     WAKE_UNCONFIRMED_ESCALATE_STREAK escalates to the human once per
     episode via ``notify``.
+
+    Probe-only candidates (item_162): stale-heartbeat sessions whose
+    sole qualification is a live task never reach the prompt path -
+    ``_probe_pass`` checks their presence on one batched session/list
+    after the candidate loop so no_session dead-marking still runs
+    while an empty mailbox provably never wakes.
     """
     deadline = time.monotonic() + _WAKE_PASS_DEADLINE_SECONDS
     unverified: list[str] = []
@@ -853,8 +859,15 @@ def _probe_pass(db_path, state_directory, sids, policy) -> None:
             )
         return
     policy.record_result(host_key, True)
+    now = int(time.time())
     for sid in due:
-        if statuses.get(sid, SESSION_ABSENT) == SESSION_ABSENT:
+        # Parity with _verify_unconfirmed_wakes: a fresh ack proves a
+        # live drain turn even when session/list raced and reported
+        # the session absent - absent-with-fresh-ack is not no_session
+        # evidence.
+        ack = db.last_ack_at(sid, path=db_path)
+        absent = statuses.get(sid, SESSION_ABSENT) == SESSION_ABSENT
+        if absent and not (ack is not None and now - int(ack) <= _VERIFY_ACK_GRACE_SECONDS):
             streak = policy.record_no_session(sid)
             _decision(
                 state_directory,
@@ -866,7 +879,12 @@ def _probe_pass(db_path, state_directory, sids, policy) -> None:
                 _mark_dead_no_session(db_path, state_directory, sid, streak)
         else:
             policy.record_session_seen(sid)
-            _decision(state_directory, "wake_probe", sid, "present")
+            _decision(
+                state_directory,
+                "wake_probe",
+                sid,
+                "present" if not absent else "absent_but_acked",
+            )
 
 
 def _env_int(name: str, default: int) -> int:
