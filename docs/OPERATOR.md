@@ -748,11 +748,12 @@ Global flags: `--db PATH` (`SESSIONS_BRIDGE_DB`), `--queue-dir DIR`
 | `bridge unpark <sid>` | resume a paused/awaiting session (requeues paused tasks, clears the queue pause). |
 | `bridge retry <sid\|task_id>` | requeue a failed task; attempt resets. |
 | `bridge arm <sid>` | enroll the session into managed mode; also clears a leftover `queue_paused` flag so tasks stay claimable. |
-| `bridge disarm <sid>` / `bridge disarm --all` | leave managed mode + send a `disarm` mailbox notice. |
+| `bridge disarm <sid>` / `bridge disarm --all` | leave managed mode + send a `disarm` mailbox message. |
 | `bridge register <sid> [--role worker\|orchestrator] [--workspace DIR] [--force]` | join the bus and stamp the heartbeat; orchestrator is a CAS singleton. |
 | `bridge ask --session SID --task ID "text"` | post a worker question; refused when another question is pending (`pending_exists`), the task hit the 3-question budget (`question_limit`), or no active orchestrator exists (`no_orchestrator`). |
 | `bridge ack --session SID [--up-to N]` | advance the session's mailbox ack watermark. |
 | `bridge directive <sid> "<text>"` | send a registered directive notification: the daemon relays it into the fs mailbox and the wake legs see it. Prefer this over hand-writing `msg_*.txt` files - foreign files get wakes via the file-pending leg but carry no registry evidence (v0.3.4). |
+| `bridge notice <sid> "<text>"` | send a registered informational notice - same delivery machinery as directive, but kind `notice` means "read and incorporate" rather than "obey": the path for worker status and task reports (v0.3.9). |
 | `bridge heartbeat <sid>` | refresh the session's liveness record (bumps the heartbeat generation; no takeover semantics). |
 | `bridge questions list [--session SID] [--task ID]` | list pending worker questions. |
 | `bridge questions claim <qid> --claimant SID` | atomically claim a question for answering. |

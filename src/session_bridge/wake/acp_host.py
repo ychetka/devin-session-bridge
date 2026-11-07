@@ -353,8 +353,7 @@ def _hello_error_reason(err) -> str:
     unrecognized reason into the daemon's switch arms.
     """
     if isinstance(err, dict):
-        code = err.get("code")
-        return str(code) if code in {"unauthorized"} else "attach_failed"
+        return "unauthorized" if err.get("code") == "unauthorized" else "attach_failed"
     return "unauthorized" if "unauthorized" in str(err) else "attach_failed"
 
 
