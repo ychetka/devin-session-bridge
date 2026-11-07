@@ -907,8 +907,12 @@ _MAIL_STALL_SECONDS = _env_int("SESSIONS_BRIDGE_MAIL_STALL_SECONDS", 1800)
 #: is younger than this. Past it the session may be wedged mid-turn -
 #: managed sessions are exempt from the heartbeat sweep, so this pass
 #: is the last operator signal for that shape. Default = 4 stall
-#: lengths.
-_BUSY_GRACE_SECONDS = _env_int("SESSIONS_BRIDGE_BUSY_GRACE_SECONDS", 4 * _MAIL_STALL_SECONDS)
+#: lengths; clamped at the stall threshold so a misconfigured
+#: override cannot silently disable the grace.
+_BUSY_GRACE_SECONDS = max(
+    _MAIL_STALL_SECONDS,
+    _env_int("SESSIONS_BRIDGE_BUSY_GRACE_SECONDS", 4 * _MAIL_STALL_SECONDS),
+)
 
 
 def _msg_nid(name: str):
@@ -972,7 +976,7 @@ def _busy_sessions(sids, state_directory=None) -> set:
         _decision(
             state_directory,
             "mail_stall_verify_failed",
-            "-",
+            None,
             f"{e.reason}: {e}",
         )
         return set()
