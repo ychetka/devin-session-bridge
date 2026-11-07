@@ -902,6 +902,18 @@ def _env_int(name: str, default: int) -> int:
 #: unacked this long is unreachable by every other signal we have.
 _MAIL_STALL_SECONDS = _env_int("SESSIONS_BRIDGE_MAIL_STALL_SECONDS", 1800)
 
+#: Busy grace has a ceiling (task #174 review): a session whose
+#: statusEnum reports live work defers escalation only while the mail
+#: is younger than this. Past it the session may be wedged mid-turn -
+#: managed sessions are exempt from the heartbeat sweep, so this pass
+#: is the last operator signal for that shape. Default = 4 stall
+#: lengths; clamped at the stall threshold so a misconfigured
+#: override cannot silently disable the grace.
+_BUSY_GRACE_SECONDS = max(
+    _MAIL_STALL_SECONDS,
+    _env_int("SESSIONS_BRIDGE_BUSY_GRACE_SECONDS", 4 * _MAIL_STALL_SECONDS),
+)
+
 
 def _msg_nid(name: str):
     """Numeric notification id from ``msg_<nid>.txt``; None when the
@@ -939,6 +951,40 @@ def _msg_is_tick(path: str, nid) -> bool:
         and nid is not None
         and headers.get("notification_id") == str(nid)
     )
+
+
+def _busy_sessions(sids, state_directory=None) -> set:
+    """Sids verifiably mid-turn per session/list, best-effort.
+
+    One shared attach answers for the whole stall-candidate batch -
+    the same verify channel the wake paths use. A session whose
+    statusEnum reports live turn work is busy; absent, statusless and
+    idle entries are not busy evidence, and a failed attach yields an
+    empty set (unverifiable is not busy - escalation stays
+    conservative). The busy check is the escalation-grace signal for
+    task #174: a mid-turn session cannot drain by definition, so its
+    undrained mail is expected lag, not a stall.
+    """
+    if not sids:
+        return set()
+    lock_data = find_lockfile()
+    if lock_data is None:
+        return set()
+    try:
+        statuses = verify_sessions(list(sids), lock_data=lock_data)
+    except WakeError as e:
+        _decision(
+            state_directory,
+            "mail_stall_verify_failed",
+            None,
+            f"{e.reason}: {e}",
+        )
+        return set()
+    return {
+        sid
+        for sid, st in statuses.items()
+        if st is not None and st != SESSION_ABSENT and not status_is_idle(st)
+    }
 
 
 def _mail_stall_pass(
@@ -986,6 +1032,15 @@ def _mail_stall_pass(
     # without a matching row are genuinely unregistered foreign mail
     # (the msg_003 case) - only they join the count.
     #
+    # A session verifiably mid-turn per session/list gets grace
+    # instead of escalation (task #174): it cannot drain mid-turn, so
+    # its undrained mail is expected lag. The deferral consumes no
+    # episode stamp - once it goes idle with the mail still on disk,
+    # the same stall escalates. Grace is bounded by
+    # ``_BUSY_GRACE_SECONDS`` so a wedged turn cannot silence the
+    # signal forever. Dead, absent, unmanaged and unverifiable
+    # sessions are never graced.
+    #
     # The shared ``pending`` scan is only a candidate hint: it is
     # taken before _wake_pass, and a wake can itself trigger a drain
     # that removes files before this merge - every candidate dir is
@@ -1032,9 +1087,32 @@ def _mail_stall_pass(
         con.close()
     orch_sid = orch["session_id"] if orch else None
 
+    # Busy grace (task #174): a session verifiably mid-turn cannot
+    # drain by definition - its undrained mail is expected ack lag,
+    # not a stall, so the escalation is deferred instead of fired.
+    # The episode stamp is NOT consumed: when the session goes idle
+    # with the mail still undrained it escalates on a later pass, so
+    # busy buys grace, not amnesty. The grace is also bounded by
+    # _BUSY_GRACE_SECONDS: mail older than that on a still-busy
+    # session may mean a wedged turn, so it escalates anyway. Dead,
+    # absent, unmanaged and unverifiable sessions escalate exactly
+    # as before.
+    busy = _busy_sessions(
+        [sid for sid, r in undrained.items() if now - r["oldest"] >= _MAIL_STALL_SECONDS],
+        state_directory,
+    )
+
     for sid, r in undrained.items():
         age = now - r["oldest"]
         if age < _MAIL_STALL_SECONDS:
+            continue
+        if sid in busy and age < _BUSY_GRACE_SECONDS:
+            _decision(
+                state_directory,
+                "mail_stall_deferred_busy",
+                sid,
+                f"age={age}s count={r['count']} session mid-turn",
+            )
             continue
         # pick the delivery target FIRST: the dedup stamp is consumed
         # only when an escalation can actually leave the daemon
