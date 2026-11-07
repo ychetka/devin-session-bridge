@@ -805,9 +805,12 @@ def test_item17_seen_outcome_resets_no_session_streak(env, tmp_path, monkeypatch
     assert db.get_session(SID, path=env.db)["status"] == "dead"  # 3rd consecutive
 
 
-def test_item17_live_task_only_is_wake_candidate(env, tmp_path, monkeypatch):
-    """A managed session with a live task but no mail still gets probed -
-    keeps no_session death detection alive (review coverage hole)."""
+def test_item162_live_task_only_probes_never_wakes(env, tmp_path, monkeypatch):
+    """[ITEM-162.GWT-1] A managed session with a live task but an empty
+    mailbox gets a session/list presence probe - never a drain prompt:
+    the stale-hb + live-task combination is structural for a DRAIN
+    session between turns, so waking on it looped drain prompts on a
+    physically empty queue (the buttered-tilapia incident)."""
     host = FakeAcpHost(sessions=[IDLE_SESSION])
     _lockdir(tmp_path, host, monkeypatch)
     _session(env.db, SID, managed=True)
@@ -816,8 +819,44 @@ def test_item17_live_task_only_is_wake_candidate(env, tmp_path, monkeypatch):
 
     daemon._wake_pass(env.db, env.sdir, int(time.time()), WakePolicy())
 
+    assert "session/prompt" not in host.methods()
+    assert any(d["event"] == "wake_probe" for d in _decisions(env))
+    assert not any(d["event"] == "wake_sent" for d in _decisions(env))
+
+
+def test_item162_probe_absent_marks_dead_without_prompt(env, tmp_path, monkeypatch):
+    """[ITEM-162.GWT-2] The probe keeps no_session dead-marking alive on
+    an empty outbox: a session absent from session/list across the
+    streak threshold is marked dead - and no prompt is ever sent."""
+    host = FakeAcpHost(sessions=[])
+    _lockdir(tmp_path, host, monkeypatch)
+    _session(env.db, SID, managed=True)
+    _heartbeat(env.db, SID, age=999)
+    _live_task(env.db, SID)
+    policy = WakePolicy(cooldown_seconds=0)
+
+    for _ in range(3):
+        daemon._wake_pass(env.db, env.sdir, int(time.time()), policy)
+    assert db.get_session(SID, path=env.db)["status"] == "dead"
+    assert "session/prompt" not in host.methods()
+    assert any(d["event"] == "wake_probe_absent" for d in _decisions(env))
+
+
+def test_item162_live_task_plus_mail_still_wakes(env, tmp_path, monkeypatch):
+    """[ITEM-162.GWT-3] Mail keeps the prompt path: a live task session
+    with unacked relayed mail is a wake row, not a probe."""
+    host = FakeAcpHost(sessions=[IDLE_SESSION])
+    _lockdir(tmp_path, host, monkeypatch)
+    _session(env.db, SID, managed=True)
+    _heartbeat(env.db, SID, age=999)
+    _live_task(env.db, SID)
+    _relayed_mail(env.db, SID)
+
+    daemon._wake_pass(env.db, env.sdir, int(time.time()), WakePolicy())
+
     assert "session/prompt" in host.methods()
     assert any(d["event"] == "wake_sent" for d in _decisions(env))
+    assert not any(d["event"] == "wake_probe" for d in _decisions(env))
 
 
 def test_item17_dead_session_not_a_wake_candidate(env, tmp_path, monkeypatch):

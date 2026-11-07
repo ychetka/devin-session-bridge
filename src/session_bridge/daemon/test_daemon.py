@@ -1106,27 +1106,33 @@ def test_item139_gwt1_awaiting_user_task_not_wake_candidate(env, monkeypatch):
 
 def test_item139_gwt2_fresh_wait_until_suppresses_task_leg(env, monkeypatch):
     """[ITEM-139.GWT-2] `bridge wait` stamps wait_until = lease expiry:
-    a running task mid external-wait is not wake-worthy until the
-    stamp decays, then it is again (the dead-worker boundary)."""
+    a running task mid external-wait is not probe-worthy until the
+    stamp decays, then it is again (the dead-worker boundary). Since
+    item_162 the task leg produces a liveness probe, never a drain
+    prompt - wake_session must not be called in any phase."""
     _managed_stale(env)
     tid = _running_task(env)
     calls = _wake_calls(env, monkeypatch)
 
-    # running without a wait stamp: wake-worthy liveness probe
+    # running without a wait stamp: probe-worthy, but never woken
     assert daemon.run(env.db, env.qdir, once=True, notify_send=env.notifier) == daemon.RUN_OK
-    assert calls == [SID]
+    assert calls == []
+    assert any(d["event"] == "wake_probe_absent" for d in _decisions(env))
 
     calls.clear()
     assert db.wait_task(tid, SID, "waiting on CI", path=env.db)
     task = db.get_task(tid, path=env.db)
     assert task["wait_until"] == task["lease_expires_at"]
+    before = len(_decisions(env))
     assert daemon.run(env.db, env.qdir, once=True, notify_send=env.notifier) == daemon.RUN_OK
     assert calls == []
+    assert not any(d["event"].startswith("wake_probe") for d in _decisions(env)[before:])
 
-    # stamp expired -> wake-worthy again on its own, no clear needed
+    # stamp expired -> probe-worthy again on its own, no clear needed
     _exec(env.db, "UPDATE tasks SET wait_until=? WHERE id=?", (int(time.time()) - 1, tid))
     assert daemon.run(env.db, env.qdir, once=True, notify_send=env.notifier) == daemon.RUN_OK
-    assert calls == [SID]
+    assert calls == []
+    assert any(d["event"] == "wake_probe_absent" for d in _decisions(env))
 
 
 def test_item139_gwt3_mail_stall_escalates_once_per_episode(env, monkeypatch):
