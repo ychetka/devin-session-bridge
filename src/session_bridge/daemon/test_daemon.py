@@ -1642,3 +1642,24 @@ def test_item174_gwt7_busy_grace_has_a_ceiling(env, monkeypatch):
 
     assert daemon._mail_stall_pass(env.db, env.sdir, int(time.time()), env.notifier) >= 7199
     assert _orch_stall_count(env) == 1
+
+
+def test_item180_gwt8_halted_session_mail_is_parked(env, monkeypatch):
+    """[ITEM-180.GWT-8] a halted session's undrained mail is parked by
+    design - mail_stall_deferred_halted, no escalation, no stamp,
+    unbounded in time (unlike the busy grace ceiling)."""
+    _stall_env(env)
+    _undrained_mail(
+        env, SID, NotificationKind.DIRECTIVE, age_seconds=daemon._BUSY_GRACE_SECONDS + 600
+    )
+    db.set_session_halted(SID, True, path=env.db)
+    _wake_calls(env, monkeypatch)
+
+    assert daemon._mail_stall_pass(env.db, env.sdir, int(time.time()), env.notifier) >= 7199
+    assert _orch_stall_count(env) == 0
+    assert [d["event"] for d in _decisions(env)] == ["mail_stall_deferred_halted"]
+
+    # resume unparks it - the same mail escalates on the next pass
+    db.set_session_halted(SID, False, path=env.db)
+    assert daemon._mail_stall_pass(env.db, env.sdir, int(time.time()), env.notifier) >= 7199
+    assert _orch_stall_count(env) == 1

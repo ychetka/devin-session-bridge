@@ -1102,9 +1102,28 @@ def _mail_stall_pass(
         state_directory,
     )
 
+    # Halt parking (task #180): a halted session's undrained mail is
+    # parked until `bridge resume` by design - it is the strongest
+    # "expected lag" signal we have and needs no grace ceiling.
+    halted = {
+        sid
+        for sid, r in undrained.items()
+        if now - r["oldest"] >= _MAIL_STALL_SECONDS
+        and (sess := db.get_session(sid, path=db_path)) is not None
+        and sess["halted_at"] is not None
+    }
+
     for sid, r in undrained.items():
         age = now - r["oldest"]
         if age < _MAIL_STALL_SECONDS:
+            continue
+        if sid in halted:
+            _decision(
+                state_directory,
+                "mail_stall_deferred_halted",
+                sid,
+                f"age={age}s count={r['count']} session halted",
+            )
             continue
         if sid in busy and age < _BUSY_GRACE_SECONDS:
             _decision(

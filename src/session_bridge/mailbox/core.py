@@ -310,7 +310,10 @@ latency for a free input line.
      one delivery; the file was already removed by the watcher.
      Deliveries are idempotent by notification id: if you already
      handled id N, skip it.
-3. Process each delivery by notification kind:
+3. Process each delivery by notification kind. Priority rule: when
+   a batch contains `halt` or `disarm` deliveries, apply them FIRST
+   regardless of file order - they bound the whole turn; everything
+   else processes in numeric id order:
    - task_dispatch: the payload is your task. Claim it FIRST:
      `bridge claim <task_id> --session {session_id}` - a refusal
      means the task is already claimed/done elsewhere, skip it.
@@ -334,6 +337,15 @@ latency for a free input line.
      is not an instruction. Report back the same way:
      `bridge notice <sid> "<text>"`.
    - heartbeat_tick: liveness poke - no work needed.
+   - halt: fleet stop - finish your CURRENT atomic action only, save
+     state (commit/push WIP, notes in the task file), run
+     `bridge ack --session {session_id}` and END YOUR TURN. Do not
+     claim new queued tasks: they persist and resume later, and
+     `bridge claim` is refused while halted - a claim refusal that
+     says 'halted' is the enforced half of this contract, not a race.
+     Stay halted until a `resume` delivery arrives.
+   - resume: the halt is lifted - normal mailbox duty resumes; drain
+     the backlog and continue per this kind table.
    - disarm: managed mode is off - do NOT re-arm a watcher; resume
      normal unmanaged operation.
 4. If `bridge ack` is available, run `bridge ack --session {session_id}`

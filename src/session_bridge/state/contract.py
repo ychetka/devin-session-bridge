@@ -526,6 +526,15 @@ class NotificationKind(str, Enum):
     report flow rides NOTICE so "obey" and "read" stay distinct),
     DISARM orders a watcher/turn teardown, HEARTBEAT_TICK
     is a liveness poke.
+
+    HALT and RESUME are the priority-flagged pair (task #180): HALT
+    is the fleet-stop semantic (finish the current atomic action,
+    save state, claim no new tasks, end the turn - enforced
+    db-side by claim_managed refusing halted sessions); RESUME lifts
+    it. Both preempt mailbox ordering by duty contract: the drain
+    applies them before the numeric file order because their
+    semantics bound the whole turn. DISARM stays the permanent
+    variant - HALT/RESUME is pause, DISARM is exit.
     """
 
     TASK_DISPATCH = "task_dispatch"
@@ -534,6 +543,8 @@ class NotificationKind(str, Enum):
     NOTICE = "notice"
     DISARM = "disarm"
     HEARTBEAT_TICK = "heartbeat_tick"
+    HALT = "halt"
+    RESUME = "resume"
 
 
 class Notification(BaseModel):

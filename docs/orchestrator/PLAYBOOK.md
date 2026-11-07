@@ -117,8 +117,11 @@ Directives to a worker:
 
 - `db.notify(sid, "directive", text, task_id=..., question_id=...)`
   writes the outbox row; the daemon relays it. Notification kinds:
-  `task_dispatch`, `question_answer`, `directive`, `disarm`,
-  `heartbeat_tick` (contract `NotificationKind`).
+  `task_dispatch`, `question_answer`, `directive`, `notice`,
+  `halt`, `resume`, `disarm`, `heartbeat_tick` (contract
+  `NotificationKind`). For the fleet stop use `bridge halt` /
+  `bridge resume`, not a free-text directive - they set the durable
+  flag and the semantic kind together.
 
 Audit log (`audit_events`, append-only):
 
@@ -297,8 +300,14 @@ working fix: input stays free and deliveries drain on the next turn.
   `question_answer`, `directive` (an instruction - obey it), `notice`
   (an informational report - read and incorporate; worker status and
   task reports ride `bridge notice`, not `bridge directive`),
-  `heartbeat_tick` (liveness poke, no work), `disarm` (stop
-  re-arming/draining, resume unmanaged operation).
+  `heartbeat_tick` (liveness poke, no work), `halt` (fleet stop:
+  finish the current atomic action only, save state, claim no new
+  tasks - `bridge claim` refuses while halted - and end the turn;
+  parked until `resume`), `resume` (halt lifted - normal duty),
+  `disarm` (stop re-arming/draining, resume unmanaged operation).
+- Priority: `halt` and `disarm` deliveries apply first when a batch
+  contains them, regardless of file order - they bound the whole
+  turn. Everything else processes in numeric id order.
 - Deliveries are idempotent by notification id - skip ids already
   handled.
 - After processing, advance your restart watermark:
