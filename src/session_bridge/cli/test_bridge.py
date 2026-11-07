@@ -2399,3 +2399,78 @@ def test_item180_gwt6_skip_cases(env, monkeypatch, capsys):
     finally:
         con.close()
     assert n["c"] == 1  # only the single successful halt
+
+
+def test_item180_gwt9_dispatch_skips_halted(env, monkeypatch, capsys):
+    """[ITEM-180.GWT-9] review fix (critical): a halted session's queued
+    task is NOT staged dispatch_decided - staging it would burn a
+    lease attempt per redispatch until MAX_ATTEMPTS failed it
+    terminally; the task persists queued until resume."""
+    _managed(env)
+    _stub_wake(env, monkeypatch)
+    tid = _task(env)
+    _run(["halt", SID, "--json"], capsys)
+
+    assert not db.dispatch_managed(tid, "bridge-pump", path=env.db)
+    assert db.get_task(tid, path=env.db)["status"] == TaskStatus.QUEUED.value
+
+    _run(["resume", SID, "--json"], capsys)
+    assert db.dispatch_managed(tid, "bridge-pump", path=env.db)
+
+
+def test_item180_gwt10_stop_daemon_relays_halt_files(env, monkeypatch, capsys):
+    """[ITEM-180.GWT-10] review fix: --stop-daemon must not strand the
+    HALT outbox rows - after the SIGTERM a synchronous relay pass
+    materializes them as mailbox files."""
+    _managed(env)
+    _stub_wake(env, monkeypatch)
+    monkeypatch.setattr(bridge, "_sigterm_daemon", lambda sdir: "stopped")
+
+    rc, out = _run(["halt", "--all", "--stop-daemon", "--json"], capsys)
+    assert rc == ExitCode.OK
+    assert out["data"]["relayed"] is True
+    nid = out["data"]["sessions"][0]["notification_id"]
+    assert (env.qdir / SID / f"msg_{nid}.txt").exists()
+    # the relayed row is marked - no double-delivery on daemon start
+    assert (
+        _one(env.db, "SELECT relayed_at FROM notifications WHERE id=?", (nid,))["relayed_at"]
+        is not None
+    )
+
+
+def test_item180_gwt11_target_fault_isolation(env, monkeypatch, capsys):
+    """[ITEM-180.GWT-11] review fix: one failing broadcast member
+    reports status=error per row and does not abort the rest of the
+    fleet."""
+    _managed(env)
+    _managed(env, sid="s2")
+    _stub_wake(env, monkeypatch)
+    calls = []
+    orig = db.set_session_halted
+
+    def _flaky(sid, halted, *, path=None):
+        if sid == "s2":
+            raise RuntimeError("db gone")
+        calls.append(sid)
+        return orig(sid, halted, path=path)
+
+    monkeypatch.setattr(db, "set_session_halted", _flaky)
+    rc, out = _run(["halt", "--all", "--json"], capsys)
+    assert rc == ExitCode.OK
+    rows = {r["session_id"]: r for r in out["data"]["sessions"]}
+    assert rows[SID]["status"] == "halted"
+    assert rows["s2"]["status"] == "error"
+    assert "db gone" in rows["s2"]["reason"]
+
+
+def test_item180_gwt12_disarm_drops_halt_flag(env, monkeypatch, capsys):
+    """[ITEM-180.GWT-12] review fix: disarm clears halted_at - leaving
+    managed mode drops the managed-only halt flag, so a stray flag
+    cannot refuse claims after a re-arm."""
+    _managed(env)
+    _stub_wake(env, monkeypatch)
+    _run(["halt", SID, "--json"], capsys)
+    assert _sess(env, SID)["halted_at"] is not None
+
+    _run(["disarm", SID, "--json"], capsys)
+    assert _sess(env, SID)["halted_at"] is None

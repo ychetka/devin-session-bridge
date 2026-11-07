@@ -1757,6 +1757,10 @@ def _cmd_disarm(args) -> int:
         )
     for sid in sids:
         db.set_session_mode(sid, SessionMode.UNMANAGED, path=args.db)
+        # leaving managed mode drops the managed-only halt flag too -
+        # a disarmed session no longer owes drain duty, and a stray
+        # halted_at would still refuse its claims after a re-arm
+        db.set_session_halted(sid, False, path=args.db)
         db.notify(sid, NotificationKind.DISARM, _DISARM_BODY, path=args.db)
     resp = JsonResponse(
         session=None if args.all else args.session_id,
@@ -1847,21 +1851,27 @@ def _halt_apply(args, sid: str, halt: bool) -> dict:
         row["status"] = "skipped"
         row["reason"] = "not halted"
         return row
-    db.set_session_halted(sid, halt, path=args.db)
-    kind = NotificationKind.HALT if halt else NotificationKind.RESUME
-    body = _HALT_BODY if halt else _RESUME_BODY
-    if args.reason:
-        body += f" ({args.reason})"
-    row["notification_id"] = db.notify(sid, kind, body, path=args.db)
+    # per-target fault isolation (PR #79 review): a failure on one
+    # broadcast member must not abort the rest of the fleet
     try:
-        row["wake"] = wake_session(sid, _session_cwd(sid, args))
-    except WakeError as e:
-        row["wake"] = f"failed:{e.reason}"
-    row["mailbox_files"] = _mailbox_file_count(args, sid)
-    task = db.get_live_task(sid, path=args.db)
-    row["live_task"] = task["id"] if task is not None else None
-    row["halted"] = halt
-    row["status"] = "halted" if halt else "resumed"
+        db.set_session_halted(sid, halt, path=args.db)
+        kind = NotificationKind.HALT if halt else NotificationKind.RESUME
+        body = _HALT_BODY if halt else _RESUME_BODY
+        if args.reason:
+            body += f" ({args.reason})"
+        row["notification_id"] = db.notify(sid, kind, body, path=args.db)
+        try:
+            row["wake"] = wake_session(sid, _session_cwd(sid, args))
+        except WakeError as e:
+            row["wake"] = f"failed:{e.reason}"
+        row["mailbox_files"] = _mailbox_file_count(args, sid)
+        task = db.get_live_task(sid, path=args.db)
+        row["live_task"] = task["id"] if task is not None else None
+        row["halted"] = halt
+        row["status"] = "halted" if halt else "resumed"
+    except Exception as e:
+        row["status"] = "error"
+        row["reason"] = f"{type(e).__name__}: {e}"
     return row
 
 
@@ -1881,8 +1891,17 @@ def _cmd_halt(args) -> int:
     data: dict = {"sessions": rows}
     daemon_state = None
     if getattr(args, "stop_daemon", False):
-        daemon_state = _sigterm_daemon(_state_dir(args))
+        sdir = _state_dir(args)
+        daemon_state = _sigterm_daemon(sdir)
         data["daemon"] = daemon_state
+        if daemon_state in ("stopped", "not_running"):
+            # review fix (PR #79): a SIGTERM right after the outbox
+            # write would kill the relay before the HALT rows ever
+            # materialize as mailbox files - the woken sessions would
+            # drain nothing and skip the save-state step. Relay them
+            # synchronously now that the lock is free.
+            daemon._relay_pass(args.db, _queue_dir(args), sdir)
+            data["relayed"] = True
     resp = JsonResponse(status="ok", data=data)
     lines = [
         f"halt {r['session_id']}: {r['status']}"
@@ -3017,6 +3036,7 @@ def _sigterm_daemon(sdir) -> str:
 
 def _daemon_stop(args) -> int:
     sdir = _state_dir(args)
+    pid = daemon.daemon_pid(sdir)
     result = _sigterm_daemon(sdir)
     if result == "not_running":
         resp = JsonResponse(status="not_running", data={"state_dir": sdir})
@@ -3028,8 +3048,8 @@ def _daemon_stop(args) -> int:
         )
         return _emit(args, resp, ExitCode.INTERNAL, "error: daemon running but pid unreadable")
     if result == "stopped":
-        resp = JsonResponse(status="stopped", data={"state_dir": sdir})
-        return _emit(args, resp, ExitCode.OK, "daemon stopped")
+        resp = JsonResponse(status="stopped", data={"pid": pid, "state_dir": sdir})
+        return _emit(args, resp, ExitCode.OK, f"daemon stopped (pid {pid})")
     if result.startswith("sigterm_failed:"):
         resp = JsonResponse(status="running", error=f"SIGTERM failed: {result[15:]}")
         return _emit(args, resp, ExitCode.INTERNAL, f"error: SIGTERM failed: {result[15:]}")

@@ -465,6 +465,11 @@ def dispatch_managed(task_id: int, owner: str, *, path=None) -> bool:
     but the worker never claims, ``recover_stale`` folds the task back
     to ``queued`` and the next pass re-dispatches. ``transport`` stays
     NULL - managed delivery is the mailbox, not a transport enum.
+
+    Halted sessions are skipped (task #180 review): staging a task a
+    halted session cannot claim would burn a lease attempt per
+    redispatch until MAX_ATTEMPTS fails it terminally - the HALT
+    contract is that queued tasks persist until ``bridge resume``.
     """
     ts = _now()
 
@@ -476,7 +481,9 @@ def dispatch_managed(task_id: int, owner: str, *, path=None) -> bool:
                 " lease_expires_at=?, lease_renewed_at=?, updated_at=?"
                 " WHERE id=? AND status=? AND COALESCE("
                 "  (SELECT queue_paused FROM sessions"
-                "   WHERE session_id=tasks.session_id), 0) = 0",
+                "   WHERE session_id=tasks.session_id), 0) = 0"
+                " AND (SELECT halted_at FROM sessions"
+                "  WHERE session_id=tasks.session_id) IS NULL",
                 (
                     TaskStatus.DISPATCH_DECIDED.value,
                     owner,
