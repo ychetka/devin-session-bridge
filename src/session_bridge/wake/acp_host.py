@@ -18,8 +18,11 @@ Wire protocol (verified against the production host):
    process;
 3. ACP: ``initialize`` -> ``session/list`` (busy check via
    ``cognition.ai/statusEnum``) -> ``session/load`` (replayed
-   ``session/update`` notifications are drained and discarded) ->
-   ``session/prompt`` with the nudge -> detach.
+   ``session/update`` notifications are drained and discarded;
+   a host advertising ``protocolVersion`` >= 2 gets
+   ``session/resume`` instead - same params, no replay drain,
+   rpc_error falls back to load) -> ``session/prompt`` with the
+   nudge -> detach.
 
 Every step is bounded - a wake attempt has an overall deadline and
 can never stall the daemon loop. ``ATTACH_LOCK`` serializes attaches
@@ -407,7 +410,7 @@ def wake_session(
                 return _await_response(chan, req, timeout, cap)
 
             try:
-                call("initialize", _initialize_params())
+                init_resp = call("initialize", _initialize_params())
                 chan.send({"jsonrpc": "2.0", "method": "initialized", "params": {}})
 
                 listing = call("session/list", {})
@@ -434,14 +437,24 @@ def wake_session(
                 # dead-streak (item_17 review)
                 raise WakeError("no_cwd", f"no cwd known for {session_id}")
 
-            # load replays stored session/update notifications to this
-            # client - drained with a hard cap; a transcript too big to
-            # finish within the bound still lets the prompt go out
+            # session/load replays stored session/update notifications
+            # to this client - drained with a hard cap; a transcript
+            # too big to finish within the bound still lets the prompt
+            # go out. A host advertising protocolVersion >= 2 gets
+            # session/resume instead (deferred design, OPERATOR.md):
+            # resume attaches without the replay drain, so there is no
+            # transcript flood to bound and resume's own response is
+            # the only wait. A resume rpc_error degrades to load -
+            # the version advert is a hint, not a contract.
+            proto = init_resp.get("protocolVersion")
+            load_method = (
+                "session/resume" if isinstance(proto, int) and proto >= 2 else "session/load"
+            )
             req += 1
             _rpc(
                 chan,
                 req,
-                "session/load",
+                load_method,
                 {"sessionId": session_id, "cwd": wake_cwd, "mcpServers": []},
             )
             load_id = req
@@ -449,15 +462,31 @@ def wake_session(
             try:
                 _await_response(chan, load_id, replay_timeout, replay_cap)
             except WakeError as e:
-                if e.reason != "timeout":
+                if e.reason == "rpc_error" and load_method == "session/resume":
+                    req += 1
+                    _rpc(
+                        chan,
+                        req,
+                        "session/load",
+                        {"sessionId": session_id, "cwd": wake_cwd, "mcpServers": []},
+                    )
+                    load_id = req
+                    try:
+                        _await_response(chan, load_id, replay_timeout, replay_cap)
+                    except WakeError as e2:
+                        if e2.reason != "timeout":
+                            raise
+                        load_done = False
+                elif e.reason != "timeout":
                     raise
-                # replay overflow: the load response is display data,
-                # so a flooded channel is tolerated - press on. But
-                # unread replay still queued on the socket can mention
-                # this session_id, so post-prompt session/update frames
-                # no longer prove a live turn - only a matching prompt
-                # response does.
-                load_done = False
+                else:
+                    # replay overflow: the load response is display
+                    # data, so a flooded channel is tolerated - press
+                    # on. But unread replay still queued on the socket
+                    # can mention this session_id, so post-prompt
+                    # session/update frames no longer prove a live
+                    # turn - only a matching prompt response does.
+                    load_done = False
 
             nudge = nudge or nudge_text(session_id)
             req += 1

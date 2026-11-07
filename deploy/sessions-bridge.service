@@ -1,0 +1,24 @@
+# sessions-bridge daemon - systemd --user unit (template).
+# install_daemon_unit.sh renders the placeholders below with the
+# resolved bridge path and daemon flags, and installs this file to
+# ~/.config/systemd/user/sessions-bridge.service.
+[Unit]
+Description=sessions-bridge relay/wake daemon
+# user managers order against default.target; the daemon needs no
+# earlier units - it only touches the local fs and the acp-host.
+After=default.target
+
+[Service]
+Type=simple
+# `daemon run` is the foreground supervisor loop; daemon.lock inside
+# the state dir keeps double starts impossible even if something
+# races this unit.
+ExecStart=@BRIDGE_BIN@ daemon run@DAEMON_ARGS@
+Restart=on-failure
+RestartSec=5s
+# state (db, mailboxes, daemon.log) already lives under the state
+# dir; nothing else needs a private sandbox - keep the unit boring.
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target
