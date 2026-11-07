@@ -520,13 +520,18 @@ class NotificationKind(str, Enum):
     Consumers route mailbox deliveries by kind plus the correlation
     refs ``task_id``/``question_id``: TASK_DISPATCH hands the worker a
     task, QUESTION_ANSWER carries the orchestrator's answer to a
-    pending question, DIRECTIVE is a steering instruction, DISARM
-    orders a watcher/turn teardown, HEARTBEAT_TICK is a liveness poke.
+    pending question, DIRECTIVE is a steering instruction (obey it),
+    NOTICE is an informational report (read and incorporate - reports
+    and status notes are not orders; the worker-to-orchestrator
+    report flow rides NOTICE so "obey" and "read" stay distinct),
+    DISARM orders a watcher/turn teardown, HEARTBEAT_TICK
+    is a liveness poke.
     """
 
     TASK_DISPATCH = "task_dispatch"
     QUESTION_ANSWER = "question_answer"
     DIRECTIVE = "directive"
+    NOTICE = "notice"
     DISARM = "disarm"
     HEARTBEAT_TICK = "heartbeat_tick"
 

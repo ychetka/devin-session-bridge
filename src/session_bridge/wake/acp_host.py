@@ -335,10 +335,32 @@ def _attach(lock_data: dict, agent_id: str):
         raise
     if not hello.get("ok"):
         err = hello.get("error") or "attach refused"
-        reason = "unauthorized" if "unauthorized" in str(err) else "attach_failed"
         sock.close()
-        raise WakeError(reason, str(err))
+        raise WakeError(_hello_error_reason(err), _hello_error_message(err))
     return chan
+
+
+def _hello_error_reason(err) -> str:
+    """Classify a refused hello into a WakeError reason.
+
+    The host error payload is an external, uncontrolled contract: a
+    string today, but a structured ``{"code", "message"}`` object is
+    the stable form if the host ever exposes one - read ``code``
+    verbatim when present (the unauthorized-error-code backlog item),
+    and fall back to the historical substring match otherwise. Only
+    known reason values pass through; anything else maps to the
+    generic attach failure so a novel host code cannot smuggle an
+    unrecognized reason into the daemon's switch arms.
+    """
+    if isinstance(err, dict):
+        return "unauthorized" if err.get("code") == "unauthorized" else "attach_failed"
+    return "unauthorized" if "unauthorized" in str(err) else "attach_failed"
+
+
+def _hello_error_message(err) -> str:
+    if isinstance(err, dict):
+        return str(err.get("message") or err.get("code") or err)
+    return str(err)
 
 
 def wake_session(

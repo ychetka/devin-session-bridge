@@ -663,7 +663,7 @@ def _our_hooks(data, event):
     return [
         h
         for e in data.get(event, [])
-        for h in e.get("hooks", [])
+        for h in (e.get("hooks") if isinstance(e.get("hooks"), list) else [])
         if isinstance(h.get("command"), str) and "session_bridge/hooks/worker.py" in h["command"]
     ]
 
@@ -820,6 +820,51 @@ def test_item11_mixed_legacy_and_top_level_dedupes_our_hook(tmp_path):
     assert all(e.get("hooks") for e in data["Stop"])
     foreign = [h for e in data["Stop"] for h in e["hooks"] if h.get("command") == "other-tool stop"]
     assert len(foreign) == 1
+
+
+def test_item172_gwt4_foreign_null_hooks_entry_no_crash(tmp_path):
+    """[ITEM-172.GWT-4] a foreign hook entry whose "hooks" value is
+    null (or any non-list shape) is not ours and must not crash the
+    post-install validation - the install succeeds with the foreign
+    entry preserved verbatim (issue #11 review nit)."""
+    repo = tmp_path / "target"
+    (repo / ".devin").mkdir(parents=True)
+    foreign = {
+        "Stop": [
+            {"matcher": "", "hooks": None},
+            {"matcher": "", "hooks": 42},
+        ]
+    }
+    (repo / ".devin" / "hooks.v1.json").write_text(json.dumps(foreign))
+    res = _install(repo)
+    assert res.returncode == 0, res.stderr
+    assert "Traceback" not in res.stderr
+    data = _hooks(repo)
+    # foreign malformed entries survive next to our fresh hook entry
+    assert {"matcher": "", "hooks": None} in data["Stop"]
+    assert {"matcher": "", "hooks": 42} in data["Stop"]
+    assert len(_our_hooks(data, "Stop")) == 1
+
+
+def test_item172_gwt5_fresh_install_validation_failure_removes_file(tmp_path):
+    """[ITEM-172.GWT-5] a fresh install whose post-merge validation
+    fails leaves no self-declared-invalid hooks.v1.json behind -
+    without a .bak the file is removed, mirroring the rollback path
+    (issue #11 review nit)."""
+    repo = tmp_path / "target"
+    repo.mkdir()
+    res = subprocess.run(
+        ["bash", str(INSTALL_SH), str(repo)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        # cycle longer than the forced 600s Stop timeout -> the
+        # post-merge timeout check fails on a fresh install
+        env={**os.environ, "SESSIONS_BRIDGE_CYCLE_SECONDS": "700"},
+    )
+    assert res.returncode != 0
+    assert "timeout" in res.stderr
+    assert not (repo / ".devin" / "hooks.v1.json").exists()
 
 
 def test_item11_foreign_hook_with_non_string_command_ignored(tmp_path):

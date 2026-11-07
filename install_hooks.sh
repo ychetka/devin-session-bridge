@@ -209,14 +209,22 @@ MARKER = "session_bridge/hooks/worker.py"
 # - a surviving "hooks" wrapper key or a missing/broken event means the
 # merge produced a file Devin will silently ignore.
 EVENTS = ("SessionStart", "SessionEnd", "UserPromptSubmit", "Stop")
+def inner_hooks(entry):
+    # a foreign entry's "hooks" may be null or any non-list shape -
+    # only a real list can carry hook dicts (issue #11)
+    if not isinstance(entry, dict):
+        return []
+    inner = entry.get("hooks")
+    return inner if isinstance(inner, list) else []
+
+
 broken = [
     event for event in EVENTS
     if not isinstance(data.get(event), list)
     or not any(
         MARKER in h["command"]
         for entry in data[event]
-        if isinstance(entry, dict)
-        for h in entry.get("hooks", [])
+        for h in inner_hooks(entry)
         if isinstance(h, dict) and isinstance(h.get("command"), str)
     )
 ]
@@ -231,8 +239,7 @@ if "hooks" in data or broken:
 ours = [
     h.get("timeout", 60)
     for entry in data.get("Stop", [])
-    if isinstance(entry, dict)
-    for h in entry.get("hooks", [])
+    for h in inner_hooks(entry)
     if isinstance(h, dict)
     and isinstance(h.get("command"), str)
     and MARKER in h["command"]
@@ -251,6 +258,11 @@ then
         mv "$HOOKS_FILE.bak" "$HOOKS_FILE"
         echo "install_hooks: restored pre-install $HOOKS_FILE" \
             "from backup" >&2
+    else
+        # fresh install: no backup to restore - remove the
+        # self-declared-invalid file instead of leaving it behind
+        # (issue #11)
+        rm -f "$HOOKS_FILE"
     fi
     exit 1
 fi

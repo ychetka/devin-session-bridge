@@ -389,6 +389,7 @@ def test_item13a_gwt3_notification_outbox_semantics() -> None:
         "task_dispatch",
         "question_answer",
         "directive",
+        "notice",
         "disarm",
         "heartbeat_tick",
     }

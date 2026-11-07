@@ -1348,6 +1348,50 @@ def test_item139_gwt11_bridge_directive_relays_and_wakes(env, monkeypatch, capsy
     )  # only the earlier successful directive
 
 
+def test_item172_gwt1_bridge_notice_relays_and_wakes(env, monkeypatch):
+    """[ITEM-172.GWT-1] `bridge notice` writes a registered NOTICE
+    notification: the next daemon pass relays it into the fs mailbox
+    and the actionable-mail leg wakes the recipient - same delivery
+    machinery as directive, distinct kind."""
+    _managed_fresh(env)
+    calls = _wake_calls(env, monkeypatch)
+
+    assert bridge.main(["--db", env.db, "notice", SID, "report ready"]) == 0
+    nid = _one(
+        env.db,
+        "SELECT id FROM notifications WHERE session_id=? AND kind='notice'",
+        (SID,),
+    )
+    assert nid is not None
+    # no directive row is created by the notice path
+    assert (
+        _one(
+            env.db,
+            "SELECT COUNT(*) c FROM notifications WHERE session_id=? AND kind='directive'",
+            (SID,),
+        )["c"]
+        == 0
+    )
+
+    assert daemon.run(env.db, env.qdir, once=True, notify_send=env.notifier) == daemon.RUN_OK
+    assert calls == [SID]
+    assert os.path.exists(os.path.join(env.qdir, SID, f"msg_{nid['id']}.txt"))
+
+    # empty text and non-active targets are refused like directive
+    assert bridge.main(["--db", env.db, "notice", SID, "   "]) != 0
+    assert bridge.main(["--db", env.db, "notice", "ghost-sid", "hi"]) != 0
+    db.set_session_status(SID, "dead", path=env.db)
+    assert bridge.main(["--db", env.db, "notice", SID, "hi"]) != 0
+    assert (
+        _one(
+            env.db,
+            "SELECT COUNT(*) c FROM notifications WHERE session_id=? AND kind='notice'",
+            (SID,),
+        )["c"]
+        == 1
+    )
+
+
 def test_item139_gwt12_fs_only_pending_escalates_stall(env, monkeypatch):
     """[ITEM-139.GWT-12] a mailbox file from a foreign writer older
     than the stall threshold escalates by its mtime even though the

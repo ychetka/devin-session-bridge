@@ -386,29 +386,35 @@ Each pass (~5s, with up to ~1s startup jitter):
 2. Wake: managed+armed sessions get a nudge prompt through the
    acp-host wake transport (see below) when either (a) their
    heartbeat is stale (or absent) and they carry unacked relayed
-   mail or a live task - this closes the delivery loop for idle
-   sessions, and the live-task leg keeps the liveness probe running
-   so a managed session's death is still detected when its outbox is
-   empty - or (b) any unacked actionable mail
+   mail - this closes the delivery loop for idle sessions - or
+   (b) any unacked actionable mail
    (kind != `heartbeat_tick`) waits, whatever the heartbeat age
    (item_102c): a DRAIN session idle at the prompt never opens a turn
    on its own, so directives and answers would otherwise sit until a
    human typed. A `heartbeat_tick` alone never wakes a
    fresh-heartbeat session. A session mid-turn is never prompted.
    Dead sessions are not candidates. Two task states are excluded
-   from the stale-heartbeat leg (v0.3.3): an `awaiting_user` task is
+   from the live-task probe (v0.3.3): an `awaiting_user` task is
    parked on an out-of-band answer that itself arrives as actionable
    mail, and a `running` task whose `wait_until` stamp is still fresh
-   declared an external wait via `bridge wait` - waking a session
+   declared an external wait via `bridge wait` - probing a session
    that cannot act yet is noise; the stamp decays with the lease it
-   mirrors, so an abandoned wait becomes wake-worthy on its own.
+   mirrors, so an abandoned wait becomes probe-worthy on its own.
+   A stale-heartbeat session whose ONLY qualification is a live task
+   is never prompted (v0.3.7): it gets a batched `session/list`
+   presence probe instead, so no_session dead-marking still runs on
+   an empty outbox while an empty mailbox can never wake - the
+   buttered-tilapia drain-prompt loop incident.
    The third leg is file-level (v0.3.4): any unconsumed `msg_*.txt`
    in the session's mailbox dir qualifies whatever rows or heartbeats
    say - the fs mailbox is the authoritative channel, and foreign
    writers (hand-written directives) bypass the notifications table
    entirely. Use `bridge directive <sid> "<text>"` instead of writing
    files by hand: it creates the notification row so relay, wake and
-   stall-escalation all see the mail.
+   stall-escalation all see the mail. `bridge notice <sid> "<text>"`
+   is the same registered path for informational reports (worker
+   status/task reports) - kind `notice` means "read and
+   incorporate", while `directive` means "obey".
 3. Sweep: **unmanaged** sessions whose `worker_heartbeats.last_seen_at`
    is older than `HEARTBEAT_STALE_SECONDS` (120s) flip to
    `status='dead'`. Managed sessions are excluded: between turns a
@@ -742,11 +748,12 @@ Global flags: `--db PATH` (`SESSIONS_BRIDGE_DB`), `--queue-dir DIR`
 | `bridge unpark <sid>` | resume a paused/awaiting session (requeues paused tasks, clears the queue pause). |
 | `bridge retry <sid\|task_id>` | requeue a failed task; attempt resets. |
 | `bridge arm <sid>` | enroll the session into managed mode; also clears a leftover `queue_paused` flag so tasks stay claimable. |
-| `bridge disarm <sid>` / `bridge disarm --all` | leave managed mode + send a `disarm` mailbox notice. |
+| `bridge disarm <sid>` / `bridge disarm --all` | leave managed mode + send a `disarm` mailbox message. |
 | `bridge register <sid> [--role worker\|orchestrator] [--workspace DIR] [--force]` | join the bus and stamp the heartbeat; orchestrator is a CAS singleton. |
 | `bridge ask --session SID --task ID "text"` | post a worker question; refused when another question is pending (`pending_exists`), the task hit the 3-question budget (`question_limit`), or no active orchestrator exists (`no_orchestrator`). |
 | `bridge ack --session SID [--up-to N]` | advance the session's mailbox ack watermark. |
 | `bridge directive <sid> "<text>"` | send a registered directive notification: the daemon relays it into the fs mailbox and the wake legs see it. Prefer this over hand-writing `msg_*.txt` files - foreign files get wakes via the file-pending leg but carry no registry evidence (v0.3.4). |
+| `bridge notice <sid> "<text>"` | send a registered informational notice - same delivery machinery as directive, but kind `notice` means "read and incorporate" rather than "obey": the path for worker status and task reports (v0.3.9). |
 | `bridge heartbeat <sid>` | refresh the session's liveness record (bumps the heartbeat generation; no takeover semantics). |
 | `bridge questions list [--session SID] [--task ID]` | list pending worker questions. |
 | `bridge questions claim <qid> --claimant SID` | atomically claim a question for answering. |
