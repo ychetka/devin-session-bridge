@@ -1730,11 +1730,15 @@ def _install_unit(tmp_path, *args):
     systemctl = bin_dir / "systemctl"
     systemctl.write_text(f'#!/bin/sh\necho "$@" >> "{log}"\n')
     systemctl.chmod(0o755)
+    loginctl = bin_dir / "loginctl"
+    loginctl.write_text("#!/bin/sh\nexit 0\n")
+    loginctl.chmod(0o755)
     env = dict(
         os.environ,
         SESSIONS_BRIDGE_BIN=str(bridge_bin),
         SESSIONS_BRIDGE_UNIT_DIR=str(tmp_path / "units"),
         SESSIONS_BRIDGE_SYSTEMCTL=str(systemctl),
+        SESSIONS_BRIDGE_LOGINCTL=str(loginctl),
     )
     res = subprocess.run(
         ["bash", str(INSTALL_UNIT_SH), *args],
@@ -1754,7 +1758,7 @@ def test_item184_gwt6_unit_print_renders_paths(tmp_path):
     assert res.returncode == 0, res.stderr
     bridge_bin = str(tmp_path / "bin" / "bridge")
     # --db is a TOP-LEVEL flag: it precedes the daemon subcommand
-    assert f"ExecStart={bridge_bin} --db '/data/state.db' daemon run" in res.stdout
+    assert f'ExecStart={bridge_bin} --db "/data/state.db" daemon run' in res.stdout
     assert "Restart=on-failure" in res.stdout
     assert "WantedBy=default.target" in res.stdout
     assert not unit_file.exists()  # print writes nothing

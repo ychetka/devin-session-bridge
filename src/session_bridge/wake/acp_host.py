@@ -599,7 +599,12 @@ def verify_sessions(
                 return _await_response(chan, req, timeout, cap)
 
             try:
-                call("initialize", _initialize_params())
+                # probes never drive session/resume, so they keep the
+                # proven v1 handshake (PR #81 review: inheriting the
+                # v2 offer without the re-attach fallback would let a
+                # non-compliant host silently disable presence probes
+                # and no_session dead-marking)
+                call("initialize", _initialize_params(1))
                 chan.send({"jsonrpc": "2.0", "method": "initialized", "params": {}})
                 listing = call("session/list", {})
             except WakeError as e:

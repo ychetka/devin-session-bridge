@@ -49,7 +49,7 @@ while [ $# -gt 0 ]; do
         --no-enable) DO_ENABLE=0; shift ;;
         --print) PRINT_ONLY=1; shift ;;
         -h|--help)
-            sed -n '2,30p' "$0"
+            sed -n '2,26p' "$0"
             exit 0
             ;;
         *) die "unknown flag: $1 (try --help)" ;;
@@ -57,9 +57,10 @@ while [ $# -gt 0 ]; do
 done
 
 # argparse would crash-loop the unit on a non-numeric interval - the
-# mistake is cheaper here than under Restart=on-failure
-[ -z "$INTERVAL" ] || [[ "$INTERVAL" =~ ^[0-9]+$ ]] \
-    || die "--interval must be a non-negative integer, got: $INTERVAL"
+# mistake is cheaper here than under Restart=on-failure (--interval
+# is type=float in the CLI)
+[ -z "$INTERVAL" ] || [[ "$INTERVAL" =~ ^[0-9]+([.][0-9]+)?$ ]] \
+    || die "--interval must be a non-negative number, got: $INTERVAL"
 
 BRIDGE="${SESSIONS_BRIDGE_BIN:-}"
 if [ -z "$BRIDGE" ]; then
@@ -69,10 +70,17 @@ fi
 [ -x "$BRIDGE" ] || die "bridge binary not executable: $BRIDGE"
 
 # --db/--queue-dir are TOP-LEVEL bridge flags and must precede the
-# daemon subcommand; only --interval belongs after `run`
+# daemon subcommand; only --interval belongs after `run`. Values are
+# double-quoted with \ and " escaped - a single-quoted systemd arg
+# has no way to embed a literal single quote.
+_dq() {
+    local s=${1//\\/\\\\}
+    s=${s//\"/\\\"}
+    printf '"%s"' "$s"
+}
 GLOBAL_ARGS=""
-[ -n "$DB_PATH" ] && GLOBAL_ARGS+=" --db '$DB_PATH'"
-[ -n "$QUEUE_DIR" ] && GLOBAL_ARGS+=" --queue-dir '$QUEUE_DIR'"
+[ -n "$DB_PATH" ] && GLOBAL_ARGS+=" --db $(_dq "$DB_PATH")"
+[ -n "$QUEUE_DIR" ] && GLOBAL_ARGS+=" --queue-dir $(_dq "$QUEUE_DIR")"
 RUN_ARGS=""
 [ -n "$INTERVAL" ] && RUN_ARGS+=" --interval '$INTERVAL'"
 
@@ -124,10 +132,11 @@ fi
 # the user manager (and this unit) stops at logout. Only relevant
 # when the unit is meant to persist - a --no-enable staging install
 # skips the attempt.
+LOGINCTL="${SESSIONS_BRIDGE_LOGINCTL:-loginctl}"
 if [ "$DO_ENABLE" -eq 0 ]; then
     :
-elif command -v loginctl >/dev/null 2>&1; then
-    if loginctl enable-linger "$USER" 2>/dev/null; then
+elif command -v "$LOGINCTL" >/dev/null 2>&1; then
+    if "$LOGINCTL" enable-linger "$USER" 2>/dev/null; then
         echo "linger enabled for $USER - the daemon survives reboots and logout"
     else
         echo "warning: loginctl enable-linger failed - run it as root or via" >&2

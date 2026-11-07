@@ -425,6 +425,18 @@ def test_item184_gwt11_v1_host_negotiates_down_no_reattach():
     assert host.methods() == ["initialize", "session/list", "session/load", "session/prompt"]
 
 
+def test_item184_gwt12_verify_sessions_keeps_v1_offer():
+    """[ITEM-184.GWT-12] verify_sessions never drives session/resume,
+    so it keeps the proven v1 handshake: a host refusing the >=2
+    offer outright must NOT break presence probes or no_session
+    dead-marking (PR #81 review)."""
+    host = FakeAcpHost(sessions=[IDLE_SESSION], protocol_version=1, reject_above=1)
+    out = verify_sessions([SID, "s9"], lock_data=host.lock_data())
+    assert len(host.hellos) == 1
+    assert host.calls[0][1]["protocolVersion"] == 1
+    assert out["s9"] == SESSION_ABSENT  # absent from the list entirely
+
+
 def test_wake_busy_session_not_prompted():
     host = FakeAcpHost(sessions=[BUSY_SESSION])
     outcome = wake_session(SID, "/tmp/ws", lock_data=host.lock_data())
