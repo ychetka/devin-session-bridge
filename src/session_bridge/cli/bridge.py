@@ -1797,6 +1797,57 @@ _HALT_BODY = (
 _RESUME_BODY = "RESUME: the halt is lifted - normal mailbox duty resumes"
 
 
+def _tombstone_path(sid: str, mdir: str) -> str:
+    """Park name for a mailbox being unregistered - unique per caller."""
+    return os.path.join(
+        os.path.dirname(mdir), f".unregistered-{sid}-{int(time.time())}-{os.getpid()}"
+    )
+
+
+def _merge_dir_no_clobber(src: str, dst: str) -> None:
+    """Move src's files into dst; a live same-name file always wins.
+
+    Mailbox names are msg_<notification_id>.txt, so a same-name file
+    in a recreated dir is almost always the same notification (the
+    consumer dedups by id anyway) - the post-delete write owns the
+    slot and the parked duplicate is dropped with the park.
+    """
+    for name in os.listdir(src):
+        if os.path.exists(os.path.join(dst, name)):
+            continue
+        os.replace(os.path.join(src, name), os.path.join(dst, name))
+
+
+def _reap_unregister_tombstones(sid: str, mdir: str) -> None:
+    """Merge leftover ``.unregistered-<sid>-*`` parks back into ``<sid>``.
+
+    A crash between the tombstone rename and the db commit (or a
+    failed restore) strands the mailbox under a name no writer
+    targets - the registration lives but its mail is parked forever.
+    The reaper runs where a live registration meets its mailbox
+    again: top of ``bridge unregister`` and after a successful
+    ``bridge register``. Best-effort: a sick fs must not block the
+    command itself.
+    """
+    root = os.path.dirname(mdir)
+    try:
+        parked = [
+            name
+            for name in os.listdir(root)
+            if name.startswith(f".unregistered-{sid}-") and os.path.isdir(os.path.join(root, name))
+        ]
+    except OSError:
+        return
+    for name in parked:
+        park = os.path.join(root, name)
+        try:
+            os.makedirs(mdir, exist_ok=True)
+            _merge_dir_no_clobber(park, mdir)
+            shutil.rmtree(park, ignore_errors=True)
+        except OSError:
+            continue
+
+
 def _cmd_unregister(args) -> int:
     """``bridge unregister <sid> [--force]``: remove a dead registration (task #198).
 
@@ -1872,42 +1923,70 @@ def _cmd_unregister(args) -> int:
     # <sid> dir during the delete belongs to the post-delete world
     # and is left alone.
     mdir = mailbox_dir(sid, db_path=args.db, queue_dir=args.queue_dir)
+    _reap_unregister_tombstones(sid, mdir)
     tombstone = None
+    rename_failed = False
     if os.path.isdir(mdir):
-        tombstone = os.path.join(os.path.dirname(mdir), f".unregistered-{sid}-{int(time.time())}")
+        tombstone = _tombstone_path(sid, mdir)
         try:
             os.rename(mdir, tombstone)
         except OSError:
             tombstone = None
+            rename_failed = True
 
-    verdict = db.unregister_session(sid, force=args.force, path=args.db)
+    def _restore_tombstone() -> str:
+        """Put the parked mailbox back - the registration survived.
 
-    def _restore_tombstone() -> None:
-        """Put the parked mailbox back - the registration survived."""
+        Returns 'restored' | 'merged' | 'none' | 'failed:<err>' so a
+        restore failure lands in the response instead of silently
+        stranding the mail.
+        """
         nonlocal tombstone
         if tombstone is None:
-            return
+            return "none"
         try:
             if not os.path.isdir(mdir):
                 os.rename(tombstone, mdir)
+                result = "restored"
             else:
                 # a writer recreated <sid> in the window: merge the
-                # parked files into the live dir, then drop the park
-                for name in os.listdir(tombstone):
-                    os.replace(os.path.join(tombstone, name), os.path.join(mdir, name))
-                os.rmdir(tombstone)
-        except OSError:
-            pass
+                # parked files into the live dir without clobbering
+                # post-delete writes, then drop the park
+                _merge_dir_no_clobber(tombstone, mdir)
+                shutil.rmtree(tombstone)
+                result = "merged"
+        except OSError as e:
+            result = f"failed:{e}"
         tombstone = None
+        return result
+
+    try:
+        verdict = db.unregister_session(sid, force=args.force, path=args.db)
+    except Exception:
+        # the delete never committed: the registration is intact, so
+        # the parked mailbox must come back before the error surfaces
+        _restore_tombstone()
+        raise
 
     if isinstance(verdict, UnregisterNotFound):
-        _restore_tombstone()
-        # raced with a concurrent unregister/cleanup - the row is
-        # already gone, which is the outcome the caller wanted
+        # raced with a concurrent unregister: the row is already gone,
+        # which is the outcome the caller wanted. The parked mailbox
+        # is restored ONLY when the sid re-registered in the window
+        # (it belongs to the new registration); otherwise it is the
+        # deleted session's last mailbox - remove it rather than
+        # resurrecting an orphan dir nothing drains.
+        if db.get_session(sid, path=args.db) is not None:
+            restored = _restore_tombstone()
+        else:
+            if tombstone is not None:
+                shutil.rmtree(tombstone, ignore_errors=True)
+                tombstone = None
+            restored = "removed"
         resp = JsonResponse(
             session=sid,
             status="not_found",
             error=f"no registration for {sid} (removed concurrently)",
+            data={"mailbox_restored": restored},
         )
         return _emit(
             args,
@@ -1916,22 +1995,23 @@ def _cmd_unregister(args) -> int:
             f"not registered: {sid} (removed concurrently)",
         )
     if isinstance(verdict, UnregisterRefusedLiveTask):
-        _restore_tombstone()
+        restored = _restore_tombstone()
         resp = JsonResponse(
             session=sid,
             status="conflict",
             error=(
                 f"task {verdict.task_id} is {verdict.task_status} - close it before unregistering"
             ),
+            data={"mailbox_restored": restored},
         )
         return _emit(
             args,
             resp,
             ExitCode.CONFLICT,
-            f"conflict: task {verdict.task_id} still {verdict.task_status}",
+            f"conflict: task {verdict.task_id} still {verdict.task_status} (mailbox {restored})",
         )
     if isinstance(verdict, UnregisterRefusedFreshHeartbeat):
-        _restore_tombstone()
+        restored = _restore_tombstone()
         resp = JsonResponse(
             session=sid,
             status="conflict",
@@ -1939,12 +2019,14 @@ def _cmd_unregister(args) -> int:
                 f"fresh heartbeat {verdict.age_seconds}s ago"
                 " - session is alive (--force to override)"
             ),
+            data={"mailbox_restored": restored},
         )
         return _emit(
             args,
             resp,
             ExitCode.CONFLICT,
-            f"conflict: {sid} heartbeat {verdict.age_seconds}s ago (--force to override)",
+            f"conflict: {sid} heartbeat {verdict.age_seconds}s ago (--force to override)"
+            f" (mailbox {restored})",
         )
     counts = verdict.counts
     mail_files = 0
@@ -1982,6 +2064,7 @@ def _cmd_unregister(args) -> int:
             "mailbox_files_removed": mail_files,
             "mailbox_removed": mailbox_removed,
             "mailbox_tombstoned": tombstone is not None,
+            "mailbox_rename_failed": rename_failed,
             "mailbox_dir_recreated": recreated,
             "host_check": host_check,
         },
@@ -2206,6 +2289,13 @@ def _cmd_register(args) -> int:
         )
         human = f"refused: {why}; use --force to take over"
         return _emit(args, resp, ExitCode.CONFLICT, human)
+    # a crash inside a previous unregister can leave the mailbox
+    # parked as .unregistered-<sid>-* - merge it back so the new
+    # registration drains its pre-crash mail (task #203 reaper)
+    _reap_unregister_tombstones(
+        result.session_id,
+        mailbox_dir(result.session_id, db_path=args.db, queue_dir=args.queue_dir),
+    )
     resp = JsonResponse(
         session=result.session_id,
         status="registered",

@@ -86,6 +86,11 @@ def test_gwt4_response_classification_helpers():
     assert protocol.response_result({}) == {}
     assert protocol.response_result({"result": [1]}) == {}
 
+    # a present-but-falsy error member is still an error response -
+    # the transports' old `msg.get("error") is not None` contract
+    assert protocol.error_payload({"id": 1, "error": 0}) == 0
+    assert protocol.error_payload({"id": 1, "error": {}}) == {}
+
 
 def test_gwt5_initialize_params_one_shape_both_consumers():
     """[ITEM-203.GWT-5] the hello payload is built once: the wake

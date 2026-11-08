@@ -104,10 +104,16 @@ def is_server_call(msg: dict) -> bool:
     return "method" in msg
 
 
-def error_payload(msg: dict) -> dict | None:
-    """The ``error`` object of a response message, or None."""
-    err = msg.get("error")
-    return err if err else None
+def error_payload(msg: dict):
+    """The raw ``error`` member of a response message, or None.
+
+    Returns the value unfiltered: a present-but-falsy error (``0``,
+    ``""``, ``{}``) still classifies as an error response - that is
+    the ``msg.get("error") is not None`` contract both transports
+    had before the extraction (review M1: filtering dropped such
+    errors and silently reclassified them as success).
+    """
+    return msg.get("error")
 
 
 def error_detail(err) -> str:

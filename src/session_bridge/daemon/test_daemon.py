@@ -2002,3 +2002,25 @@ def test_item203_gwt3_pass_timing_event_emitted(env):
         "question_janitor",
     ):
         assert f"{name}=" in detail
+
+
+def test_item203_gwt4_pass_timing_survives_pass_failure(env, monkeypatch):
+    """[ITEM-203.GWT-4] a pass that throws mid-iteration still gets a
+    pass_timing event carrying the durations measured before the
+    failure - the journal must not silently skip instrumentation at
+    exactly the moment a stalled pass would hide (review W6)."""
+
+    def boom(*a):
+        raise RuntimeError("sweep exploded")
+
+    monkeypatch.setattr(daemon, "_sweep_pass", boom)
+    with pytest.raises(RuntimeError):
+        daemon.run(env.db, env.qdir, once=True, notify_send=env.notifier)
+    events = [d["event"] for d in _decisions(env)]
+    assert "pass_timing" in events
+    detail = next(d["detail"] for d in _decisions(env) if d["event"] == "pass_timing")
+    # everything up to and including the failing pass is measured;
+    # later passes never ran
+    assert "schedule=" in detail
+    assert "sweep=" in detail
+    assert "question_janitor=" not in detail

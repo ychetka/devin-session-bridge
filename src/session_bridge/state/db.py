@@ -72,6 +72,7 @@ from .verdict import (
     UnregisterNotFound,
     UnregisterRefusedFreshHeartbeat,
     UnregisterRefusedLiveTask,
+    UnregisterVerdict,
 )
 
 
@@ -1565,7 +1566,7 @@ def set_session_halted(session_id: str, halted: bool, *, path=None) -> None:
     _retry(op)
 
 
-def unregister_session(session_id: str, *, force: bool = False, path=None):
+def unregister_session(session_id: str, *, force: bool = False, path=None) -> UnregisterVerdict:
     """Delete a session registration and every session-scoped row.
 
     Task #198: fleet status was haunted by ghost registrations -

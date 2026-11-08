@@ -1498,11 +1498,6 @@ def run(
                     pending,
                 )
                 _timed("question_janitor", _question_janitor_pass, db_path, state_directory)
-                _decision(
-                    state_directory,
-                    "pass_timing",
-                    detail=" ".join(f"{name}={ms}ms" for name, ms in timings.items()),
-                )
                 # metric line: the oldest undrained-mail age rides along
                 # in the heartbeat file (external watchdogs read line 1
                 # only - line 2 is observability, not a contract)
@@ -1517,6 +1512,18 @@ def run(
                     "pass_error",
                     detail=f"{type(e).__name__}: {e}",
                 )
+            finally:
+                # the journal line rides in finally: a pass that throws
+                # mid-iteration is exactly where a stalled pass would
+                # hide - record whatever durations got measured
+                # (review W6: keeping this inside try meant the timing
+                # event silently vanished on every pass failure)
+                if timings:
+                    _decision(
+                        state_directory,
+                        "pass_timing",
+                        detail=" ".join(f"{name}={ms}ms" for name, ms in timings.items()),
+                    )
             if once:
                 break
             stop.wait(interval)

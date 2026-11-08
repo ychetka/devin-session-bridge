@@ -257,7 +257,7 @@ class AcpClient:
                 )
             chunk = os.read(self._fd, _READ_CHUNK)
             if not chunk:
-                lost = len(self._rbuf.take_pending())
+                lost = len(self._rbuf.take_pending().strip())
                 if lost:
                     raise AcpError(
                         f"acp closed stdout mid-message ({lost} buffered bytes lost)",
