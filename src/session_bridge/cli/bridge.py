@@ -82,6 +82,11 @@ from session_bridge.state.contract import (
     Transport,
 )
 from session_bridge.state.verdict import (
+    ReleaseNotFound,
+    ReleaseRefusedOwner,
+    ReleaseRemoved,
+    ReserveConflict,
+    ReserveGranted,
     UnregisterNotFound,
     UnregisterRefusedFreshHeartbeat,
     UnregisterRefusedLiveTask,
@@ -2520,6 +2525,145 @@ def _cmd_events(args) -> int:
     return _emit(args, resp, ExitCode.OK, "\n".join(lines))
 
 
+def _cmd_reserve(args) -> int:
+    """``bridge reserve <type> <id> --project P``: atomic allocation.
+
+    The host-level resource registry (directive 426): a project
+    declares each host resource it needs BEFORE deploying - the
+    PRIMARY KEY on (type, id) is the mutex, so the verdict is
+    atomic: granted (new or same-owner renew) or conflict echoing
+    the incumbent owner. Deploy scripts treat any non-granted exit
+    as a hard fail and escalate to the orchestrator - never retry
+    or force their way past a conflict.
+    """
+    try:
+        verdict = db.reserve(
+            args.resource_type,
+            args.resource_id,
+            args.project,
+            purpose=args.purpose,
+            session_id=args.session,
+            ttl=args.ttl,
+            path=args.db,
+        )
+    except ValueError as e:
+        resp = JsonResponse(status="usage", error=str(e))
+        return _emit(args, resp, ExitCode.USAGE, f"usage: {e}")
+    if isinstance(verdict, ReserveConflict):
+        resp = JsonResponse(
+            status="conflict",
+            error=f"{args.resource_type}/{verdict.resource_id} held by {verdict.owner}",
+            data={
+                "owner": verdict.owner,
+                "incumbent_resource_id": verdict.resource_id,
+                "purpose": verdict.purpose,
+                "created_at": verdict.created_at,
+                "expires_at": verdict.expires_at,
+            },
+        )
+        # the incumbent key differs from the request only on a
+        # wildcard (systemd_unit_prefix `P-*`) conflict - name it so
+        # release --force arbitration needs no second query
+        key_note = (
+            f" via wildcard {verdict.resource_id}"
+            if verdict.resource_id != args.resource_id
+            else ""
+        )
+        return _emit(
+            args,
+            resp,
+            ExitCode.CONFLICT,
+            f"conflict: {args.resource_type}/{args.resource_id} held by {verdict.owner}"
+            f"{key_note}" + (f" ({verdict.purpose})" if verdict.purpose else ""),
+        )
+    assert isinstance(verdict, ReserveGranted)
+    resp = JsonResponse(
+        status="ok",
+        data={
+            "resource_type": args.resource_type,
+            "resource_id": args.resource_id,
+            "project": args.project,
+            "renewed": verdict.renewed,
+            "expires_at": verdict.expires_at,
+        },
+    )
+    verb = "renewed" if verdict.renewed else "reserved"
+    return _emit(
+        args,
+        resp,
+        ExitCode.OK,
+        f"{verb}: {args.resource_type}/{args.resource_id} -> {args.project}",
+    )
+
+
+def _cmd_release(args) -> int:
+    """``bridge release <type> <id> --project P [--force]``: drop the
+    allocation. Owner-only; ``--force`` is the orchestrator's
+    arbitration override for genuinely contested resources - deploy
+    scripts must never pass it."""
+    try:
+        verdict = db.release(
+            args.resource_type,
+            args.resource_id,
+            args.project,
+            force=args.force,
+            path=args.db,
+        )
+    except ValueError as e:
+        resp = JsonResponse(status="usage", error=str(e))
+        return _emit(args, resp, ExitCode.USAGE, f"usage: {e}")
+    if isinstance(verdict, ReleaseNotFound):
+        resp = JsonResponse(status="ok", data={"released": False})
+        return _emit(args, resp, ExitCode.OK, "no allocation at that key")
+    if isinstance(verdict, ReleaseRefusedOwner):
+        resp = JsonResponse(
+            status="conflict",
+            error=f"held by {verdict.owner} (use --force only for orchestrator arbitration)",
+            data={"owner": verdict.owner},
+        )
+        return _emit(
+            args,
+            resp,
+            ExitCode.CONFLICT,
+            f"conflict: held by {verdict.owner} - orchestrator arbitration only (--force)",
+        )
+    assert isinstance(verdict, ReleaseRemoved)
+    resp = JsonResponse(status="ok", data={"released": True, "owner": verdict.owner})
+    return _emit(
+        args,
+        resp,
+        ExitCode.OK,
+        f"released: {args.resource_type}/{args.resource_id} (was {verdict.owner})",
+    )
+
+
+def _cmd_allocations(args) -> int:
+    """``bridge allocations [--type T] [--project P]``: live registry."""
+    rows = db.list_allocations(resource_type=args.type, project_id=args.project, path=args.db)
+    items = [
+        {
+            "resource_type": r["resource_type"],
+            "resource_id": r["resource_id"],
+            "project": r["project_id"],
+            "purpose": r["purpose"],
+            "session": r["session_id"],
+            "created_at": r["created_at"],
+            "expires_at": r["expires_at"],
+        }
+        for r in rows
+    ]
+    resp = JsonResponse(status="ok", data={"allocations": items})
+    if not items:
+        return _emit(args, resp, ExitCode.OK, "no allocations")
+    lines = [
+        f"{r['resource_type']}/{r['resource_id']} -> {r['project']}"
+        + (f" ({r['purpose']})" if r["purpose"] else "")
+        + (f" [expires {r['expires_at']}]" if r["expires_at"] else "")
+        for r in items
+    ]
+    return _emit(args, resp, ExitCode.OK, "\n".join(lines))
+
+
 def _cmd_ack(args) -> int:
     """``bridge ack``: advance the restart watermark after mailbox consume."""
     acked = db.ack_notifications(args.session, args.up_to, path=args.db)
@@ -3855,6 +3999,54 @@ def _parse_args(argv) -> argparse.Namespace:
     sp.add_argument("--last", type=int, default=50, help="page size (default 50)")
     _add_json(sp)
 
+    # task #208 (directive 426): host-level resource registry - the
+    # machine-readable reservation layer self-sufficient projects
+    # call as a deploy pre-flight; the (type, id) PRIMARY KEY is the
+    # mutex, conflicts name the incumbent owner, and genuinely
+    # contested resources escalate to orchestrator arbitration only
+    sp = sub.add_parser(
+        "reserve",
+        help="atomically reserve a host resource for a project",
+    )
+    sp.add_argument("resource_type", help=f"one of: {', '.join(sorted(db.ALLOCATION_TYPES))}")
+    sp.add_argument("resource_id", help="port, unit prefix, CIDR, netns handle, ...")
+    sp.add_argument("--project", required=True, help="owning project id")
+    sp.add_argument("--purpose", default=None, help="free-text purpose")
+    sp.add_argument(
+        "--session",
+        default=None,
+        help="reserving session id (audit trail; optional)",
+    )
+    sp.add_argument(
+        "--ttl",
+        type=int,
+        default=None,
+        help="seconds until lazy-expiry (default: held until released)",
+    )
+    _add_json(sp)
+
+    sp = sub.add_parser(
+        "release",
+        help="release a reserved host resource (owner-only unless --force)",
+    )
+    sp.add_argument("resource_type")
+    sp.add_argument("resource_id")
+    sp.add_argument("--project", required=True, help="owning project id")
+    sp.add_argument(
+        "--force",
+        action="store_true",
+        help="override ownership - orchestrator arbitration only",
+    )
+    _add_json(sp)
+
+    sp = sub.add_parser(
+        "allocations",
+        help="list live host-resource allocations",
+    )
+    sp.add_argument("--type", default=None, help="filter to one resource_type")
+    sp.add_argument("--project", default=None, help="filter to one project")
+    _add_json(sp)
+
     sp = sub.add_parser(
         "questions",
         help="orchestrator question queue: list / claim / answer",
@@ -3977,7 +4169,10 @@ _HANDLERS = {
     "ack": _cmd_ack,
     "directive": _cmd_directive,
     "notice": _cmd_notice,
+    "allocations": _cmd_allocations,
     "event": _cmd_event,
+    "release": _cmd_release,
+    "reserve": _cmd_reserve,
     "events": _cmd_events,
     "claim": _cmd_claim,
     "finish": _cmd_finish,

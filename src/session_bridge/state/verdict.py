@@ -20,6 +20,13 @@ from typing import Annotated, Literal
 from pydantic import BaseModel, Field
 
 __all__ = [
+    "ReleaseNotFound",
+    "ReleaseRefusedOwner",
+    "ReleaseRemoved",
+    "ReleaseVerdict",
+    "ReserveConflict",
+    "ReserveGranted",
+    "ReserveVerdict",
     "UnregisterDeleted",
     "UnregisterNotFound",
     "UnregisterRefusedFreshHeartbeat",
@@ -67,5 +74,66 @@ UnregisterVerdict = Annotated[
     | UnregisterRefusedLiveTask
     | UnregisterRefusedFreshHeartbeat
     | UnregisterDeleted,
+    Field(discriminator="kind"),
+]
+
+
+class ReserveGranted(_Verdict):
+    """The (type, id) key is now owned by the requesting project.
+
+    ``renewed`` is true when the same project already held the key -
+    a re-reserve by the owner is an idempotent TTL/purpose touch, not
+    a conflict.
+    """
+
+    kind: Literal["granted"] = "granted"
+    renewed: bool
+    expires_at: int | None
+
+
+class ReserveConflict(_Verdict):
+    """A different project holds the key; its row is echoed so the
+    caller can report the existing owner - and on a wildcard
+    ``systemd_unit_prefix`` conflict, so the orchestrator's
+    ``release --force`` arbitration learns the incumbent's actual
+    key without a second query."""
+
+    kind: Literal["conflict"] = "conflict"
+    owner: str
+    resource_id: str
+    purpose: str | None
+    created_at: int
+    expires_at: int | None
+
+
+ReserveVerdict = Annotated[
+    ReserveGranted | ReserveConflict,
+    Field(discriminator="kind"),
+]
+
+
+class ReleaseRemoved(_Verdict):
+    """The row is gone."""
+
+    kind: Literal["removed"] = "removed"
+    owner: str
+
+
+class ReleaseNotFound(_Verdict):
+    """No live allocation at that key (never held, or TTL-swept)."""
+
+    kind: Literal["not_found"] = "not_found"
+
+
+class ReleaseRefusedOwner(_Verdict):
+    """A different project owns the key; ``--force`` is the override
+    the orchestrator uses when arbitrating a contested resource."""
+
+    kind: Literal["refused_owner"] = "refused_owner"
+    owner: str
+
+
+ReleaseVerdict = Annotated[
+    ReleaseRemoved | ReleaseNotFound | ReleaseRefusedOwner,
     Field(discriminator="kind"),
 ]

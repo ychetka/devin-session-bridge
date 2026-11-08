@@ -5,6 +5,7 @@ import multiprocessing
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
@@ -27,6 +28,11 @@ from session_bridge.state.contract import (
     Transport,
 )
 from session_bridge.state.verdict import (
+    ReleaseNotFound,
+    ReleaseRefusedOwner,
+    ReleaseRemoved,
+    ReserveConflict,
+    ReserveGranted,
     UnregisterDeleted,
     UnregisterNotFound,
     UnregisterRefusedFreshHeartbeat,
@@ -2262,3 +2268,146 @@ def test_item207_gwt2_decision_events_append_and_read(db_path):
         db.record_event("orc", "BAD KIND!", "x", path=db_path)
     with pytest.raises(ValueError):
         db.record_event("orc", "contract", "   ", path=db_path)
+
+
+# --- task #208 (directive 426): host-level resource allocations ------------------
+
+
+def test_item208_gwt1_reserve_grants_and_conflicts_atomic(db_path):
+    """[ITEM-208.GWT-1] reserve grants a free (type,id) key; a second
+    project on the same key gets ReserveConflict echoing the
+    incumbent owner - the PRIMARY KEY is the mutex, no
+    check-then-write window."""
+    v = db.reserve("tcp_port", "5678", "trade-ai", purpose="n8n", path=db_path)
+    assert isinstance(v, ReserveGranted) and v.renewed is False and v.expires_at is None
+
+    v = db.reserve("tcp_port", "5678", "rival", path=db_path)
+    assert isinstance(v, ReserveConflict)
+    assert v.owner == "trade-ai" and v.purpose == "n8n"
+
+    # a different resource_id or type is an independent key
+    assert isinstance(db.reserve("tcp_port", "5679", "rival", path=db_path), ReserveGranted)
+    assert isinstance(db.reserve("netns_id", "5678", "rival", path=db_path), ReserveGranted)
+
+
+def test_item208_gwt2_same_owner_renew_not_conflict(db_path):
+    """[ITEM-208.GWT-2] a re-reserve by the SAME project renews the
+    row (updated_at/expires_at/purpose touched) - a deploy
+    pre-flight calling reserve() every run is idempotent, not a
+    false conflict."""
+    db.reserve("tcp_port", "5678", "trade-ai", purpose="n8n", path=db_path)
+    v = db.reserve("tcp_port", "5678", "trade-ai", ttl=600, path=db_path)
+    assert isinstance(v, ReserveGranted) and v.renewed is True
+    assert v.expires_at is not None and v.expires_at > int(time.time())
+    rows = db.list_allocations(path=db_path)
+    assert len(rows) == 1 and rows[0]["expires_at"] == v.expires_at
+
+
+def test_item208_gwt3_release_owner_only_force_override(db_path):
+    """[ITEM-208.GWT-3] release is owner-bound: a foreign project is
+    refused (naming the incumbent), the owner frees the key, and
+    --force - the orchestrator's arbitration override - evicts a
+    foreign holder."""
+    db.reserve("tcp_port", "8443", "trade-ai", path=db_path)
+    v = db.release("tcp_port", "8443", "rival", path=db_path)
+    assert isinstance(v, ReleaseRefusedOwner) and v.owner == "trade-ai"
+    assert db.list_allocations(path=db_path) != []  # still held
+
+    v = db.release("tcp_port", "8443", "trade-ai", path=db_path)
+    assert isinstance(v, ReleaseRemoved) and v.owner == "trade-ai"
+    assert isinstance(db.release("tcp_port", "8443", "trade-ai", path=db_path), ReleaseNotFound)
+
+    db.reserve("tcp_port", "8080", "rival", path=db_path)
+    v = db.release("tcp_port", "8080", "orc", force=True, path=db_path)
+    assert isinstance(v, ReleaseRemoved) and v.owner == "rival"
+
+
+def test_item208_gwt4_ttl_lazy_gc_frees_key(db_path):
+    """[ITEM-208.GWT-4] a TTL'd allocation sweeps itself on the next
+    registry call once expired - no background watcher; the freed
+    key is reservable inside the same atomic call."""
+    v = db.reserve("tcp_port", "9223", "tmp", ttl=1, path=db_path)
+    assert isinstance(v, ReserveGranted)
+    _exec(db_path, "UPDATE allocations SET expires_at=expires_at-10")
+    # the expired row is invisible to the list and free to re-reserve
+    assert db.list_allocations(path=db_path) == []
+    db.reserve("tcp_port", "9223", "tmp", ttl=1, path=db_path)
+    _exec(db_path, "UPDATE allocations SET expires_at=expires_at-10")
+    v = db.reserve("tcp_port", "9223", "other", path=db_path)
+    assert isinstance(v, ReserveGranted)
+
+
+def test_item208_gwt5_reserve_gates_bad_input(db_path):
+    """[ITEM-208.GWT-5] unknown resource_type, empty ids and a
+    non-positive TTL are refused at the gate before any write."""
+    with pytest.raises(ValueError):
+        db.reserve("bogus_type", "1", "p", path=db_path)
+    with pytest.raises(ValueError):
+        db.reserve("tcp_port", "  ", "p", path=db_path)
+    with pytest.raises(ValueError):
+        db.reserve("tcp_port", "1", "  ", path=db_path)
+    with pytest.raises(ValueError):
+        db.reserve("tcp_port", "1", "p", ttl=0, path=db_path)
+
+
+def test_item208_gwt6_reserve_is_atomic_under_threads(db_path):
+    """[ITEM-208.GWT-6] two threads racing one key split the verdict:
+    exactly one ReserveGranted, one ReserveConflict - the PK INSERT
+    serializes them, no lost update."""
+    results = []
+
+    def claim(proj):
+        results.append(db.reserve("tcp_port", "7777", proj, path=db_path))
+
+    t1 = threading.Thread(target=claim, args=("alpha",))
+    t2 = threading.Thread(target=claim, args=("beta",))
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
+    kinds = sorted(type(v).__name__ for v in results)
+    assert kinds == ["ReserveConflict", "ReserveGranted"]
+    assert len(db.list_allocations(path=db_path)) == 1
+
+
+def test_item208_gwt7_wildcard_prefix_conflicts_both_directions(db_path):
+    """[ITEM-208.GWT-7] systemd_unit_prefix wildcards are enforced
+    leases, not advisory rows: a foreign exact `P-foo` request
+    conflicts with the `P-*` holder, a `P-*` request collides with
+    a foreign row it would cover, and nested foreign wildcards
+    conflict. Same-project requests under an owned wildcard grant
+    normally."""
+    db.reserve("systemd_unit_prefix", "trade-ai-*", "trade-ai", path=db_path)
+    # foreign exact key covered by the wildcard -> conflict
+    v = db.reserve("systemd_unit_prefix", "trade-ai-webhook", "rival", path=db_path)
+    assert isinstance(v, ReserveConflict) and v.owner == "trade-ai"
+    # same project under its own wildcard -> granted
+    v = db.reserve("systemd_unit_prefix", "trade-ai-webhook", "trade-ai", path=db_path)
+    assert isinstance(v, ReserveGranted)
+    # a foreign wildcard covering an existing foreign-held exact row
+    db.reserve("systemd_unit_prefix", "other-svc", "rival", path=db_path)
+    v = db.reserve("systemd_unit_prefix", "other-*", "trade-ai", path=db_path)
+    assert isinstance(v, ReserveConflict) and v.owner == "rival"
+    # nested foreign wildcards conflict
+    db.reserve("systemd_unit_prefix", "nest-*", "rival", path=db_path)
+    v = db.reserve("systemd_unit_prefix", "nest-deep-*", "trade-ai", path=db_path)
+    assert isinstance(v, ReserveConflict)
+
+
+def test_item208_gwt8_renew_keeps_purpose_release_gates(db_path):
+    """[ITEM-208.GWT-8] same-owner renew without --purpose keeps the
+    stored purpose (a re-run deploy pre-flight must not wipe the
+    declaration it repeats); release applies reserve's input gates."""
+    db.reserve("tcp_port", "9000", "p", purpose="api", ttl=600, path=db_path)
+    v = db.reserve("tcp_port", "9000", "p", path=db_path)
+    assert isinstance(v, ReserveGranted) and v.renewed
+    row = db.list_allocations(path=db_path)[0]
+    assert row["purpose"] == "api"
+    # bare re-reserve keeps the incumbent expiry - it must not
+    # silently turn a TTL'd row permanent
+    assert row["expires_at"] is not None and v.expires_at == row["expires_at"]
+
+    with pytest.raises(ValueError):
+        db.release("bogus", "1", "p", path=db_path)
+    with pytest.raises(ValueError):
+        db.release("tcp_port", "9000", "", path=db_path)

@@ -2857,3 +2857,107 @@ def test_item207_gwt10_event_roundtrip_and_kind_gate(env, capsys):
 
     rc, out = _run(["event", "orc", "BAD KIND!", "x", "--json"], capsys)
     assert rc == ExitCode.USAGE
+
+
+# --- task #208 (directive 426): host-level resource allocations ------------------
+
+
+def test_item208_gwt11_reserve_conflict_names_incumbent(env, capsys):
+    """[ITEM-208.GWT-11] `bridge reserve` grants a free key and the
+    conflicted caller gets CONFLICT with the incumbent owner in the
+    wire payload - the hard-fail signal deploy scripts gate on."""
+    rc, out = _run(
+        [
+            "reserve",
+            "tcp_port",
+            "5678",
+            "--project",
+            "trade-ai",
+            "--purpose",
+            "n8n forward",
+            "--json",
+        ],
+        capsys,
+    )
+    assert rc == ExitCode.OK and out["status"] == "ok"
+    assert out["data"]["renewed"] is False
+
+    rc, out = _run(
+        ["reserve", "tcp_port", "5678", "--project", "rival", "--json"],
+        capsys,
+    )
+    assert rc == ExitCode.CONFLICT and out["status"] == "conflict"
+    assert out["data"]["owner"] == "trade-ai"
+    assert out["data"]["purpose"] == "n8n forward"
+
+
+def test_item208_gwt12_release_owner_gate_and_list(env, capsys):
+    """[ITEM-208.GWT-12] `bridge release` refuses a non-owner
+    (CONFLICT naming the incumbent), frees for the owner, and
+    `bridge allocations` lists with type/project filters."""
+    _run(["reserve", "tcp_port", "8443", "--project", "trade-ai", "--json"], capsys)
+    _run(
+        ["reserve", "netns_id", "trade-ai-inner", "--project", "trade-ai", "--json"],
+        capsys,
+    )
+
+    rc, out = _run(["release", "tcp_port", "8443", "--project", "rival", "--json"], capsys)
+    assert rc == ExitCode.CONFLICT and out["data"]["owner"] == "trade-ai"
+
+    rc, out = _run(["allocations", "--type", "tcp_port", "--json"], capsys)
+    assert rc == ExitCode.OK
+    items = out["data"]["allocations"]
+    assert [i["resource_id"] for i in items] == ["8443"]
+
+    rc, out = _run(
+        ["release", "tcp_port", "8443", "--project", "orc", "--force", "--json"],
+        capsys,
+    )
+    assert rc == ExitCode.OK and out["data"]["owner"] == "trade-ai"
+
+    rc, out = _run(["allocations", "--project", "trade-ai", "--json"], capsys)
+    assert [i["resource_type"] for i in out["data"]["allocations"]] == ["netns_id"]
+
+
+def test_item208_gwt13_reserve_usage_gates(env, capsys):
+    """[ITEM-208.GWT-13] bad resource_type, empty project and
+    non-positive --ttl are USAGE refusals, never silent writes."""
+    rc, _ = _run(["reserve", "bogus", "1", "--project", "p", "--json"], capsys)
+    assert rc == ExitCode.USAGE
+    rc, _ = _run(
+        ["reserve", "tcp_port", "1", "--project", "p", "--ttl", "0", "--json"],
+        capsys,
+    )
+    assert rc == ExitCode.USAGE
+    rc, out = _run(["allocations", "--json"], capsys)
+    assert out["data"]["allocations"] == []
+
+
+def test_item208_gwt14_wildcard_enforced_release_usage_and_session(env, capsys):
+    """[ITEM-208.GWT-14] the {project}-* wildcard lease conflicts a
+    foreign exact request at the CLI boundary; `release` refuses a
+    typo'd type as USAGE; `--session` lands in the allocations row."""
+    _run(
+        [
+            "reserve",
+            "systemd_unit_prefix",
+            "trade-ai-*",
+            "--project",
+            "trade-ai",
+            "--session",
+            "wonderful-aster",
+            "--json",
+        ],
+        capsys,
+    )
+    rc, out = _run(
+        ["reserve", "systemd_unit_prefix", "trade-ai-web", "--project", "rival", "--json"],
+        capsys,
+    )
+    assert rc == ExitCode.CONFLICT and out["data"]["owner"] == "trade-ai"
+
+    rc, out = _run(["allocations", "--json"], capsys)
+    assert out["data"]["allocations"][0]["session"] == "wonderful-aster"
+
+    rc, _ = _run(["release", "bogus", "x", "--project", "p", "--json"], capsys)
+    assert rc == ExitCode.USAGE

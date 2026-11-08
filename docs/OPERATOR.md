@@ -953,6 +953,9 @@ Global flags: `--db PATH` (`SESSIONS_BRIDGE_DB`), `--queue-dir DIR`
 | `bridge heartbeat <sid>` | refresh the session's liveness record (bumps the heartbeat generation; no takeover semantics). |
 | `bridge event <sid\|-> <kind> "<text>" [--task ID]` | append a row to the durable `decision_events` log (v0.3.16): kinds are lowercase slugs (`contract`, `plan_delta`, `review_verdict`, `milestone`, ... matching `^[a-z][a-z0-9_]{0,39}$`); `-` as the session id records a bus-level decision with no owning session. Survives restarts - contracts and verdicts no longer live in session memory only. |
 | `bridge events [--session SID\|-] [--kind K] [--last N]` | read the `decision_events` log newest-first (default 50 rows, `--last` >= 1; `--session -` filters the bus-level rows with no owning session; `--json` for machine use). |
+| `bridge reserve <type> <id> --project P [--purpose T] [--ttl S]` | atomically reserve a host resource (v0.3.17): OK = granted or same-owner renew, CONFLICT names the incumbent owner. Deploy pre-flight contract in docs/ALLOCATIONS.md. |
+| `bridge release <type> <id> --project P [--force]` | release an allocation (owner-bound; `--force` = orchestrator arbitration only). |
+| `bridge allocations [--type T] [--project P]` | list live host-resource allocations (TTL rows swept lazily on every call). |
 | `bridge questions list [--session SID] [--task ID]` | list pending worker questions. |
 | `bridge questions claim <qid> --claimant SID` | atomically claim a question for answering. |
 | `bridge questions answer <qid> --claimant SID "text"` | answer a claimed question and notify the asker. |
