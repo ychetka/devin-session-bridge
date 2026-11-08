@@ -2931,3 +2931,33 @@ def test_item208_gwt9_reserve_usage_gates(env, capsys):
     assert rc == ExitCode.USAGE
     rc, out = _run(["allocations", "--json"], capsys)
     assert out["data"]["allocations"] == []
+
+
+def test_item208_gwt10_wildcard_enforced_release_usage_and_session(env, capsys):
+    """[ITEM-208.GWT-10] the {project}-* wildcard lease conflicts a
+    foreign exact request at the CLI boundary; `release` refuses a
+    typo'd type as USAGE; `--session` lands in the allocations row."""
+    _run(
+        [
+            "reserve",
+            "systemd_unit_prefix",
+            "trade-ai-*",
+            "--project",
+            "trade-ai",
+            "--session",
+            "wonderful-aster",
+            "--json",
+        ],
+        capsys,
+    )
+    rc, out = _run(
+        ["reserve", "systemd_unit_prefix", "trade-ai-web", "--project", "rival", "--json"],
+        capsys,
+    )
+    assert rc == ExitCode.CONFLICT and out["data"]["owner"] == "trade-ai"
+
+    rc, out = _run(["allocations", "--json"], capsys)
+    assert out["data"]["allocations"][0]["session"] == "wonderful-aster"
+
+    rc, _ = _run(["release", "bogus", "x", "--project", "p", "--json"], capsys)
+    assert rc == ExitCode.USAGE

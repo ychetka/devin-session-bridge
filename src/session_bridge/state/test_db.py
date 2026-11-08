@@ -2368,3 +2368,42 @@ def test_item208_gwt6_reserve_is_atomic_under_threads(db_path):
     kinds = sorted(type(v).__name__ for v in results)
     assert kinds == ["ReserveConflict", "ReserveGranted"]
     assert len(db.list_allocations(path=db_path)) == 1
+
+
+def test_item208_gwt7_wildcard_prefix_conflicts_both_directions(db_path):
+    """[ITEM-208.GWT-7] systemd_unit_prefix wildcards are enforced
+    leases, not advisory rows: a foreign exact `P-foo` request
+    conflicts with the `P-*` holder, a `P-*` request collides with
+    a foreign row it would cover, and nested foreign wildcards
+    conflict. Same-project requests under an owned wildcard grant
+    normally."""
+    db.reserve("systemd_unit_prefix", "trade-ai-*", "trade-ai", path=db_path)
+    # foreign exact key covered by the wildcard -> conflict
+    v = db.reserve("systemd_unit_prefix", "trade-ai-webhook", "rival", path=db_path)
+    assert isinstance(v, ReserveConflict) and v.owner == "trade-ai"
+    # same project under its own wildcard -> granted
+    v = db.reserve("systemd_unit_prefix", "trade-ai-webhook", "trade-ai", path=db_path)
+    assert isinstance(v, ReserveGranted)
+    # a foreign wildcard covering an existing foreign-held exact row
+    db.reserve("systemd_unit_prefix", "other-svc", "rival", path=db_path)
+    v = db.reserve("systemd_unit_prefix", "other-*", "trade-ai", path=db_path)
+    assert isinstance(v, ReserveConflict) and v.owner == "rival"
+    # nested foreign wildcards conflict
+    db.reserve("systemd_unit_prefix", "nest-*", "rival", path=db_path)
+    v = db.reserve("systemd_unit_prefix", "nest-deep-*", "trade-ai", path=db_path)
+    assert isinstance(v, ReserveConflict)
+
+
+def test_item208_gwt8_renew_keeps_purpose_release_gates(db_path):
+    """[ITEM-208.GWT-8] same-owner renew without --purpose keeps the
+    stored purpose (a re-run deploy pre-flight must not wipe the
+    declaration it repeats); release applies reserve's input gates."""
+    db.reserve("tcp_port", "9000", "p", purpose="api", path=db_path)
+    v = db.reserve("tcp_port", "9000", "p", path=db_path)
+    assert isinstance(v, ReserveGranted) and v.renewed
+    assert db.list_allocations(path=db_path)[0]["purpose"] == "api"
+
+    with pytest.raises(ValueError):
+        db.release("bogus", "1", "p", path=db_path)
+    with pytest.raises(ValueError):
+        db.release("tcp_port", "9000", "", path=db_path)

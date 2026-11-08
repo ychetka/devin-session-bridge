@@ -21,11 +21,14 @@ bridge release <resource_type> <resource_id> --project <p> [--force]
 bridge allocations [--type T] [--project P]
 ```
 
-- `reserve` is atomic: the `(resource_type, resource_id)` PRIMARY
-  KEY is the mutex - a single INSERT guarded by the constraint, no
-  check-then-write window. Exit 0 = granted (`renewed: true` when
-  the same project already held the key - a re-reserve renews
-  purpose/TTL/updated_at, so calling reserve() on every deploy run
+- `reserve` is atomic: sweep-check-upsert runs inside one
+  `BEGIN IMMEDIATE` transaction - the writer lock plus the
+  `(resource_type, resource_id)` PRIMARY KEY serialize racers
+  end-to-end, so a concurrent reserve sees either a free key or
+  the committed incumbent. Exit 0 = granted (`renewed: true` when
+  the same project already held the key - a re-reserve touches
+  updated_at/expires_at and keeps the stored purpose/session when
+  the caller passes none, so calling reserve() on every deploy run
   is idempotent). Exit 4 (`CONFLICT`) = another project holds the
   key; the JSON `data.owner`/`purpose` name the incumbent.
 - `release` is owner-bound. A foreign project gets `CONFLICT`
@@ -54,9 +57,12 @@ silently skipping a shared resource is worse than a fuzzy type.
 - **systemd units** are named `{project_id}-<service>` for every
   NEW unit a project creates (e.g. `trade-ai-webhook.service`).
   Projects also reserve the wildcard prefix `systemd_unit_prefix`
-  `{project}-*` so a foreign project cannot squat on their
-  namespace. Pre-convention unit names are registered verbatim
-  (retro-declared rows below).
+  `{project}-*` - an ENFORCED lease, not an advisory note: a
+  foreign `P-foo` request conflicts with the `P-*` row (and vice
+  versa - requesting `P-*` collides with any foreign `P-*`-covered
+  row), checked in the same atomic transaction. Same-project
+  requests under an owned wildcard grant normally. Pre-convention
+  unit names are registered verbatim (retro-declared rows below).
 - **Ports** are reserved individually as `tcp_port/<port>` -
   atomic per-key guarantees. A project MAY additionally declare an
   advisory range as `other/<project>-ports-<start>-<end>`

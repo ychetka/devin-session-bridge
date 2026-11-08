@@ -2542,6 +2542,7 @@ def _cmd_reserve(args) -> int:
             args.resource_id,
             args.project,
             purpose=args.purpose,
+            session_id=args.session,
             ttl=args.ttl,
             path=args.db,
         )
@@ -2591,13 +2592,17 @@ def _cmd_release(args) -> int:
     allocation. Owner-only; ``--force`` is the orchestrator's
     arbitration override for genuinely contested resources - deploy
     scripts must never pass it."""
-    verdict = db.release(
-        args.resource_type,
-        args.resource_id,
-        args.project,
-        force=args.force,
-        path=args.db,
-    )
+    try:
+        verdict = db.release(
+            args.resource_type,
+            args.resource_id,
+            args.project,
+            force=args.force,
+            path=args.db,
+        )
+    except ValueError as e:
+        resp = JsonResponse(status="usage", error=str(e))
+        return _emit(args, resp, ExitCode.USAGE, f"usage: {e}")
     if isinstance(verdict, ReleaseNotFound):
         resp = JsonResponse(status="ok", data={"released": False})
         return _emit(args, resp, ExitCode.OK, "no allocation at that key")
@@ -2632,6 +2637,7 @@ def _cmd_allocations(args) -> int:
             "resource_id": r["resource_id"],
             "project": r["project_id"],
             "purpose": r["purpose"],
+            "session": r["session_id"],
             "created_at": r["created_at"],
             "expires_at": r["expires_at"],
         }
@@ -3997,6 +4003,11 @@ def _parse_args(argv) -> argparse.Namespace:
     sp.add_argument("resource_id", help="port, unit prefix, CIDR, netns handle, ...")
     sp.add_argument("--project", required=True, help="owning project id")
     sp.add_argument("--purpose", default=None, help="free-text purpose")
+    sp.add_argument(
+        "--session",
+        default=None,
+        help="reserving session id (audit trail; optional)",
+    )
     sp.add_argument(
         "--ttl",
         type=int,
