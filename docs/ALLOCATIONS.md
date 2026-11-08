@@ -27,9 +27,11 @@ bridge allocations [--type T] [--project P]
   end-to-end, so a concurrent reserve sees either a free key or
   the committed incumbent. Exit 0 = granted (`renewed: true` when
   the same project already held the key - a re-reserve touches
-  updated_at/expires_at and keeps the stored purpose/session when
-  the caller passes none, so calling reserve() on every deploy run
-  is idempotent). Exit 4 (`CONFLICT`) = another project holds the
+  updated_at and keeps the stored purpose/session/expiry when the
+  caller passes none; re-stating `--ttl` refreshes the expiry,
+  clearing it needs release + re-reserve, so calling reserve() on
+  every deploy run is idempotent). Exit 4 (`CONFLICT`) = another
+  project holds the
   key; the JSON `data.owner`/`purpose` name the incumbent.
 - `release` is owner-bound. A foreign project gets `CONFLICT`
   naming the incumbent. `--force` exists ONLY for orchestrator

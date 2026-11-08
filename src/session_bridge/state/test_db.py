@@ -2398,10 +2398,14 @@ def test_item208_gwt8_renew_keeps_purpose_release_gates(db_path):
     """[ITEM-208.GWT-8] same-owner renew without --purpose keeps the
     stored purpose (a re-run deploy pre-flight must not wipe the
     declaration it repeats); release applies reserve's input gates."""
-    db.reserve("tcp_port", "9000", "p", purpose="api", path=db_path)
+    db.reserve("tcp_port", "9000", "p", purpose="api", ttl=600, path=db_path)
     v = db.reserve("tcp_port", "9000", "p", path=db_path)
     assert isinstance(v, ReserveGranted) and v.renewed
-    assert db.list_allocations(path=db_path)[0]["purpose"] == "api"
+    row = db.list_allocations(path=db_path)[0]
+    assert row["purpose"] == "api"
+    # bare re-reserve keeps the incumbent expiry - it must not
+    # silently turn a TTL'd row permanent
+    assert row["expires_at"] is not None and v.expires_at == row["expires_at"]
 
     with pytest.raises(ValueError):
         db.release("bogus", "1", "p", path=db_path)
