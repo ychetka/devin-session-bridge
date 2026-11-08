@@ -2746,3 +2746,114 @@ def test_item203_gwt6_register_reaps_orphaned_tombstone(env, capsys):
     assert rc == ExitCode.OK
     assert (mdir / "msg_1.txt").exists()  # parked mail back in the live dir
     assert not park.exists()
+
+
+# --- item_207: lazy GC of dead registrations + durable event log -----------------
+
+
+def _ghost_no_hb(env, sid="g1", age=None):
+    """Unmanaged sessions row with NO heartbeat row - the
+    register-then-vanish ghost class (impossible-vibraphone)."""
+    res = db.register(sid, f"/repo/{sid}", path=env.db)
+    assert res.accepted
+    _one(env.db, "DELETE FROM worker_heartbeats WHERE session_id=?", (sid,))
+    old = int(time.time()) - (age if age is not None else db.GHOST_TTL_SECONDS + 60)
+    _one(env.db, "UPDATE sessions SET updated_at=? WHERE session_id=?", (old, sid))
+
+
+def test_item207_gwt7_status_marks_ghost_dead(env, capsys):
+    """[ITEM-207.GWT-7] lazy GC inside `bridge status`: an unmanaged
+    ghost (no hb row, updated_at past GHOST_TTL) is marked dead by
+    the status call itself - the impossible-vibraphone class dies on
+    the next operator call, daemon or not."""
+    _ghost_no_hb(env)
+    rc, _ = _run(["status", "--json"], capsys)
+    assert rc == ExitCode.OK
+    assert db.get_session("g1", path=env.db)["status"] == SessionStatus.DEAD.value
+
+
+def test_item207_gwt8_fresh_ghost_and_managed_survive(env, capsys):
+    """[ITEM-207.GWT-8] the grace window protects live rows: a
+    recently-touched unmanaged ghost and any MANAGED session - even
+    a stale-heartbeat one (drain-mode by design) - survive the GC."""
+    _ghost_no_hb(env, "g2", age=60)  # recent -> inside grace
+    _ghost(env, "m1")
+    _one(env.db, "UPDATE sessions SET mode='managed' WHERE session_id='m1'")
+    rc, _ = _run(["status", "--json"], capsys)
+    assert rc == ExitCode.OK
+    assert db.get_session("g2", path=env.db)["status"] == SessionStatus.ACTIVE.value
+    assert db.get_session("m1", path=env.db)["status"] == SessionStatus.ACTIVE.value
+
+
+def test_item207_gwt9_gc_requeues_live_task_and_decides(env, capsys):
+    """[ITEM-207.GWT-9] GC fires the full dead-worker effect on the
+    heartbeat leg: the silent worker's live task folds back to
+    queued inside the attempt budget and a worker_dead decision
+    lands in the journal."""
+    _ghost(env, "g1")  # stamped heartbeat gone silent, not a no-row ghost
+    tid = _task(env, "g1")
+    assert db.claim_queued(tid, "hook-1", Transport.HOOK_QUEUE, path=env.db)
+    assert db.mark_running(tid, "hook-1", path=env.db)
+    rc, _ = _run(["status", "--json"], capsys)
+    assert rc == ExitCode.OK
+    assert db.get_session("g1", path=env.db)["status"] == SessionStatus.DEAD.value
+    # the requeue CAS fired (attempt+1, back to queued) - the decision
+    # journal carries it; the pump's dispatch leg may re-pick the
+    # queued task afterwards, which is pre-existing dispatch
+    # behavior outside the GC contract
+    details = " ".join(d["detail"] or "" for d in _decisions(env) if d["event"] == "worker_dead")
+    assert f"task={tid} -> queued" in details
+    assert db.get_task(tid, path=env.db)["attempt"] == 1
+
+
+def test_item207_gwt9b_ghost_with_live_task_is_deferred(env, capsys):
+    """[ITEM-207.GWT-9b] a no-heartbeat-row ghost holding a LIVE task
+    is NOT demoted on the ghost leg: sessions.updated_at does not
+    track task liveness, so a silently-working unmanaged worker
+    past GHOST_TTL would otherwise be killed mid-task -> duplicate
+    execution. Lease recovery owns the task; once nothing is live
+    the next call removes the registration."""
+    _ghost_no_hb(env)
+    tid = _task(env, "g1")
+    assert db.claim_queued(tid, "hook-1", Transport.HOOK_QUEUE, path=env.db)
+    assert db.mark_running(tid, "hook-1", path=env.db)
+    rc, _ = _run(["status", "--json"], capsys)
+    assert rc == ExitCode.OK
+    # deferred: still active, task untouched
+    assert db.get_session("g1", path=env.db)["status"] == SessionStatus.ACTIVE.value
+    assert db.get_task(tid, path=env.db)["status"] == TaskStatus.RUNNING.value
+    # once the task is no longer live the same call GCs the ghost
+    _one(env.db, "UPDATE tasks SET status='done' WHERE id=?", (tid,))
+    rc, _ = _run(["status", "--json"], capsys)
+    assert rc == ExitCode.OK
+    assert db.get_session("g1", path=env.db)["status"] == SessionStatus.DEAD.value
+
+
+def test_item207_gwt10_event_roundtrip_and_kind_gate(env, capsys):
+    """[ITEM-207.GWT-10] `bridge event` appends a durable decision
+    row; `bridge events` reads it back with session/kind filters; a
+    bad kind slug is refused with usage."""
+    rc, out = _run(
+        ["event", "orc", "contract", "task 207 signed", "--task", "207", "--json"],
+        capsys,
+    )
+    assert rc == ExitCode.OK and out["data"]["kind"] == "contract"
+    _run(["event", "-", "plan_delta", "fleet halt lifted", "--json"], capsys)
+
+    rc, out = _run(["events", "--session", "orc", "--json"], capsys)
+    assert rc == ExitCode.OK
+    items = out["data"]["events"]
+    assert len(items) == 1 and items[0]["task_id"] == 207
+    rc, out = _run(["events", "--kind", "plan_delta", "--json"], capsys)
+    assert out["data"]["events"][0]["session"] is None
+    # `--session -` filters back exactly the bus-level rows
+    rc, out = _run(["events", "--session", "-", "--json"], capsys)
+    assert rc == ExitCode.OK
+    items = out["data"]["events"]
+    assert len(items) == 1 and items[0]["kind"] == "plan_delta"
+    # `--last` is floored at 1 - a negative SQLite LIMIT reads unbounded
+    rc, out = _run(["events", "--last", "0", "--json"], capsys)
+    assert rc == ExitCode.USAGE
+
+    rc, out = _run(["event", "orc", "BAD KIND!", "x", "--json"], capsys)
+    assert rc == ExitCode.USAGE

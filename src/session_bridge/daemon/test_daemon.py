@@ -1997,6 +1997,7 @@ def test_item203_gwt3_pass_timing_event_emitted(env):
         "pending_scan",
         "wake",
         "lease_renew",
+        "recovery",
         "sweep",
         "mail_stall",
         "question_janitor",
@@ -2024,3 +2025,80 @@ def test_item203_gwt4_pass_timing_survives_pass_failure(env, monkeypatch):
     assert "schedule=" in detail
     assert "sweep=" in detail
     assert "question_janitor=" not in detail
+
+
+# --- task #207: daemon-owned lease recovery + ghost GC sweep ---------------------
+
+
+def test_item207_gwt1_daemon_recovery_folds_expired_lease(env, monkeypatch):
+    """[ITEM-207.GWT-1] recovery ownership consolidated (item b):
+    run(once) requeues a running task whose lease lapsed with ZERO
+    CLI traffic - previously recover_stale only fired inside the
+    _work pump, so a daemon-only fleet left expired leases frozen."""
+    _managed_stale(env)
+    tid = _running_task(env)
+    _lease_window(env, tid, expires_in=-10, renewed_ago=600)
+    # not verifiably busy -> lease_renew leaves it alone, recovery owns it
+    _stall_verify(env, monkeypatch, {})
+    daemon.run(env.db, env.qdir, once=True, notify_send=env.notifier)
+    row = db.get_task(tid, path=env.db)
+    assert row["status"] == TaskStatus.QUEUED.value and row["attempt"] == 1
+    assert row["lease_expires_at"] is None  # lease fields cleared by the fold
+    events = [d["event"] for d in _decisions(env)]
+    assert "task_recovered" in events
+
+
+def test_item207_gwt2_recovery_failed_notifies_once(env, monkeypatch):
+    """[ITEM-207.GWT-2] a lapsed task at the attempt budget fails
+    terminally in the daemon pass AND pings the operator via
+    notify-send - mark_notified dedups the ping with any racing CLI
+    pump leg, so exactly one notification fires."""
+    _managed_stale(env)
+    tid = _running_task(env)
+    _lease_window(env, tid, expires_in=-10, renewed_ago=600)
+    _exec(env.db, "UPDATE tasks SET attempt=1 WHERE id=?", (tid,))
+    _stall_verify(env, monkeypatch, {})
+    daemon.run(env.db, env.qdir, once=True, notify_send=env.notifier)
+    row = db.get_task(tid, path=env.db)
+    assert row["status"] == TaskStatus.FAILED.value
+    assert [t for t, _ in env.sent if "FAILED" in t]  # operator pinged
+    detail = next(d["detail"] for d in _decisions(env) if d["event"] == "task_recovered")
+    assert f"task={tid}" in detail and "failed" in detail
+
+
+def test_item207_gwt3_recovery_runs_after_lease_renew(env, monkeypatch):
+    """[ITEM-207.GWT-3] pass order matters: a verifiably-busy managed
+    session's in-margin lease is renewed BEFORE the recovery pass
+    scans - recovery must never fold a task the renewer just saved."""
+    res = db.register(SID, "/repo/ws", path=env.db)
+    assert res.accepted
+    db.set_session_mode(SID, SessionMode.MANAGED, path=env.db)
+    tid = _running_task(env)
+    _lease_window(env, tid, expires_in=10, renewed_ago=0)
+    _stall_verify(env, monkeypatch, {SID: "working"})
+    daemon.run(env.db, env.qdir, once=True, notify_send=env.notifier)
+    row = db.get_task(tid, path=env.db)
+    assert row["status"] == TaskStatus.RUNNING.value
+    assert row["lease_expires_at"] > int(time.time()) + 60
+
+
+def test_item207_gwt4_sweep_sees_no_heartbeat_ghosts(env):
+    """[ITEM-207.GWT-4] the daemon sweep now folds unmanaged sessions
+    with NO heartbeat row once updated_at passes GHOST_TTL - the
+    impossible-vibraphone blind spot: a hook-upserted sessions row
+    the old JOIN-based scan could never see."""
+    res = db.register("ghost", "/repo/g", path=env.db)
+    assert res.accepted
+    _exec(env.db, "DELETE FROM worker_heartbeats WHERE session_id='ghost'")
+    _exec(
+        env.db,
+        "UPDATE sessions SET updated_at=? WHERE session_id='ghost'",
+        (int(time.time()) - db.GHOST_TTL_SECONDS - 60,),
+    )
+    daemon.run(env.db, env.qdir, once=True, notify_send=env.notifier)
+    assert db.get_session("ghost", path=env.db)["status"] == SessionStatus.DEAD.value
+    detail = next(
+        (d["detail"] for d in _decisions(env) if d["event"] == "worker_dead"),
+        "",
+    )
+    assert "ghost" in detail

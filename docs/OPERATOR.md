@@ -452,11 +452,12 @@ Daemon files in the state dir:
   `mail_stall_deferred`, `mail_stall_deferred_busy`,
   `mail_stall_verify_failed`, `mail_stall_deferred_halted`,
   `session_unregistered`, `lease_auto_renewed`,
-  `lease_renew_verify_failed`, `pass_timing`.
+  `lease_renew_verify_failed`, `task_recovered`, `pass_timing`.
 - `pass_timing` is the per-iteration instrumentation line (v0.3.15):
   one event per loop carrying every pass duration as
   `schedule=Xms relay=Xms pending_scan=Xms wake=Xms
-  lease_renew=Xms sweep=Xms mail_stall=Xms question_janitor=Xms`.
+  lease_renew=Xms recovery=Xms sweep=Xms mail_stall=Xms
+  question_janitor=Xms`.
   A pass quietly outgrowing the daemon interval shows up here
   before the fleet looks stalled.
 - `logs/daemon.log` - the detached daemon's stderr (decision lines are
@@ -525,10 +526,33 @@ Each pass (~5s, with up to ~1s startup jitter):
    not renewed: their leases lapse into `recover_stale` exactly as
    before (fail-closed - unverifiable is not busy). Each renewal logs
    `lease_auto_renewed`.
-4. Sweep: **unmanaged** sessions whose `worker_heartbeats.last_seen_at`
+4. Recovery (v0.3.16): the daemon now owns the lease-expiry fold that
+   used to live only in the CLI `_work` pump - `recover_stale` ran
+   lazily inside bridge commands, so with zero CLI traffic an expired
+   lease could sit unrecovered until somebody typed `bridge status`.
+   The `_recovery_pass` runs right after `_lease_renew_pass` so a
+   verifiably-busy worker gets its renewal first and only the truly
+   expired rows fold: live tasks requeue (`task_recovered` decision,
+   terminal `failed` at the attempt budget notifies the operator
+   once), stale `dispatch_decided` rows fold back to queued, and the
+   renewal is idempotent across daemon/CLI invocations through the
+   same CAS + `mark_notified` journal.
+5. Sweep: **unmanaged** sessions whose `worker_heartbeats.last_seen_at`
    is older than `HEARTBEAT_STALE_SECONDS` (120s) flip to
-   `status='dead'`. Managed sessions are excluded: between turns a
-   managed drain-mode session is stale-hb by design, and that signal
+   `status='dead'`, and unmanaged sessions with NO heartbeat row at
+   all - register-then-vanish ghosts, the impossible-vibraphone class -
+   flip after `GHOST_TTL_SECONDS` (86400s) counted from
+   `sessions.updated_at` (v0.3.16: previously the sweep required a
+   heartbeat row, so ghosts were invisible to it). The same scan runs
+   lazily inside `bridge status`, `bridge wait` and the `_work` pump,
+   so CLI traffic alone also GCs dead registrations. A ghost that
+   still holds a LIVE task is NOT demoted on the ghost leg -
+   `sessions.updated_at` does not track task liveness, so a
+   silently-working unmanaged worker past GHOST_TTL would die
+   mid-task into duplicate execution; lease recovery folds the task
+   first and the registration dies next pass. Managed sessions
+   are excluded: between turns a managed drain-mode session is
+   stale-hb by design, and that signal
    is the wake trigger - treating it as death would fail every
    dispatched task 120s after dispatch. A managed session's real
    death is detected on the wake path instead: 3 consecutive
@@ -541,7 +565,7 @@ Each pass (~5s, with up to ~1s startup jitter):
    dead-worker-backup-<id>) and reset the worktree to the task's base
    ref before starting". A silent orchestrator raises one deduped
    `notify-send -u critical`.
-5. Mail stall: any session whose oldest undrained actionable mail is
+6. Mail stall: any session whose oldest undrained actionable mail is
    older than `SESSIONS_BRIDGE_MAIL_STALL_SECONDS` (default 1800s)
    gets one escalation per stall episode - a directive pushed into
    the active orchestrator's mailbox naming the session and the wait
@@ -927,6 +951,8 @@ Global flags: `--db PATH` (`SESSIONS_BRIDGE_DB`), `--queue-dir DIR`
 | `bridge directive <sid> "<text>"` | send a registered directive notification: the daemon relays it into the fs mailbox and the wake legs see it. Prefer this over hand-writing `msg_*.txt` files - foreign files get wakes via the file-pending leg but carry no registry evidence (v0.3.4). |
 | `bridge notice <sid> "<text>"` | send a registered informational notice - same delivery machinery as directive, but kind `notice` means "read and incorporate" rather than "obey": the path for worker status and task reports (v0.3.9). |
 | `bridge heartbeat <sid>` | refresh the session's liveness record (bumps the heartbeat generation; no takeover semantics). |
+| `bridge event <sid\|-> <kind> "<text>" [--task ID]` | append a row to the durable `decision_events` log (v0.3.16): kinds are lowercase slugs (`contract`, `plan_delta`, `review_verdict`, `milestone`, ... matching `^[a-z][a-z0-9_]{0,39}$`); `-` as the session id records a bus-level decision with no owning session. Survives restarts - contracts and verdicts no longer live in session memory only. |
+| `bridge events [--session SID\|-] [--kind K] [--last N]` | read the `decision_events` log newest-first (default 50 rows, `--last` >= 1; `--session -` filters the bus-level rows with no owning session; `--json` for machine use). |
 | `bridge questions list [--session SID] [--task ID]` | list pending worker questions. |
 | `bridge questions claim <qid> --claimant SID` | atomically claim a question for answering. |
 | `bridge questions answer <qid> --claimant SID "text"` | answer a claimed question and notify the asker. |
@@ -979,4 +1005,5 @@ the target workspace as `.devin/orchestrator/PLAYBOOK.md`).
 | `SESSIONS_BRIDGE_CYCLE_SECONDS` | 150 | park cycle length for installed hooks. |
 | `SESSIONS_BRIDGE_CYCLES_MAX` | 5 | park budget for installed hooks. |
 | `SESSIONS_BRIDGE_MAIL_STALL_SECONDS` | 1800 | undrained-mail age before the daemon escalates to the orchestrator. |
+| `SESSIONS_BRIDGE_GHOST_TTL` | 86400 | seconds after `sessions.updated_at` before a no-heartbeat-row unmanaged registration (ghost) is swept dead. |
 | `SESSIONS_BRIDGE_BUSY_GRACE_SECONDS` | 7200 (4x stall) | ceiling on mid-turn busy grace - a still-busy session escalates past it; clamped at the stall threshold. |

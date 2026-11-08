@@ -441,6 +441,25 @@ def _task_to_hook_queue(task_id: int, owner: str, args) -> bool:
     return db.demote_running_to_hook(task_id, owner, path=args.db)
 
 
+def _gc_dead_sessions(args) -> None:
+    """Lazy GC of dead registrations (task #207 item f).
+
+    Every bus-touching call (``bridge status``, ``wait``, the
+    ``pump`` pass behind ``push``/``_work``) marks unmanaged
+    sessions dead when their liveness TTL passed - the same verdict
+    the daemon sweep gives, so a ghost dies on the next operator
+    call even with the daemon down. Two legs ride the shared
+    ``db.stale_unmanaged_sessions`` scan: silent stamped heartbeats
+    (``HEARTBEAT_STALE_SECONDS``) and no-heartbeat-row ghosts
+    (``GHOST_TTL_SECONDS``). The ``set_session_status`` CAS dedups a
+    racing daemon sweep: only the active->dead edge fires effects,
+    whoever flips it.
+    """
+    now = int(time.time())
+    for row in db.stale_unmanaged_sessions(now, path=args.db):
+        daemon.mark_dead(row, args.db, _state_dir(args), _notify_send, now, tag="gc ")
+
+
 def pump(args) -> dict:
     """Lazy recovery + one dispatch pass over queued tasks.
 
@@ -459,6 +478,8 @@ def pump(args) -> dict:
     saturated = False
 
     _sweep_worker_logs(args)
+
+    _gc_dead_sessions(args)
 
     for tid in db.recover_stale(path=args.db):
         row = db.get_task(tid, path=args.db)
@@ -2436,6 +2457,69 @@ def _cmd_notice(args) -> int:
     return _push_registered(args, NotificationKind.NOTICE)
 
 
+def _cmd_event(args) -> int:
+    """``bridge event <sid> <kind> <text>``: append a durable decision.
+
+    The append-only ``decision_events`` log (task #207 item g) is
+    the restart-proof home for decisions that used to live in
+    session memory only - contracts signed, PLAN_DELTAs, review
+    verdicts, milestones. ``<sid>`` names the deciding session;
+    ``-`` records a bus-level decision no single session owns.
+    """
+    sid = None if args.session_id == "-" else args.session_id
+    try:
+        eid = db.record_event(sid, args.event_kind, args.text, task_id=args.task, path=args.db)
+    except ValueError as e:
+        resp = JsonResponse(session=sid, status="usage", error=str(e))
+        return _emit(args, resp, ExitCode.USAGE, f"usage: {e}")
+    resp = JsonResponse(
+        session=sid,
+        status="ok",
+        data={"event_id": eid, "kind": args.event_kind.strip().lower()},
+    )
+    return _emit(
+        args,
+        resp,
+        ExitCode.OK,
+        f"event {eid} logged ({args.event_kind.strip().lower()})",
+    )
+
+
+def _cmd_events(args) -> int:
+    """``bridge events [--session SID] [--kind K] [--last N]``: read the log."""
+    if args.last < 1:
+        return _emit(
+            args,
+            JsonResponse(status="error", error="--last must be >= 1"),
+            ExitCode.USAGE,
+            "events: --last must be >= 1",
+        )
+    bus_only = args.session == "-"
+    rows = db.list_events(
+        session_id=None if bus_only else args.session,
+        bus_only=bus_only,
+        kind=args.kind,
+        limit=args.last,
+        path=args.db,
+    )
+    items = [
+        {
+            "id": r["id"],
+            "session": r["session_id"],
+            "kind": r["kind"],
+            "body": r["body"],
+            "task_id": r["task_id"],
+            "created_at": r["created_at"],
+        }
+        for r in rows
+    ]
+    resp = JsonResponse(session=args.session, status="ok", data={"events": items})
+    if not items:
+        return _emit(args, resp, ExitCode.OK, "no events")
+    lines = [f"#{r['id']} [{r['kind']}] {r['session'] or '-'}: {r['body'][:80]}" for r in items]
+    return _emit(args, resp, ExitCode.OK, "\n".join(lines))
+
+
 def _cmd_ack(args) -> int:
     """``bridge ack``: advance the restart watermark after mailbox consume."""
     acked = db.ack_notifications(args.session, args.up_to, path=args.db)
@@ -2638,6 +2722,9 @@ def _cmd_wait(args) -> int:
             error=f"task {tid} belongs to {task['session_id']}, not {sid}",
         )
         return _emit(args, resp, ExitCode.CONFLICT, f"conflict: task {tid} is not yours")
+    # lazy GC on this bus-touching path too (task #207 item f) - a
+    # dead registration expires on the next call, daemon or not
+    _gc_dead_sessions(args)
     if _session_mode(sid, args) != SessionMode.MANAGED.value:
         resp = JsonResponse(
             session=sid,
@@ -3746,6 +3833,28 @@ def _parse_args(argv) -> argparse.Namespace:
     sp.add_argument("text", help="notice text")
     _add_json(sp)
 
+    # task #207 item g: durable append-only decision log - decisions
+    # that used to live in session memory only (contracts,
+    # PLAN_DELTAs, review verdicts) survive a session restart here
+    sp = sub.add_parser(
+        "event",
+        help="append a durable decision event ('-' sid = bus-level)",
+    )
+    sp.add_argument("session_id", help="deciding session id, or '-' for bus-level")
+    sp.add_argument("event_kind", help="kind slug: contract, plan_delta, review_verdict, ...")
+    sp.add_argument("text", help="decision body")
+    sp.add_argument("--task", type=int, default=None, help="optional task id ref")
+    _add_json(sp)
+
+    sp = sub.add_parser(
+        "events",
+        help="read the durable decision log (latest first)",
+    )
+    sp.add_argument("--session", default=None, help="filter to one session")
+    sp.add_argument("--kind", default=None, help="filter to one kind slug")
+    sp.add_argument("--last", type=int, default=50, help="page size (default 50)")
+    _add_json(sp)
+
     sp = sub.add_parser(
         "questions",
         help="orchestrator question queue: list / claim / answer",
@@ -3868,6 +3977,8 @@ _HANDLERS = {
     "ack": _cmd_ack,
     "directive": _cmd_directive,
     "notice": _cmd_notice,
+    "event": _cmd_event,
+    "events": _cmd_events,
     "claim": _cmd_claim,
     "finish": _cmd_finish,
     "heartbeat": _cmd_heartbeat,
