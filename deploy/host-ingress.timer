@@ -1,0 +1,16 @@
+# host-ingress.timer - periodic ingress reconcile.
+# Cadence 30s: a `reserve --fwd` is picked up within half a minute
+# even when the deploy script forgot to call `bridge ingress sync`;
+# missed runs during downtime are caught by Persistent=true.
+[Unit]
+Description=periodic host ingress reconcile
+After=default.target
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=30s
+AccuracySec=5s
+Persistent=true
+
+[Install]
+WantedBy=timers.target

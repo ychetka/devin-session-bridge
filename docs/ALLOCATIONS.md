@@ -17,8 +17,11 @@ make collisions visible and arbitrable.
 
 ```bash
 bridge reserve <resource_type> <resource_id> --project <p> [--purpose "..."] [--ttl S]
+       [--fwd <spec> [--bind <addr>]]          (tcp_port only)
 bridge release <resource_type> <resource_id> --project <p> [--force]
 bridge allocations [--type T] [--project P]
+bridge ingress sync        # reconcile running forwarders with the registry
+bridge ingress status      # desired vs running forwards
 ```
 
 - `reserve` is atomic: sweep-check-upsert runs inside one
@@ -126,6 +129,49 @@ resource:
 | tcp_port/9223 | shared_person | chrome `--remote-debugging-port` audit profile |
 | systemd_unit_prefix/{devin-telegram,copilot-api,copilot-model-shim,vk-token,voltrack-watch,filter-chain} | (various) | enabled user units, retro-declared |
 
+## Ingress forwards (v0.4.0, task #209)
+
+`tcp_port` reservations can carry a **forward declaration** that the
+neutral host ingress layer materializes: `reserve --fwd` stores a
+`fwd=<spec>` token inside the row's `purpose`, and the
+`host-ingress.timer` (plus explicit `bridge ingress sync` calls from
+deploy scripts that want zero-wait publication) reconciles a detached
+`session_bridge.ingress.forwarder` process per declared port.
+
+Contract:
+
+- `reserve tcp_port <port> --fwd <spec>` → a listener on
+  `<bind>:<port>` appears (at latest within the timer's 30s cadence).
+- `release tcp_port <port>` → the forwarder is removed on the next
+  reconcile.
+- Rows without a `fwd=` token are ownership leases only - no
+  forwarder is spawned.
+
+Spec grammar:
+
+| spec | meaning |
+|---|---|
+| `tcp:<host>:<port>` | relay to host:port in the forwarder's own netns |
+| `ns-pid:<pid>:<port>` | setns into `/proc/<pid>/ns/net`, dial 127.0.0.1:<port> |
+| `ns-pidfile:<path>:<port>` | same, resolving the pid from an absolute path at reconcile time |
+
+`--bind <addr>` sets the host listen address (default `0.0.0.0`); it
+is stored as a `bind=<addr>` token next to `fwd=`.
+
+Reconcile semantics: a forwarder is kept while its row, spec and
+resolved target are unchanged; a changed spec or a changed pidfile
+target (stack restart) kills and respawns it. The reconciler only
+kills processes it spawned (cmdline marker + port must match), and
+`ns-pidfile` rows whose pidfile is unreadable produce a sync error,
+not a crash. Forwarder output lands in
+`<state_dir>/logs/ingress-fwd-<port>.log`; runtime bookkeeping in
+`<state_dir>/ingress.json`.
+
+trade-ai's own netns/dockerd stays trade-ai-owned: the project
+declares `fwd=ns-pidfile:<docker-static>/inner.pid:<inner>` rows and
+the neutral layer does the rest - the hand-rolled `port_fwd.py`
+lines in supervisor.sh are superseded by this contract.
+
 ## TTL semantics
 
 `--ttl S` sets `expires_at`; expired rows are deleted lazily at
@@ -138,8 +184,5 @@ service meant to stay.
 
 ## Out of scope (orchestrator-owned follow-ups)
 
-- The neutral ingress/forwarding script that generates host port
-  forwards FROM the registry (replacing trade-ai's hand-rolled
-  port_fwd chain) - coordinated separately.
 - Embedding `reserve()` calls into each repo's deploy scripts -
   rolled out per-repo with the root sessions.
