@@ -1908,7 +1908,7 @@ def _cmd_unregister(args) -> int:
         try:
             mail_files = len(os.listdir(mdir))
         except OSError:
-            mail_files = -1
+            mail_files = None
         shutil.rmtree(mdir, ignore_errors=True)
     mailbox_removed = not os.path.isdir(mdir)
     daemon._decision(
@@ -1929,11 +1929,12 @@ def _cmd_unregister(args) -> int:
         },
     )
     tail = "" if mailbox_removed else " (mailbox dir survived removal!)"
+    files_text = "unknown" if mail_files is None else str(mail_files)
     return _emit(
         args,
         resp,
         ExitCode.OK,
-        f"unregistered {sid} ({mail_files} mailbox file(s), host={host_check}){tail}",
+        f"unregistered {sid} ({files_text} mailbox file(s), host={host_check}){tail}",
     )
 
 
