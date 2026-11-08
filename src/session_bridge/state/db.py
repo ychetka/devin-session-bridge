@@ -68,6 +68,13 @@ from .contract import (
     validate_question_transition,
 )
 from .verdict import (
+    ReleaseNotFound,
+    ReleaseRefusedOwner,
+    ReleaseRemoved,
+    ReleaseVerdict,
+    ReserveConflict,
+    ReserveGranted,
+    ReserveVerdict,
     UnregisterDeleted,
     UnregisterNotFound,
     UnregisterRefusedFreshHeartbeat,
@@ -313,6 +320,31 @@ CREATE TABLE IF NOT EXISTS decision_events (
 -- The read pattern is "latest N for this session/kind".
 CREATE INDEX IF NOT EXISTS ix_decision_events_session
   ON decision_events(session_id, id);
+
+-- Host-level resource registry (task #208, directive 426): the
+-- orchestrator-owned allocation layer that lets self-sufficient
+-- projects declare host resources they hold - host ports, systemd
+-- unit names/prefixes, docker CIDRs, netns handles, external API
+-- accounts - so two projects cannot silently collide on the same
+-- host. The PRIMARY KEY IS the lease: one row per (type, id), so
+-- the atomic reserve is a single INSERT guarded by the constraint,
+-- never check-then-write. expires_at NULL means "held until
+-- released"; a set value is swept lazily on every registry call,
+-- the same TTL pattern as the session GC - no background watcher.
+CREATE TABLE IF NOT EXISTS allocations (
+  resource_type TEXT NOT NULL,
+  resource_id TEXT NOT NULL,
+  project_id TEXT NOT NULL,
+  purpose TEXT,
+  session_id TEXT,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  expires_at INTEGER,
+  PRIMARY KEY (resource_type, resource_id)
+);
+
+CREATE INDEX IF NOT EXISTS ix_allocations_project
+  ON allocations(project_id);
 
 PRAGMA user_version=1;
 """
@@ -2052,6 +2084,208 @@ def list_events(*, session_id=None, bus_only=False, kind=None, limit: int = 50, 
         return con.execute(sql, params).fetchall()
     finally:
         con.close()
+
+
+# --- host-level resource allocations (task #208, directive 426) -----------------
+
+#: Resource classes the registry arbitrates. The set is deliberately
+#: host-scoped: things two projects on this machine can collide on.
+#: ``other`` is the escape hatch for a class not listed - a project
+#: that invents a new collision domain registers it there instead of
+#: staying silent.
+ALLOCATION_TYPES = frozenset(
+    {
+        "tcp_port",
+        "systemd_unit_prefix",
+        "docker_network_cidr",
+        "external_api_account",
+        "netns_id",
+        "other",
+    }
+)
+
+
+def _gc_allocations(con, now: int) -> int:
+    """Drop TTL'd rows whose expiry passed - lazy GC, same pattern as
+    the session sweep: every registry call sweeps first, so an
+    expired lease frees itself on the next caller with no watcher.
+    Callers MUST run this inside the same BEGIN IMMEDIATE that takes
+    the write/read decision, so a freed key is reservable atomically.
+    """
+    return con.execute(
+        "DELETE FROM allocations WHERE expires_at IS NOT NULL AND expires_at<=?",
+        (now,),
+    ).rowcount
+
+
+def reserve(
+    resource_type: str,
+    resource_id: str,
+    project_id: str,
+    *,
+    purpose=None,
+    session_id=None,
+    ttl=None,
+    path=None,
+) -> ReserveVerdict:
+    """Atomically claim one ``(resource_type, resource_id)`` key.
+
+    The PRIMARY KEY is the mutex: the whole verdict is one INSERT
+    inside a single connection - there is no check-then-write window
+    a racer could slip through. A key already held by the SAME
+    project renews (updated_at/expires_at/purpose touched), so a
+    deploy pre-flight calling reserve() on every run is idempotent.
+    A key held by a different project yields ReserveConflict echoing
+    the incumbent row; the caller reports the owner and hard-fails.
+    ``ttl`` seconds sets ``expires_at``; NULL means held-until-
+    released. Raises ValueError on a bad type slug or empty ids.
+    """
+    resource_type = (resource_type or "").strip()
+    resource_id = (resource_id or "").strip()
+    project_id = (project_id or "").strip()
+    if resource_type not in ALLOCATION_TYPES:
+        raise ValueError(f"bad resource_type {resource_type!r}: one of {sorted(ALLOCATION_TYPES)}")
+    if not resource_id:
+        raise ValueError("reserve requires a non-empty resource_id")
+    if not project_id:
+        raise ValueError("reserve requires --project")
+    if ttl is not None and int(ttl) <= 0:
+        raise ValueError("--ttl must be a positive number of seconds")
+    now = _now()
+    expires_at = now + int(ttl) if ttl is not None else None
+
+    def op():
+        con = connect(path)
+        try:
+            con.execute("BEGIN IMMEDIATE")
+            try:
+                _gc_allocations(con, now)
+                row = con.execute(
+                    "SELECT * FROM allocations WHERE resource_type=? AND resource_id=?",
+                    (resource_type, resource_id),
+                ).fetchone()
+                if row is not None and row["project_id"] != project_id:
+                    con.execute("COMMIT")
+                    return ReserveConflict(
+                        owner=row["project_id"],
+                        purpose=row["purpose"],
+                        created_at=row["created_at"],
+                        expires_at=row["expires_at"],
+                    )
+                renewed = row is not None
+                con.execute(
+                    "INSERT INTO allocations"
+                    "(resource_type,resource_id,project_id,purpose,session_id,"
+                    " created_at,updated_at,expires_at)"
+                    " VALUES(?,?,?,?,?,?,?,?)"
+                    " ON CONFLICT(resource_type,resource_id) DO UPDATE SET"
+                    " purpose=excluded.purpose,session_id=excluded.session_id,"
+                    " updated_at=excluded.updated_at,expires_at=excluded.expires_at",
+                    (
+                        resource_type,
+                        resource_id,
+                        project_id,
+                        purpose,
+                        session_id,
+                        now,
+                        now,
+                        expires_at,
+                    ),
+                )
+                con.execute("COMMIT")
+                return ReserveGranted(renewed=renewed, expires_at=expires_at)
+            except BaseException:
+                if con.in_transaction:
+                    con.execute("ROLLBACK")
+                raise
+        finally:
+            con.close()
+
+    return _retry(op)
+
+
+def release(
+    resource_type: str,
+    resource_id: str,
+    project_id: str,
+    *,
+    force: bool = False,
+    path=None,
+) -> ReleaseVerdict:
+    """Drop one allocation. Owner-only by default; ``force`` is the
+    orchestrator's arbitration override for a contested resource -
+    projects must never pass it from deploy scripts (the registry is
+    the shared source of truth, not a courtesy)."""
+    now = _now()
+
+    def op():
+        con = connect(path)
+        try:
+            con.execute("BEGIN IMMEDIATE")
+            try:
+                _gc_allocations(con, now)
+                row = con.execute(
+                    "SELECT project_id FROM allocations WHERE resource_type=? AND resource_id=?",
+                    ((resource_type or "").strip(), (resource_id or "").strip()),
+                ).fetchone()
+                if row is None:
+                    con.execute("COMMIT")
+                    return ReleaseNotFound()
+                owner = row["project_id"]
+                if owner != (project_id or "").strip() and not force:
+                    con.execute("COMMIT")
+                    return ReleaseRefusedOwner(owner=owner)
+                con.execute(
+                    "DELETE FROM allocations WHERE resource_type=? AND resource_id=?",
+                    ((resource_type or "").strip(), (resource_id or "").strip()),
+                )
+                con.execute("COMMIT")
+                return ReleaseRemoved(owner=owner)
+            except BaseException:
+                if con.in_transaction:
+                    con.execute("ROLLBACK")
+                raise
+        finally:
+            con.close()
+
+    return _retry(op)
+
+
+def list_allocations(*, resource_type=None, project_id=None, path=None):
+    """Live allocation rows ordered by type/id. Sweeps expired TTL
+    rows first (same lazy GC as reserve/release), so callers never
+    see a stale lease."""
+    now = _now()
+
+    def op():
+        con = connect(path)
+        try:
+            con.execute("BEGIN IMMEDIATE")
+            try:
+                _gc_allocations(con, now)
+                where = []
+                params: list = []
+                if resource_type is not None:
+                    where.append("resource_type=?")
+                    params.append(resource_type.strip())
+                if project_id is not None:
+                    where.append("project_id=?")
+                    params.append(project_id.strip())
+                sql = "SELECT * FROM allocations"
+                if where:
+                    sql += " WHERE " + " AND ".join(where)
+                sql += " ORDER BY resource_type, resource_id"
+                rows = con.execute(sql, params).fetchall()
+                con.execute("COMMIT")
+                return rows
+            except BaseException:
+                if con.in_transaction:
+                    con.execute("ROLLBACK")
+                raise
+        finally:
+            con.close()
+
+    return _retry(op)
 
 
 # --- message bus: questions ---------------------------------------------------
