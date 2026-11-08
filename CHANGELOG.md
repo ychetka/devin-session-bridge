@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.4.0] - 2026-11-08
+
+Neutral host ingress layer (issue #92, task #209): port forwards
+are now materialized from the allocation registry itself.
+
+### ingress/
+
+- `bridge reserve tcp_port <port> --fwd <spec> [--bind <addr>]`
+  embeds a machine-readable forward declaration into the row's
+  `purpose` (`fwd=`/`bind=` tokens; grammar: `tcp:<host>:<port>`,
+  `ns-pid:<pid>:<port>`, `ns-pidfile:<path>:<port>`).
+- `bridge ingress sync` reconciles detached
+  `session_bridge.ingress.forwarder` processes with the registry:
+  reserve -> listener appears, release -> forwarder removed,
+  changed spec or pidfile target -> respawn. Reconciler state in
+  `<state_dir>/ingress.json`, child logs in
+  `logs/ingress-fwd-<port>.log`, flock-serialized.
+- `bridge ingress status`: desired-vs-running view.
+- `deploy/host-ingress.{service,timer}` + `install_ingress_timer.sh`:
+  30s reconcile cadence, Persistent=true.
+- docs/ALLOCATIONS.md documents the contract; trade-ai's
+  supervisor.sh moves its 5678/8080/8443 chain onto it.
+
 ## [0.2.1] - 2026-11-02
 
 Zero-touch delivery completed: the bridge can now wake idle

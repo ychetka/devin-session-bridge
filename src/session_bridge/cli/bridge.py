@@ -66,6 +66,8 @@ from session_bridge.cli.contract import (
     JsonResponse,
 )
 from session_bridge.daemon import core as daemon
+from session_bridge.ingress import spec as ingress_spec
+from session_bridge.ingress import sync as ingress_sync
 from session_bridge.mailbox import mailbox_dir
 from session_bridge.state import db
 from session_bridge.state.contract import (
@@ -2535,13 +2537,35 @@ def _cmd_reserve(args) -> int:
     the incumbent owner. Deploy scripts treat any non-granted exit
     as a hard fail and escalate to the orchestrator - never retry
     or force their way past a conflict.
+
+    ``--fwd`` (tcp_port only) embeds a machine-readable forward
+    declaration into the stored purpose - the neutral ingress layer
+    materializes a host listener from it (docs/ALLOCATIONS.md).
     """
+    purpose = args.purpose
+    if args.fwd is not None:
+        try:
+            fwd = ingress_spec.parse_fwd_spec(args.fwd, bind=args.bind or ingress_spec.DEFAULT_BIND)
+        except ValueError as e:
+            resp = JsonResponse(status="usage", error=str(e))
+            return _emit(args, resp, ExitCode.USAGE, f"usage: {e}")
+        if args.resource_type != "tcp_port":
+            resp = JsonResponse(status="usage", error="--fwd is only valid for tcp_port")
+            return _emit(args, resp, ExitCode.USAGE, "usage: --fwd is only valid for tcp_port")
+        purpose = ingress_spec.format_purpose(
+            fwd.spec_text,
+            args.bind,
+            args.purpose,
+        )
+    elif args.bind is not None:
+        resp = JsonResponse(status="usage", error="--bind requires --fwd")
+        return _emit(args, resp, ExitCode.USAGE, "usage: --bind requires --fwd")
     try:
         verdict = db.reserve(
             args.resource_type,
             args.resource_id,
             args.project,
-            purpose=args.purpose,
+            purpose=purpose,
             session_id=args.session,
             ttl=args.ttl,
             path=args.db,
@@ -2661,6 +2685,54 @@ def _cmd_allocations(args) -> int:
         + (f" [expires {r['expires_at']}]" if r["expires_at"] else "")
         for r in items
     ]
+    return _emit(args, resp, ExitCode.OK, "\n".join(lines))
+
+
+def _cmd_ingress(args) -> int:
+    """``bridge ingress sync|status``: the neutral host ingress layer.
+
+    sync reconciles running forwarder processes with tcp_port rows
+    carrying a fwd= declaration; status shows desired vs running.
+    """
+    rows = db.list_allocations(resource_type="tcp_port", path=args.db)
+    sdir = _state_dir(args)
+    if args.ingress_action == "sync":
+        summary = ingress_sync.sync(sdir, rows)
+        ok = summary.get("status") == "ok"
+        errors = summary.get("errors", [])
+        resp = JsonResponse(
+            status="ok" if ok else "skipped",
+            data=summary,
+            error=None if ok else summary.get("reason"),
+        )
+        lines = [
+            f"started={summary.get('started', [])} "
+            f"stopped={summary.get('stopped', [])} "
+            f"kept={summary.get('kept', [])} "
+            f"errors={len(errors)}"
+        ]
+        if not ok:
+            lines.append(f"skipped: {summary.get('reason')}")
+        for err in errors:
+            detail = err.get("spec") or err.get("row") or "?"
+            lines.append(f"  port {err.get('port', detail)}: {err['error']}")
+        # partial failures are visible to exit-code-gated callers:
+        # some forwards materialized, some failed -> not a clean OK
+        code = ExitCode.OK if ok and not errors else ExitCode.INTERNAL
+        return _emit(args, resp, code, "\n".join(lines))
+    view = ingress_sync.status(sdir, rows)
+    resp = JsonResponse(status="ok", data=view)
+    if not view["forwards"]:
+        return _emit(args, resp, ExitCode.OK, "no ingress forwards declared")
+    lines = [
+        f"{f['port']} {'UP' if f['alive'] else 'DOWN'} "
+        f"{f['bind']}:{f['port']} -> {f['spec']} pid={f['forwarder_pid']}"
+        for f in view["forwards"]
+    ]
+    for port in view["orphaned"]:
+        lines.append(f"{port} ORPHAN (tracked but row gone)")
+    for err in view.get("row_errors", []):
+        lines.append(f"row {err['row']}: BAD FWD ({err['error']})")
     return _emit(args, resp, ExitCode.OK, "\n".join(lines))
 
 
@@ -4013,6 +4085,18 @@ def _parse_args(argv) -> argparse.Namespace:
     sp.add_argument("--project", required=True, help="owning project id")
     sp.add_argument("--purpose", default=None, help="free-text purpose")
     sp.add_argument(
+        "--fwd",
+        default=None,
+        metavar="SPEC",
+        help="tcp_port only: forward spec the ingress layer materializes "
+        "(tcp:<host>:<port> | ns-pid:<pid>:<port> | ns-pidfile:<path>:<port>)",
+    )
+    sp.add_argument(
+        "--bind",
+        default=None,
+        help="with --fwd: host listen address (default 0.0.0.0)",
+    )
+    sp.add_argument(
         "--session",
         default=None,
         help="reserving session id (audit trail; optional)",
@@ -4046,6 +4130,22 @@ def _parse_args(argv) -> argparse.Namespace:
     sp.add_argument("--type", default=None, help="filter to one resource_type")
     sp.add_argument("--project", default=None, help="filter to one project")
     _add_json(sp)
+
+    # task #209 (issue #92): neutral host ingress - materializes
+    # port forwarders from tcp_port rows carrying a fwd= spec so
+    # `bridge reserve` alone publishes a listener and `release`
+    # removes it. `sync` is the reconcile pass (host-ingress.timer
+    # runs it periodically, deploy scripts may call it directly for
+    # zero-wait publication); `status` is the read-only view.
+    sp = sub.add_parser(
+        "ingress",
+        help="host ingress layer: sync | status",
+    )
+    isub = sp.add_subparsers(dest="ingress_action", required=True)
+    sp_sync = isub.add_parser("sync", help="reconcile forwarders with the registry")
+    _add_json(sp_sync)
+    sp_status = isub.add_parser("status", help="show desired vs running forwards")
+    _add_json(sp_status)
 
     sp = sub.add_parser(
         "questions",
@@ -4173,6 +4273,7 @@ _HANDLERS = {
     "event": _cmd_event,
     "release": _cmd_release,
     "reserve": _cmd_reserve,
+    "ingress": _cmd_ingress,
     "events": _cmd_events,
     "claim": _cmd_claim,
     "finish": _cmd_finish,

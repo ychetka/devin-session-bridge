@@ -1,0 +1,15 @@
+# host-ingress - neutral ingress reconcile pass (template).
+# install_ingress_timer.sh renders @BRIDGE_BIN@/@GLOBAL_ARGS@ and
+# installs this file + host-ingress.timer to
+# ~/.config/systemd/user/. Task #209 / issue #92: materializes
+# port forwarders from tcp_port allocation rows so
+# `bridge reserve ... --fwd ...` is all a project needs to publish
+# a listener.
+[Unit]
+Description=sessions-bridge host ingress reconcile (fwd= allocations -> forwarder processes)
+After=default.target
+
+[Service]
+Type=oneshot
+ExecStart=@BRIDGE_BIN@@GLOBAL_ARGS@ ingress sync
+Environment=PYTHONUNBUFFERED=1
