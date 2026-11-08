@@ -1981,6 +1981,12 @@ def _cmd_unregister(args) -> int:
             if tombstone is not None:
                 shutil.rmtree(tombstone, ignore_errors=True)
                 tombstone = None
+            # the row is gone: any <sid> dir left (e.g. the tombstone
+            # rename failed earlier, or a writer slipped files into a
+            # recreated dir) is orphaned dead-session mail - remove it
+            # instead of leaving an undrainable artifact behind
+            if os.path.isdir(mdir):
+                shutil.rmtree(mdir, ignore_errors=True)
             restored = "removed"
         resp = JsonResponse(
             session=sid,

@@ -1451,23 +1451,25 @@ def run(
             # still ages the stamp - the external watchdog reads
             # staleness as the hang signal
             _write_heartbeat(state_directory)
+            # per-pass timing instrumentation (task #203, audit
+            # finding): the loop is a sequence of full-scan passes;
+            # without durations a pass quietly outgrowing the
+            # interval is invisible until the fleet looks stalled.
+            # One consolidated decision event per iteration keeps
+            # the journal grep-able without per-pass line spam. The
+            # accumulator is bound before try so the finally-emit can
+            # never see an unbound name.
+            timings: dict[str, float] = {}
+
+            def _timed(name, fn, *a, _acc=timings):
+                start = time.monotonic()
+                try:
+                    return fn(*a)
+                finally:
+                    _acc[name] = round((time.monotonic() - start) * 1000, 1)
+
             try:
                 now = int(time.time())
-                # per-pass timing instrumentation (task #203, audit
-                # finding): the loop is a sequence of full-scan passes;
-                # without durations a pass quietly outgrowing the
-                # interval is invisible until the fleet looks stalled.
-                # One consolidated decision event per iteration keeps
-                # the journal grep-able without per-pass line spam.
-                timings: dict[str, float] = {}
-
-                def _timed(name, fn, *a, _acc=timings):
-                    start = time.monotonic()
-                    try:
-                        return fn(*a)
-                    finally:
-                        _acc[name] = round((time.monotonic() - start) * 1000, 1)
-
                 _timed("schedule", _schedule_pass, db_path, state_directory, now)
                 _timed("relay", _relay_pass, db_path, queue_dir, state_directory)
                 # one mailbox-dir scan per pass shared by the wake and

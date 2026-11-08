@@ -95,7 +95,13 @@ class NdjsonBuffer:
 
 
 def rpc_request(req_id: int, method: str, params: dict | None = None) -> dict:
-    """The JSON-RPC 2.0 request envelope both transports send."""
+    """The canonical JSON-RPC 2.0 request envelope.
+
+    The wake transport serializes requests through this helper; the
+    stdio client keeps its pydantic ``JsonRpcRequest`` model for the
+    same wire shape (client_method enum validation is client-side
+    contract surface, not transport code).
+    """
     return {"jsonrpc": "2.0", "id": req_id, "method": method, "params": params or {}}
 
 
