@@ -447,54 +447,79 @@ def _stale_sessions(db_path, now: int):
     return db.stale_unmanaged_sessions(now, path=db_path)
 
 
+def mark_dead(row, db_path, state_directory, notify_send, now: int, *, tag: str = "") -> None:
+    """Apply the dead verdict to one ``stale_unmanaged_sessions`` row.
+
+    Shared by the daemon sweep pass and the CLI lazy GC (task #207
+    item f) so the two paths cannot drift on the effect block:
+    CAS demotion to ``dead``, live-task requeue, orchestrator
+    notify-send, decision journal. ``tag`` distinguishes the caller
+    in the detail line (the CLI passes ``"gc "``).
+
+    Ghost-leg guard (hb=None): ``sessions.updated_at`` is the only
+    liveness baseline a no-heartbeat-row registration has, and no
+    task lifecycle write bumps it - a silently-working unmanaged
+    worker past GHOST_TTL would be killed mid-task and its running
+    task requeued into duplicate execution. So a ghost holding a
+    live task is NOT demoted here: lease recovery owns the task
+    first, and once nothing is live the next pass removes the
+    registration. The heartbeat leg keeps the classic verdict
+    (silent 120s = dead, task requeued immediately).
+    """
+    sid = row["sid"]
+    age = now - int(row["seen"])
+    # the scan carries two legs: hb=None means the no-heartbeat-row
+    # ghost class (GHOST_TTL), a stamped-but-silent heartbeat is the
+    # classic signal - say which one fired in the detail
+    ghost = row["hb"] is None
+    marker = " ghost" if ghost else ""
+    limit = db.GHOST_TTL_SECONDS if ghost else db.HEARTBEAT_STALE_SECONDS
+    if row["role"] == SessionRole.ORCHESTRATOR.value:
+        if db.set_session_status(sid, SessionStatus.DEAD, path=db_path):
+            notify_send(
+                "sessions-bridge ORCHESTRATOR DEAD",
+                f"{sid}: heartbeat silent {age}s (limit {limit}s)",
+            )
+            _decision(
+                state_directory,
+                "orchestrator_dead",
+                sid,
+                f"{tag}heartbeat_age={age}s{marker} notify-send sent",
+            )
+        return
+    if ghost and db.get_live_task(sid, path=db_path) is not None:
+        # not journaled: a live task past GHOST_TTL is steady state
+        # until its lease folds, and a per-pass event would spam the
+        # decisions file - lease recovery's task_recovered already
+        # documents the fold that unblocks this registration
+        return
+    if not db.set_session_status(sid, SessionStatus.DEAD, path=db_path):
+        return  # already dead or raced - handled before
+    task = db.get_live_task(sid, path=db_path)
+    outcome = "no live task"
+    if task is not None:
+        result = db.requeue_dead_worker(task["id"], note=requeue_note(task["id"]), path=db_path)
+        outcome = f"task={task['id']} -> {result.value if result is not None else 'unchanged'}"
+    _decision(
+        state_directory,
+        "worker_dead",
+        sid,
+        f"{tag}heartbeat_age={age}s{marker} {outcome}",
+    )
+
+
 def _sweep_pass(db_path, state_directory, notify_send, now: int) -> None:
     """Heartbeat staleness sweep.
 
     A silent orchestrator raises one deduped OS notification. A dead
     worker's live task is requeued with the reset-to-base instruction.
     Both fire only on the ``active > dead`` transition (the
-    ``set_session_status`` CAS), so a session that stays dead is never
-    re-notified or re-requeued on later passes.
+    ``set_session_status`` CAS inside ``mark_dead``), so a session
+    that stays dead is never re-notified or re-requeued on later
+    passes.
     """
     for row in _stale_sessions(db_path, now):
-        sid = row["sid"]
-        age = now - int(row["seen"])
-        # the scan carries two legs: hb=None means the no-heartbeat-
-        # row ghost class (GHOST_TTL), a stamped-but-silent heartbeat
-        # is the classic signal - say which one fired in the detail
-        ghost = " ghost" if row["hb"] is None else ""
-        if row["role"] == SessionRole.ORCHESTRATOR.value:
-            if db.set_session_status(sid, SessionStatus.DEAD, path=db_path):
-                notify_send(
-                    "sessions-bridge ORCHESTRATOR DEAD",
-                    f"{sid}: heartbeat silent {age}s (limit {db.HEARTBEAT_STALE_SECONDS}s)",
-                )
-                _decision(
-                    state_directory,
-                    "orchestrator_dead",
-                    sid,
-                    f"heartbeat_age={age}s{ghost} notify-send sent",
-                )
-            continue
-        if not db.set_session_status(sid, SessionStatus.DEAD, path=db_path):
-            continue  # already dead or raced - handled before
-        task = db.get_live_task(sid, path=db_path)
-        if task is None:
-            _decision(
-                state_directory,
-                "worker_dead",
-                sid,
-                f"heartbeat_age={age}s{ghost} no live task",
-            )
-            continue
-        result = db.requeue_dead_worker(task["id"], note=requeue_note(task["id"]), path=db_path)
-        outcome = result.value if result is not None else "unchanged"
-        _decision(
-            state_directory,
-            "worker_dead",
-            sid,
-            f"heartbeat_age={age}s{ghost} task={task['id']} -> {outcome}",
-        )
+        mark_dead(row, db_path, state_directory, notify_send, now)
 
 
 # Hard ceiling for one _wake_pass: the poll loop must never stall on

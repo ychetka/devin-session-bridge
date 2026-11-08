@@ -2018,18 +2018,23 @@ def record_event(session_id, kind: str, body: str, *, task_id=None, path=None) -
     return _retry(op)
 
 
-def list_events(*, session_id=None, kind=None, limit: int = 50, path=None):
+def list_events(*, session_id=None, bus_only=False, kind=None, limit: int = 50, path=None):
     """Latest ``decision_events`` rows, newest first.
 
-    ``session_id`` and ``kind`` filter when given; ``limit`` caps
-    the page (the table is append-only and never purged, so an
-    uncapped read would grow with fleet history).
+    ``session_id`` and ``kind`` filter when given; ``bus_only``
+    restricts to rows with ``session_id IS NULL`` (the ``-``
+    bus-level records - ``record_event`` writes them for decisions
+    not owned by one session). ``limit`` caps the page and is
+    floored at 1: the table is append-only and never purged, and a
+    negative SQLite LIMIT reads unbounded.
     """
     where = []
     params: list = []
     if session_id is not None:
         where.append("session_id=?")
         params.append(session_id)
+    elif bus_only:
+        where.append("session_id IS NULL")
     if kind is not None:
         where.append("kind=?")
         params.append(kind.strip().lower())
@@ -2037,7 +2042,7 @@ def list_events(*, session_id=None, kind=None, limit: int = 50, path=None):
     if where:
         sql += " WHERE " + " AND ".join(where)
     sql += " ORDER BY id DESC LIMIT ?"
-    params.append(int(limit))
+    params.append(max(1, int(limit)))
     con = connect(path)
     try:
         return con.execute(sql, params).fetchall()

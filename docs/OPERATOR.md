@@ -545,7 +545,12 @@ Each pass (~5s, with up to ~1s startup jitter):
    `sessions.updated_at` (v0.3.16: previously the sweep required a
    heartbeat row, so ghosts were invisible to it). The same scan runs
    lazily inside `bridge status`, `bridge wait` and the `_work` pump,
-   so CLI traffic alone also GCs dead registrations. Managed sessions
+   so CLI traffic alone also GCs dead registrations. A ghost that
+   still holds a LIVE task is NOT demoted on the ghost leg -
+   `sessions.updated_at` does not track task liveness, so a
+   silently-working unmanaged worker past GHOST_TTL would die
+   mid-task into duplicate execution; lease recovery folds the task
+   first and the registration dies next pass. Managed sessions
    are excluded: between turns a managed drain-mode session is
    stale-hb by design, and that signal
    is the wake trigger - treating it as death would fail every
@@ -947,7 +952,7 @@ Global flags: `--db PATH` (`SESSIONS_BRIDGE_DB`), `--queue-dir DIR`
 | `bridge notice <sid> "<text>"` | send a registered informational notice - same delivery machinery as directive, but kind `notice` means "read and incorporate" rather than "obey": the path for worker status and task reports (v0.3.9). |
 | `bridge heartbeat <sid>` | refresh the session's liveness record (bumps the heartbeat generation; no takeover semantics). |
 | `bridge event <sid\|-> <kind> "<text>" [--task ID]` | append a row to the durable `decision_events` log (v0.3.16): kinds are lowercase slugs (`contract`, `plan_delta`, `review_verdict`, `milestone`, ... matching `^[a-z][a-z0-9_]{0,39}$`); `-` as the session id records a bus-level decision with no owning session. Survives restarts - contracts and verdicts no longer live in session memory only. |
-| `bridge events [--session SID] [--kind K] [--last N]` | read the `decision_events` log newest-first (default 50 rows; `--json` for machine use). |
+| `bridge events [--session SID\|-] [--kind K] [--last N]` | read the `decision_events` log newest-first (default 50 rows, `--last` >= 1; `--session -` filters the bus-level rows with no owning session; `--json` for machine use). |
 | `bridge questions list [--session SID] [--task ID]` | list pending worker questions. |
 | `bridge questions claim <qid> --claimant SID` | atomically claim a question for answering. |
 | `bridge questions answer <qid> --claimant SID "text"` | answer a claimed question and notify the asker. |

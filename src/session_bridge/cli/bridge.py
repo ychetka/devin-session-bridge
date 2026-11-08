@@ -457,37 +457,7 @@ def _gc_dead_sessions(args) -> None:
     """
     now = int(time.time())
     for row in db.stale_unmanaged_sessions(now, path=args.db):
-        sid = row["sid"]
-        age = now - int(row["seen"])
-        ghost = " ghost" if row["hb"] is None else ""
-        if row["role"] == SessionRole.ORCHESTRATOR.value:
-            if db.set_session_status(sid, SessionStatus.DEAD, path=args.db):
-                _notify_send(
-                    "sessions-bridge ORCHESTRATOR DEAD",
-                    f"{sid}: heartbeat silent {age}s (limit {db.HEARTBEAT_STALE_SECONDS}s)",
-                )
-                daemon._decision(
-                    _state_dir(args),
-                    "orchestrator_dead",
-                    sid,
-                    f"gc heartbeat_age={age}s{ghost} notify-send sent",
-                )
-            continue
-        if not db.set_session_status(sid, SessionStatus.DEAD, path=args.db):
-            continue  # already dead or raced - handled before
-        task = db.get_live_task(sid, path=args.db)
-        outcome = "no live task"
-        if task is not None:
-            result = db.requeue_dead_worker(
-                task["id"], note=daemon.requeue_note(task["id"]), path=args.db
-            )
-            outcome = f"task={task['id']} -> {result.value if result else 'unchanged'}"
-        daemon._decision(
-            _state_dir(args),
-            "worker_dead",
-            sid,
-            f"gc heartbeat_age={age}s{ghost} {outcome}",
-        )
+        daemon.mark_dead(row, args.db, _state_dir(args), _notify_send, now, tag="gc ")
 
 
 def pump(args) -> dict:
@@ -2517,7 +2487,21 @@ def _cmd_event(args) -> int:
 
 def _cmd_events(args) -> int:
     """``bridge events [--session SID] [--kind K] [--last N]``: read the log."""
-    rows = db.list_events(session_id=args.session, kind=args.kind, limit=args.last, path=args.db)
+    if args.last < 1:
+        return _emit(
+            args,
+            JsonResponse(status="error", error="--last must be >= 1"),
+            ExitCode.USAGE,
+            "events: --last must be >= 1",
+        )
+    bus_only = args.session == "-"
+    rows = db.list_events(
+        session_id=None if bus_only else args.session,
+        bus_only=bus_only,
+        kind=args.kind,
+        limit=args.last,
+        path=args.db,
+    )
     items = [
         {
             "id": r["id"],
