@@ -2176,3 +2176,89 @@ def test_item198_gwt9_unregister_refusals_inside_txn(db_path):
     out = db.unregister_session("s9", force=True, path=db_path)
     assert isinstance(out, UnregisterDeleted) and out.counts["sessions"] == 1
     assert db.get_session("s9", path=db_path) is None
+
+
+# --- task #207: lazy GC scan + durable decision_events --------------------------
+
+
+def _session_row(path, sid, *, mode="unmanaged", updated_at=None, heartbeat=True):
+    """A sessions row via register; heartbeat row dropped unless asked.
+
+    ``db.register`` stamps the first heartbeat - the ghost class is
+    a sessions row WITHOUT one (hook upsert / crashed before the
+    first stamp), so the helper deletes the row for the no-hb legs.
+    """
+    res = db.register(sid, f"/repo/{sid}", path=path)
+    assert res.accepted
+    if mode != "unmanaged":
+        _exec(path, "UPDATE sessions SET mode=? WHERE session_id=?", (mode, sid))
+    if updated_at is not None:
+        _exec(path, "UPDATE sessions SET updated_at=? WHERE session_id=?", (updated_at, sid))
+    if not heartbeat:
+        _exec(path, "DELETE FROM worker_heartbeats WHERE session_id=?", (sid,))
+
+
+def test_item207_gwt1_stale_scan_sees_ghosts(db_path):
+    """[ITEM-207.GWT-1] the shared stale scan carries BOTH unmanaged
+    dead signals: a stamped heartbeat gone silent past
+    HEARTBEAT_STALE_SECONDS, and NO heartbeat row with updated_at
+    past GHOST_TTL_SECONDS - the register-then-vanish ghost class
+    the old JOIN dropped forever (impossible-vibraphone blind spot)."""
+    now = int(time.time())
+    ghost = now - db.GHOST_TTL_SECONDS - 60
+    stale_hb = now - db.HEARTBEAT_STALE_SECONDS - 60
+
+    # ghost: no hb row, updated_at past the ghost TTL -> stale
+    _session_row(db_path, "g_old", updated_at=ghost, heartbeat=False)
+    # fresh ghost: no hb row but recent -> alive (the TTL is a grace
+    # window for live unmanaged sessions that never heartbeat)
+    _session_row(db_path, "g_fresh", updated_at=now - 60, heartbeat=False)
+    # stamped-then-silent: the classic sweep signal
+    _session_row(db_path, "h_stale", updated_at=stale_hb)
+    _exec(
+        db_path,
+        "UPDATE worker_heartbeats SET last_seen_at=? WHERE session_id=?",
+        (stale_hb, "h_stale"),
+    )
+    # stamped and fresh -> alive
+    _session_row(db_path, "h_fresh", updated_at=now - 60)
+    # managed session excluded even with a stale heart
+    _session_row(db_path, "m_stale", mode="managed", updated_at=stale_hb)
+    _exec(
+        db_path,
+        "UPDATE worker_heartbeats SET last_seen_at=? WHERE session_id=?",
+        (stale_hb, "m_stale"),
+    )
+
+    sids = {r["sid"]: r for r in db.stale_unmanaged_sessions(now, path=db_path)}
+    assert set(sids) == {"g_old", "h_stale"}
+    assert sids["g_old"]["hb"] is None  # the ghost leg is distinguishable
+    assert sids["h_stale"]["hb"] == stale_hb
+
+
+def test_item207_gwt2_decision_events_append_and_read(db_path):
+    """[ITEM-207.GWT-2] record_event appends durable rows; list_events
+    returns newest-first with session/kind filters; bad kinds are
+    refused at the gate (typo namespaces would splinter the log)."""
+    eid = db.record_event("orc", "contract", "task 207 signed", task_id=207, path=db_path)
+    db.record_event("orc", "review_verdict", "PR 87 approved", path=db_path)
+    db.record_event(None, "plan_delta", "fleet halt lifted", path=db_path)
+    db.record_event("w1", "contract", "task 210 signed", path=db_path)
+
+    all_rows = db.list_events(path=db_path)
+    assert [r["id"] for r in all_rows] == sorted((r["id"] for r in all_rows), reverse=True)
+    assert all_rows[0]["kind"] == "contract" and all_rows[0]["session_id"] == "w1"
+
+    orc = db.list_events(session_id="orc", path=db_path)
+    assert len(orc) == 2 and orc[-1]["task_id"] == 207
+    contracts = db.list_events(kind="contract", path=db_path)
+    assert {r["session_id"] for r in contracts} == {"orc", "w1"}
+    bus = db.list_events(session_id=None, path=db_path)
+    assert len(bus) == len(all_rows)  # no filter reads everything
+    assert db.list_events(kind="plan_delta", path=db_path)[0]["session_id"] is None
+    assert isinstance(eid, int) and eid > 0
+
+    with pytest.raises(ValueError):
+        db.record_event("orc", "BAD KIND!", "x", path=db_path)
+    with pytest.raises(ValueError):
+        db.record_event("orc", "contract", "   ", path=db_path)

@@ -108,6 +108,17 @@ NOTIFY_DEDUP_SECONDS = 300
 HEARTBEAT_INTERVAL_SECONDS = 60
 HEARTBEAT_STALE_SECONDS = 2 * HEARTBEAT_INTERVAL_SECONDS
 
+#: Liveness TTL for unmanaged sessions that NEVER stamped a
+#: heartbeat - the register-then-vanish ghost class. With no
+#: worker_heartbeats row the only liveness evidence left is
+#: sessions.updated_at, and an unmanaged session owes the bus no
+#: heartbeat duty, so the TTL is deliberately generous (24h): a live
+#: unmanaged session idles freely, a dead one's row expires on the
+#: next daemon sweep or lazy CLI GC (task #207 item f;
+#: impossible-vibraphone sat 'active' 38h on exactly this blind
+#: spot). Env-tunable via SESSIONS_BRIDGE_GHOST_TTL.
+GHOST_TTL_SECONDS = int(os.environ.get("SESSIONS_BRIDGE_GHOST_TTL", 24 * 3600))
+
 _BUSY_BASE_DELAY = 0.1
 
 # Live statuses as a SQL literal list, derived from the contract so the
@@ -281,6 +292,27 @@ CREATE TABLE IF NOT EXISTS wake_state (
   mail_escalated_at INTEGER,
   updated_at INTEGER NOT NULL
 );
+
+-- Durable append-only event/decision log (task #207 item g, audit
+-- SPOF finding): orchestrator and session-side decisions -
+-- contracts signed, PLAN_DELTAs, review verdicts, milestones -
+-- persisted in the bus's single source of truth instead of session
+-- memory, so a session restart loses no decision history. Strictly
+-- write-once: no UPDATE/DELETE writers exist by design; unregister
+-- spares the rows the same way it spares audit_events. session_id
+-- is nullable so bus-level (non-session-scoped) decisions fit.
+CREATE TABLE IF NOT EXISTS decision_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id TEXT,
+  kind TEXT NOT NULL,
+  body TEXT NOT NULL,
+  task_id INTEGER,
+  created_at INTEGER NOT NULL
+);
+
+-- The read pattern is "latest N for this session/kind".
+CREATE INDEX IF NOT EXISTS ix_decision_events_session
+  ON decision_events(session_id, id);
 
 PRAGMA user_version=1;
 """
@@ -1900,6 +1932,117 @@ def heartbeat(session_id: str, *, path=None) -> int:
             con.close()
 
     return _retry(op)
+
+
+def stale_unmanaged_sessions(now: int, *, path=None):
+    """Unmanaged sessions past their liveness TTL (shared scan).
+
+    One LEFT-JOIN query carries BOTH unmanaged dead signals (task
+    #207 item f): a stamped heartbeat gone silent past
+    ``HEARTBEAT_STALE_SECONDS`` - the daemon sweep's classic
+    leg - and NO heartbeat row at all with ``sessions.updated_at``
+    past ``GHOST_TTL_SECONDS`` - the register-then-vanish ghost
+    class the old ``JOIN`` scan structurally could not see
+    (impossible-vibraphone sat 'active' 38h on that blind spot: a
+    hook upsert creates the sessions row without a heartbeat, so the
+    join dropped it forever).
+
+    ``seen`` is the baseline the age is measured against
+    (``last_seen_at`` when stamped, ``updated_at`` for ghosts);
+    ``hb`` is the raw last_seen_at (NULL distinguishes the ghost
+    leg for callers that report it). Managed sessions are excluded
+    deliberately (item_17): a managed drain-mode session is
+    stale-hb between turns BY DESIGN - its liveness verdict is the
+    acp-host no_session streak, not heartbeat age.
+    """
+    con = connect(path)
+    try:
+        return con.execute(
+            "SELECT s.session_id AS sid, s.role AS role, s.status AS status,"
+            " COALESCE(wh.last_seen_at, s.updated_at) AS seen,"
+            " wh.last_seen_at AS hb"
+            " FROM sessions s"
+            " LEFT JOIN worker_heartbeats wh ON wh.session_id=s.session_id"
+            " WHERE COALESCE(s.mode,'unmanaged')<>?"
+            " AND (wh.last_seen_at<=?"
+            "      OR (wh.last_seen_at IS NULL AND s.updated_at<=?))"
+            " ORDER BY s.session_id",
+            (
+                SessionMode.MANAGED.value,
+                now - HEARTBEAT_STALE_SECONDS,
+                now - GHOST_TTL_SECONDS,
+            ),
+        ).fetchall()
+    finally:
+        con.close()
+
+
+#: Event-kind vocabulary gate for ``record_event``: a lowercase slug
+#: keeps ``bridge events --kind`` filters and SQL grouping usable -
+#: free-form kinds would splinter the log into typo namespaces.
+_EVENT_KIND = re.compile(r"^[a-z][a-z0-9_]{0,39}$")
+
+
+def record_event(session_id, kind: str, body: str, *, task_id=None, path=None) -> int:
+    """Append one row to the durable ``decision_events`` log.
+
+    Write-once by design (task #207 item g): there is deliberately
+    no update or delete writer - the log is the restart-proof home
+    for decisions that used to live in session memory only
+    (contracts, PLAN_DELTAs, review verdicts). ``session_id`` may be
+    None for bus-level decisions not owned by one session.
+    """
+    kind = (kind or "").strip().lower()
+    if not _EVENT_KIND.match(kind):
+        raise ValueError(
+            f"bad event kind {kind!r}: use a lowercase slug (letters/digits/underscore, 1-40 chars)"
+        )
+    body = (body or "").strip()
+    if not body:
+        raise ValueError("record_event requires non-empty body")
+    ts = _now()
+
+    def op():
+        con = connect(path)
+        try:
+            cur = con.execute(
+                "INSERT INTO decision_events"
+                "(session_id,kind,body,task_id,created_at)"
+                " VALUES (?,?,?,?,?)",
+                (session_id, kind, body, task_id, ts),
+            )
+            return int(cur.lastrowid)
+        finally:
+            con.close()
+
+    return _retry(op)
+
+
+def list_events(*, session_id=None, kind=None, limit: int = 50, path=None):
+    """Latest ``decision_events`` rows, newest first.
+
+    ``session_id`` and ``kind`` filter when given; ``limit`` caps
+    the page (the table is append-only and never purged, so an
+    uncapped read would grow with fleet history).
+    """
+    where = []
+    params: list = []
+    if session_id is not None:
+        where.append("session_id=?")
+        params.append(session_id)
+    if kind is not None:
+        where.append("kind=?")
+        params.append(kind.strip().lower())
+    sql = "SELECT * FROM decision_events"
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY id DESC LIMIT ?"
+    params.append(int(limit))
+    con = connect(path)
+    try:
+        return con.execute(sql, params).fetchall()
+    finally:
+        con.close()
 
 
 # --- message bus: questions ---------------------------------------------------

@@ -429,7 +429,12 @@ def _relay_pass(db_path, queue_dir, state_directory) -> None:
 
 
 def _stale_sessions(db_path, now: int):
-    """Unmanaged sessions whose heartbeat is older than the limit.
+    """Unmanaged sessions past their liveness TTL.
+
+    Delegates to the shared ``db.stale_unmanaged_sessions`` scan
+    (task #207 item f): the stamped-heartbeat leg is the classic
+    sweep signal, the no-heartbeat-row leg catches the
+    register-then-vanish ghost class the old JOIN could not see.
 
     Managed sessions are excluded deliberately (item_17): between
     turns a managed drain-mode session is stale-hb by design - that
@@ -439,21 +444,7 @@ def _stale_sessions(db_path, now: int):
     repeated wake ``no_session`` outcomes mark the session dead in
     ``_wake_pass`` instead.
     """
-    cutoff = now - db.HEARTBEAT_STALE_SECONDS
-    con = db.connect(db_path)
-    try:
-        return con.execute(
-            "SELECT s.session_id AS sid, s.role AS role, s.status AS status,"
-            " wh.last_seen_at AS seen"
-            " FROM sessions s"
-            " JOIN worker_heartbeats wh ON wh.session_id=s.session_id"
-            " WHERE wh.last_seen_at<=?"
-            " AND COALESCE(s.mode,'unmanaged')<>?"
-            " ORDER BY s.session_id",
-            (cutoff, SessionMode.MANAGED.value),
-        ).fetchall()
-    finally:
-        con.close()
+    return db.stale_unmanaged_sessions(now, path=db_path)
 
 
 def _sweep_pass(db_path, state_directory, notify_send, now: int) -> None:
@@ -468,6 +459,10 @@ def _sweep_pass(db_path, state_directory, notify_send, now: int) -> None:
     for row in _stale_sessions(db_path, now):
         sid = row["sid"]
         age = now - int(row["seen"])
+        # the scan carries two legs: hb=None means the no-heartbeat-
+        # row ghost class (GHOST_TTL), a stamped-but-silent heartbeat
+        # is the classic signal - say which one fired in the detail
+        ghost = " ghost" if row["hb"] is None else ""
         if row["role"] == SessionRole.ORCHESTRATOR.value:
             if db.set_session_status(sid, SessionStatus.DEAD, path=db_path):
                 notify_send(
@@ -478,7 +473,7 @@ def _sweep_pass(db_path, state_directory, notify_send, now: int) -> None:
                     state_directory,
                     "orchestrator_dead",
                     sid,
-                    f"heartbeat_age={age}s notify-send sent",
+                    f"heartbeat_age={age}s{ghost} notify-send sent",
                 )
             continue
         if not db.set_session_status(sid, SessionStatus.DEAD, path=db_path):
@@ -489,7 +484,7 @@ def _sweep_pass(db_path, state_directory, notify_send, now: int) -> None:
                 state_directory,
                 "worker_dead",
                 sid,
-                f"heartbeat_age={age}s no live task",
+                f"heartbeat_age={age}s{ghost} no live task",
             )
             continue
         result = db.requeue_dead_worker(task["id"], note=requeue_note(task["id"]), path=db_path)
@@ -498,7 +493,7 @@ def _sweep_pass(db_path, state_directory, notify_send, now: int) -> None:
             state_directory,
             "worker_dead",
             sid,
-            f"heartbeat_age={age}s task={task['id']} -> {outcome}",
+            f"heartbeat_age={age}s{ghost} task={task['id']} -> {outcome}",
         )
 
 
@@ -1054,6 +1049,48 @@ def _lease_renew_pass(db_path, state_directory, now: int) -> None:
             )
 
 
+def _recovery_pass(db_path, state_directory, notify_send) -> None:
+    """Lease-expiry recovery - the daemon owns the liveness leg (task #207 b).
+
+    ``recover_stale`` used to fire only lazily inside the CLI
+    ``_work`` pump and a session-start hook, so a fleet with zero
+    CLI traffic left expired leases frozen forever - the split-brain
+    recovery-ownership gap the audit flagged. The pass runs right
+    after ``_lease_renew_pass`` so verifiably-busy tasks get their
+    renewal first and only genuinely lapsed leases fold here.
+
+    Effects mirror the CLI pump's recover leg: a requeued task is a
+    routine journal line, a terminal FAILED task additionally pings
+    the operator via notify-send once (``mark_notified`` dedups
+    across the daemon and any racing CLI pump - the CLI leg stays as
+    a fallback for daemon-down operation and is idempotent by CAS).
+    """
+    for tid in db.recover_stale(path=db_path):
+        row = db.get_task(tid, path=db_path)
+        if row is None:
+            continue
+        if row["status"] != TaskStatus.FAILED.value:
+            _decision(
+                state_directory,
+                "task_recovered",
+                row["session_id"],
+                f"task={tid} requeued (lease expired)",
+            )
+            continue
+        detail = "lease expired; attempts exhausted"
+        if db.mark_notified(tid, path=db_path):
+            notify_send(
+                "sessions-bridge FAILED",
+                f"{row['session_id']}: {detail}",
+            )
+        _decision(
+            state_directory,
+            "task_recovered",
+            row["session_id"],
+            f"task={tid} -> failed ({detail})",
+        )
+
+
 def _mail_stall_pass(
     db_path,
     state_directory,
@@ -1488,6 +1525,10 @@ def run(
                     pending,
                 )
                 _timed("lease_renew", _lease_renew_pass, db_path, state_directory, now)
+                # recovery runs AFTER lease_renew: verifiably-busy
+                # tasks renew first, only genuinely lapsed leases
+                # fold into recover_stale here (task #207 item b)
+                _timed("recovery", _recovery_pass, db_path, state_directory, notify)
                 _timed("sweep", _sweep_pass, db_path, state_directory, notify, now)
                 stall_age = _timed(
                     "mail_stall",
