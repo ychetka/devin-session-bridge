@@ -38,6 +38,7 @@ from session_bridge.state.contract import (
     TaskStatus,
     Transport,
 )
+from session_bridge.state.verdict import UnregisterNotFound
 
 SID = "s1"
 
@@ -2604,3 +2605,144 @@ def test_item198_gwt7_verify_failure_proceeds(env, monkeypatch, capsys):
     assert rc == ExitCode.OK
     assert out["data"]["host_check"] == "verify_failed:attach_failed"
     assert db.get_session(SID, path=env.db) is None
+
+
+# --- item_203: unregister mailbox tombstone (audit F1) -------------------------
+
+
+def test_item203_gwt1_refusal_restores_tombstoned_mailbox(env, capsys):
+    """[ITEM-203.GWT-1] a refused unregister must leave the mailbox
+    untouched: the dir is tombstone-renamed before the db call and
+    restored on refusal - the msg files are back under <sid>."""
+    _ghost(env)
+    db.notify(SID, NotificationKind.DISARM, "bye", path=env.db)
+    _mailbox(env)
+    _task(env)  # live task refuses
+
+    rc, _out = _run(["unregister", SID, "--json"], capsys)
+    assert rc == ExitCode.CONFLICT
+    mdir = Path(env.qdir) / SID
+    assert mdir.is_dir() and (mdir / "msg_1.txt").exists()
+    # no tombstone left behind
+    assert not list(env.qdir.glob(".unregistered-*"))
+
+
+def test_item203_gwt2_recreated_mailbox_dir_survives(env, monkeypatch, capsys):
+    """[ITEM-203.GWT-2] the F1 race: a same-sid writer (re-register,
+    foreign relay) creates a FRESH <sid> dir during the delete. The
+    pre-delete mailbox went to the tombstone and is removed; the new
+    dir belongs to the post-delete world and must survive - the old
+    code's late rmtree would have wiped it."""
+    _ghost(env)
+    db.notify(SID, NotificationKind.DISARM, "bye", path=env.db)
+    _mailbox(env)
+
+    orig = db.unregister_session
+
+    def racing_unregister(sid, *, force=False, path=None):
+        verdict = orig(sid, force=force, path=path)
+        # a writer materializes a fresh mailbox mid-delete
+        fresh = Path(env.qdir) / sid
+        fresh.mkdir(parents=True, exist_ok=True)
+        (fresh / "msg_99.txt").write_text("notification_id: 99\nkind: notice\n\nnew")
+        return verdict
+
+    monkeypatch.setattr(bridge.db, "unregister_session", racing_unregister)
+
+    rc, out = _run(["unregister", SID, "--json"], capsys)
+    assert rc == ExitCode.OK
+    assert out["data"]["mailbox_tombstoned"] is True
+    assert out["data"]["mailbox_dir_recreated"] is True
+    assert out["data"]["mailbox_files_removed"] == 1  # only the pre-delete mail
+    mdir = Path(env.qdir) / SID
+    assert (mdir / "msg_99.txt").exists()  # post-delete mail survives
+    assert not (mdir / "msg_1.txt").exists()  # pre-delete mail is gone
+    assert not list(env.qdir.glob(".unregistered-*"))
+
+
+def test_item203_gwt3_delete_exception_restores_mailbox(env, monkeypatch, capsys):
+    """[ITEM-203.GWT-3] a db.unregister_session crash must not strand
+    the parked mailbox: the registration is intact (delete never
+    committed), so the tombstone is restored before the error
+    surfaces - review W1: restore was only wired to verdict paths."""
+    _ghost(env)
+    _mailbox(env)
+
+    def boom(sid, *, force=False, path=None):
+        raise RuntimeError("db exploded mid-delete")
+
+    monkeypatch.setattr(bridge.db, "unregister_session", boom)
+    rc, out = _run(["unregister", SID, "--json"], capsys)
+    assert rc == ExitCode.INTERNAL and out["status"] == "internal"
+    mdir = Path(env.qdir) / SID
+    assert (mdir / "msg_1.txt").exists()  # mail back in place
+    assert not list(env.qdir.glob(".unregistered-*"))
+    assert db.get_session(SID, path=env.db) is not None  # nothing deleted
+
+
+def test_item203_gwt4_concurrent_not_found_drops_tombstone(env, monkeypatch, capsys):
+    """[ITEM-203.GWT-4] an UnregisterNotFound verdict means a
+    concurrent unregister already deleted the row: the parked
+    mailbox is the dead session's last mail - remove it, do NOT
+    resurrect an orphan <sid> dir nothing drains (review W4)."""
+    _ghost(env)
+    _mailbox(env)
+    orig = db.unregister_session
+
+    def already_gone(sid, *, force=False, path=None):
+        orig(sid, force=force, path=path)  # the concurrent winner deletes
+        return UnregisterNotFound()
+
+    monkeypatch.setattr(bridge.db, "unregister_session", already_gone)
+    rc, out = _run(["unregister", SID, "--json"], capsys)
+    assert rc == ExitCode.NOT_FOUND
+    assert out["data"]["mailbox_restored"] == "removed"
+    assert not (Path(env.qdir) / SID).exists()  # no orphan dir
+    assert not list(env.qdir.glob(".unregistered-*"))
+
+
+def test_item203_gwt5_refusal_merge_never_clobbers(env, monkeypatch, capsys):
+    """[ITEM-203.GWT-5] a refused unregister that finds a recreated
+    <sid> dir merges the parked mail back WITHOUT clobbering live
+    files: a post-refusal write owning the same name wins (review
+    W3 - os.replace would silently destroy the newer file)."""
+    _ghost(env)
+    _mailbox(env)  # msg_1.txt parked by the tombstone
+    _task(env)  # live task refuses
+
+    orig = db.unregister_session
+
+    def racing(sid, *, force=False, path=None):
+        verdict = orig(sid, force=force, path=path)
+        fresh = Path(env.qdir) / sid
+        fresh.mkdir(parents=True, exist_ok=True)
+        (fresh / "msg_1.txt").write_text("notification_id: 1\nkind: notice\n\nnewer")
+        (fresh / "msg_7.txt").write_text("notification_id: 7\nkind: notice\n\nfresh")
+        return verdict
+
+    monkeypatch.setattr(bridge.db, "unregister_session", racing)
+    rc, out = _run(["unregister", SID, "--json"], capsys)
+    assert rc == ExitCode.CONFLICT
+    assert out["data"]["mailbox_restored"] == "merged"
+    mdir = Path(env.qdir) / SID
+    # the live same-name file keeps its post-refusal content
+    assert (mdir / "msg_1.txt").read_text().endswith("newer")
+    assert (mdir / "msg_7.txt").exists()  # post-refusal file untouched
+    assert not list(env.qdir.glob(".unregistered-*"))
+
+
+def test_item203_gwt6_register_reaps_orphaned_tombstone(env, capsys):
+    """[ITEM-203.GWT-6] a crash between the rename and the db commit
+    leaves .unregistered-<sid>-* stranded while the registration
+    lives. The reaper in `bridge register` merges the parked mail
+    back into the live mailbox (review W5)."""
+    _ghost(env)
+    mdir = _mailbox(env)
+    park = Path(env.qdir) / f".unregistered-{SID}-1-1"
+    os.rename(mdir, park)
+    assert not mdir.exists() and (park / "msg_1.txt").exists()
+
+    rc, _out = _run(["register", SID, "--json"], capsys)
+    assert rc == ExitCode.OK
+    assert (mdir / "msg_1.txt").exists()  # parked mail back in the live dir
+    assert not park.exists()
