@@ -474,6 +474,12 @@ def mark_dead(row, db_path, state_directory, notify_send, now: int, *, tag: str 
     ghost = row["hb"] is None
     marker = " ghost" if ghost else ""
     limit = db.GHOST_TTL_SECONDS if ghost else db.HEARTBEAT_STALE_SECONDS
+    if ghost and db.get_live_task(sid, path=db_path) is not None:
+        # not journaled: a live task past GHOST_TTL is steady state
+        # until its lease folds, and a per-pass event would spam the
+        # decisions file - lease recovery's task_recovered already
+        # documents the fold that unblocks this registration
+        return
     if row["role"] == SessionRole.ORCHESTRATOR.value:
         if db.set_session_status(sid, SessionStatus.DEAD, path=db_path):
             notify_send(
@@ -486,12 +492,6 @@ def mark_dead(row, db_path, state_directory, notify_send, now: int, *, tag: str 
                 sid,
                 f"{tag}heartbeat_age={age}s{marker} notify-send sent",
             )
-        return
-    if ghost and db.get_live_task(sid, path=db_path) is not None:
-        # not journaled: a live task past GHOST_TTL is steady state
-        # until its lease folds, and a per-pass event would spam the
-        # decisions file - lease recovery's task_recovered already
-        # documents the fold that unblocks this registration
         return
     if not db.set_session_status(sid, SessionStatus.DEAD, path=db_path):
         return  # already dead or raced - handled before

@@ -1964,11 +1964,13 @@ def stale_unmanaged_sessions(now: int, *, path=None):
             " FROM sessions s"
             " LEFT JOIN worker_heartbeats wh ON wh.session_id=s.session_id"
             " WHERE COALESCE(s.mode,'unmanaged')<>?"
+            " AND s.status=?"
             " AND (wh.last_seen_at<=?"
             "      OR (wh.last_seen_at IS NULL AND s.updated_at<=?))"
             " ORDER BY s.session_id",
             (
                 SessionMode.MANAGED.value,
+                SessionStatus.ACTIVE.value,
                 now - HEARTBEAT_STALE_SECONDS,
                 now - GHOST_TTL_SECONDS,
             ),
@@ -2028,6 +2030,8 @@ def list_events(*, session_id=None, bus_only=False, kind=None, limit: int = 50, 
     floored at 1: the table is append-only and never purged, and a
     negative SQLite LIMIT reads unbounded.
     """
+    if session_id is not None and bus_only:
+        raise ValueError("list_events: session_id and bus_only are mutually exclusive")
     where = []
     params: list = []
     if session_id is not None:
