@@ -26,6 +26,12 @@ from session_bridge.state.contract import (
     TaskStatus,
     Transport,
 )
+from session_bridge.state.verdict import (
+    UnregisterDeleted,
+    UnregisterNotFound,
+    UnregisterRefusedFreshHeartbeat,
+    UnregisterRefusedLiveTask,
+)
 
 
 @pytest.fixture()
@@ -2130,8 +2136,10 @@ def test_item198_gwt8_unregister_session_counts_and_spared_audit(db_path):
     qid = db.ask("asker", tid2, "q?", path=db_path).question_id
     assert db.claim_question(qid, "ghost", path=db_path)
 
-    counts = db.unregister_session("ghost", path=db_path)
+    verdict = db.unregister_session("ghost", path=db_path)
 
+    assert isinstance(verdict, UnregisterDeleted)
+    counts = verdict.counts
     assert counts["sessions"] == 1 and counts["tasks"] == 1
     assert counts["notifications"] == 1
     assert counts["worker_heartbeats"] == 1
@@ -2143,8 +2151,8 @@ def test_item198_gwt8_unregister_session_counts_and_spared_audit(db_path):
     # the asker is untouched
     assert db.get_session("asker", path=db_path) is not None
     assert db.get_task(tid2, path=db_path) is not None
-    # unknown sid -> None, nothing deleted
-    assert db.unregister_session("nope", path=db_path) is None
+    # unknown sid -> UnregisterNotFound, nothing deleted
+    assert isinstance(db.unregister_session("nope", path=db_path), UnregisterNotFound)
 
 
 def test_item198_gwt9_unregister_refusals_inside_txn(db_path):
@@ -2155,16 +2163,16 @@ def test_item198_gwt9_unregister_refusals_inside_txn(db_path):
     assert res.accepted
     tid = db.enqueue("s9", "x", path=db_path)
     out = db.unregister_session("s9", path=db_path)
-    assert out["refused"] == "live_task" and out["task_id"] == tid
+    assert isinstance(out, UnregisterRefusedLiveTask) and out.task_id == tid
     out = db.unregister_session("s9", force=True, path=db_path)
-    assert out["refused"] == "live_task"  # force cannot kill a live task
+    assert isinstance(out, UnregisterRefusedLiveTask)  # force cannot kill a live task
 
     # fold the queued task out of live states so the heartbeat leg is next
     _exec(db_path, "UPDATE tasks SET status='failed' WHERE id=?", (tid,))
     db.heartbeat("s9", path=db_path)
     out = db.unregister_session("s9", path=db_path)
-    assert out["refused"] == "fresh_heartbeat" and out["age_seconds"] <= 2
+    assert isinstance(out, UnregisterRefusedFreshHeartbeat) and out.age_seconds <= 2
     # force skips the heartbeat leg
     out = db.unregister_session("s9", force=True, path=db_path)
-    assert out["sessions"] == 1
+    assert isinstance(out, UnregisterDeleted) and out.counts["sessions"] == 1
     assert db.get_session("s9", path=db_path) is None

@@ -81,6 +81,11 @@ from session_bridge.state.contract import (
     TaskStatus,
     Transport,
 )
+from session_bridge.state.verdict import (
+    UnregisterNotFound,
+    UnregisterRefusedFreshHeartbeat,
+    UnregisterRefusedLiveTask,
+)
 from session_bridge.wake import (
     SESSION_ABSENT,
     WakeError,
@@ -1857,8 +1862,46 @@ def _cmd_unregister(args) -> int:
                     )
                 host_check = "absent"
 
-    counts = db.unregister_session(sid, force=args.force, path=args.db)
-    if counts is None:
+    # tombstone-rename the mailbox BEFORE the db delete (audit F1,
+    # task #203): between the delete commit and a direct rmtree of
+    # <sid>, a relay could materialize new mail or a same-sid
+    # re-register could create a fresh mailbox that the late rmtree
+    # would wipe. An atomic rename parks the pre-delete mailbox
+    # under a name no writer targets; a refusal restores it, a
+    # success deletes the tombstone. Mail landing in a recreated
+    # <sid> dir during the delete belongs to the post-delete world
+    # and is left alone.
+    mdir = mailbox_dir(sid, db_path=args.db, queue_dir=args.queue_dir)
+    tombstone = None
+    if os.path.isdir(mdir):
+        tombstone = os.path.join(os.path.dirname(mdir), f".unregistered-{sid}-{int(time.time())}")
+        try:
+            os.rename(mdir, tombstone)
+        except OSError:
+            tombstone = None
+
+    verdict = db.unregister_session(sid, force=args.force, path=args.db)
+
+    def _restore_tombstone() -> None:
+        """Put the parked mailbox back - the registration survived."""
+        nonlocal tombstone
+        if tombstone is None:
+            return
+        try:
+            if not os.path.isdir(mdir):
+                os.rename(tombstone, mdir)
+            else:
+                # a writer recreated <sid> in the window: merge the
+                # parked files into the live dir, then drop the park
+                for name in os.listdir(tombstone):
+                    os.replace(os.path.join(tombstone, name), os.path.join(mdir, name))
+                os.rmdir(tombstone)
+        except OSError:
+            pass
+        tombstone = None
+
+    if isinstance(verdict, UnregisterNotFound):
+        _restore_tombstone()
         # raced with a concurrent unregister/cleanup - the row is
         # already gone, which is the outcome the caller wanted
         resp = JsonResponse(
@@ -1872,27 +1915,28 @@ def _cmd_unregister(args) -> int:
             ExitCode.NOT_FOUND,
             f"not registered: {sid} (removed concurrently)",
         )
-    if counts.get("refused") == "live_task":
+    if isinstance(verdict, UnregisterRefusedLiveTask):
+        _restore_tombstone()
         resp = JsonResponse(
             session=sid,
             status="conflict",
             error=(
-                f"task {counts['task_id']} is {counts['task_status']}"
-                " - close it before unregistering"
+                f"task {verdict.task_id} is {verdict.task_status} - close it before unregistering"
             ),
         )
         return _emit(
             args,
             resp,
             ExitCode.CONFLICT,
-            f"conflict: task {counts['task_id']} still {counts['task_status']}",
+            f"conflict: task {verdict.task_id} still {verdict.task_status}",
         )
-    if counts.get("refused") == "fresh_heartbeat":
+    if isinstance(verdict, UnregisterRefusedFreshHeartbeat):
+        _restore_tombstone()
         resp = JsonResponse(
             session=sid,
             status="conflict",
             error=(
-                f"fresh heartbeat {counts['age_seconds']}s ago"
+                f"fresh heartbeat {verdict.age_seconds}s ago"
                 " - session is alive (--force to override)"
             ),
         )
@@ -1900,17 +1944,29 @@ def _cmd_unregister(args) -> int:
             args,
             resp,
             ExitCode.CONFLICT,
-            f"conflict: {sid} heartbeat {counts['age_seconds']}s ago (--force to override)",
+            f"conflict: {sid} heartbeat {verdict.age_seconds}s ago (--force to override)",
         )
-    mdir = mailbox_dir(sid, db_path=args.db, queue_dir=args.queue_dir)
+    counts = verdict.counts
     mail_files = 0
-    if os.path.isdir(mdir):
+    if tombstone is not None:
+        try:
+            mail_files = len(os.listdir(tombstone))
+        except OSError:
+            mail_files = None
+        shutil.rmtree(tombstone, ignore_errors=True)
+        mailbox_removed = not os.path.isdir(tombstone)
+    elif os.path.isdir(mdir):
+        # the tombstone rename failed earlier - degraded to the old
+        # delete-in-place path, which keeps the F1 race window
         try:
             mail_files = len(os.listdir(mdir))
         except OSError:
             mail_files = None
         shutil.rmtree(mdir, ignore_errors=True)
-    mailbox_removed = not os.path.isdir(mdir)
+        mailbox_removed = not os.path.isdir(mdir)
+    else:
+        mailbox_removed = True
+    recreated = os.path.isdir(mdir)
     daemon._decision(
         _state_dir(args),
         "session_unregistered",
@@ -1925,6 +1981,8 @@ def _cmd_unregister(args) -> int:
             "counts": counts,
             "mailbox_files_removed": mail_files,
             "mailbox_removed": mailbox_removed,
+            "mailbox_tombstoned": tombstone is not None,
+            "mailbox_dir_recreated": recreated,
             "host_check": host_check,
         },
     )

@@ -28,7 +28,6 @@ stderr of the child goes to DEVNULL (MVP choice, configurable via the
 deadlock can occur.
 """
 
-import json
 import os
 import re
 import select
@@ -42,12 +41,13 @@ from typing import Any
 
 from pydantic import ValidationError
 
+from . import protocol
 from .contract import (
+    PROTOCOL_VERSION,
     AcpError,
     AuthenticateMeta,
     AuthenticateParams,
     ErrorKind,
-    InitializeParams,
     JsonRpcError,
     JsonRpcNotification,
     JsonRpcRequest,
@@ -172,7 +172,7 @@ class AcpClient:
         key = api_key if api_key is not None else read_api_key(credentials_path)
         self._request_timeout = request_timeout
         self._next_id = 0
-        self._rbuf = b""
+        self._rbuf = protocol.NdjsonBuffer()
         self._wlock = threading.Lock()
         self._slot = threading.Lock()
         self._notifications: deque[dict[str, Any]] = deque(maxlen=_NOTIFICATION_BUFFER)
@@ -188,7 +188,7 @@ class AcpClient:
         try:
             self.rpc(
                 Method.INITIALIZE,
-                InitializeParams().model_dump(by_alias=True),
+                protocol.initialize_params(PROTOCOL_VERSION),
             )
             auth = AuthenticateParams(meta=AuthenticateMeta(api_key=key))
             # fire-and-forget per protocol: the server streams
@@ -212,7 +212,7 @@ class AcpClient:
         return self._next_id
 
     def _write_line(self, payload: dict[str, Any]) -> None:
-        data = json.dumps(payload).encode() + b"\n"
+        data = protocol.encode_message(payload)
         with self._wlock:
             if self.proc.poll() is not None:
                 raise AcpError("acp process is not running", kind="process_dead")
@@ -239,23 +239,11 @@ class AcpClient:
         ``malformed_message``.
         """
         while True:
-            nl = self._rbuf.find(b"\n")
-            if nl >= 0:
-                line, self._rbuf = self._rbuf[:nl], self._rbuf[nl + 1 :]
-                if not line.strip():
-                    continue
-                try:
-                    msg = json.loads(line)
-                except json.JSONDecodeError as e:
-                    raise AcpError(
-                        f"malformed JSON line from acp ({e.msg})",
-                        kind="malformed_message",
-                    ) from e
-                if not isinstance(msg, dict):
-                    raise AcpError(
-                        "non-object JSON message from acp",
-                        kind="malformed_message",
-                    )
+            try:
+                msg = self._rbuf.pop_message()
+            except protocol.NdjsonError as e:
+                raise AcpError(str(e), kind=e.kind) from e
+            if msg is not None:
                 return msg
             try:
                 ready, _, _ = select.select([self._fd], [], [], timeout)
@@ -269,14 +257,14 @@ class AcpClient:
                 )
             chunk = os.read(self._fd, _READ_CHUNK)
             if not chunk:
-                if self._rbuf.strip():
-                    lost, self._rbuf = len(self._rbuf), b""
+                lost = len(self._rbuf.take_pending())
+                if lost:
                     raise AcpError(
                         f"acp closed stdout mid-message ({lost} buffered bytes lost)",
                         kind="truncated_message",
                     )
                 raise AcpError("acp closed stdout (EOF)", kind="eof")
-            self._rbuf += chunk
+            self._rbuf.feed(chunk)
 
     def _await_response(
         self,
@@ -287,7 +275,7 @@ class AcpClient:
         """Read messages until the response for ``req_id`` arrives."""
         while True:
             msg = self._read_message(timeout)
-            if "method" in msg:
+            if protocol.is_server_call(msg):
                 # server->client notification or request: buffer it and
                 # keep waiting - it must never crash the loop
                 self._notifications.append(msg)

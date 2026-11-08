@@ -56,6 +56,8 @@ import socket
 import threading
 import time
 
+from session_bridge.acp import protocol
+
 __all__ = [
     "ATTACH_LOCK",
     "DEFAULT_AGENT_ID",
@@ -199,15 +201,19 @@ def nudge_text(session_id: str) -> str:
 
 
 class _SocketChannel:
-    """Minimal NDJSON reader/writer over one TCP socket."""
+    """Minimal NDJSON reader/writer over one TCP socket.
+
+    Framing is the shared ``acp.protocol`` codec - the channel only
+    owns socket I/O and the overall-deadline timeout semantics.
+    """
 
     def __init__(self, sock: socket.socket):
         self._sock = sock
-        self._rbuf = b""
+        self._rbuf = protocol.NdjsonBuffer()
 
     def send(self, payload: dict) -> None:
         try:
-            self._sock.sendall(json.dumps(payload).encode() + b"\n")
+            self._sock.sendall(protocol.encode_message(payload))
         except OSError as e:
             raise WakeError("connect_failed", f"socket write failed: {e}") from e
 
@@ -215,17 +221,11 @@ class _SocketChannel:
         """Next complete NDJSON object; WakeError on timeout/eof/bad json."""
         deadline = time.monotonic() + timeout
         while True:
-            nl = self._rbuf.find(b"\n")
-            if nl >= 0:
-                line, self._rbuf = self._rbuf[:nl], self._rbuf[nl + 1 :]
-                if not line.strip():
-                    continue
-                try:
-                    msg = json.loads(line)
-                except json.JSONDecodeError as e:
-                    raise WakeError("malformed_message", f"bad NDJSON line: {e}") from e
-                if not isinstance(msg, dict):
-                    raise WakeError("malformed_message", "non-object NDJSON message")
+            try:
+                msg = self._rbuf.pop_message()
+            except protocol.NdjsonError as e:
+                raise WakeError(e.kind, str(e)) from e
+            if msg is not None:
                 return msg
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -242,11 +242,11 @@ class _SocketChannel:
                 raise WakeError("connect_failed", f"socket read failed: {e}") from e
             if not chunk:
                 raise WakeError("eof", "host closed the connection")
-            self._rbuf += chunk
+            self._rbuf.feed(chunk)
 
 
 def _rpc(chan: _SocketChannel, req_id: int, method: str, params: dict | None = None) -> None:
-    chan.send({"jsonrpc": "2.0", "id": req_id, "method": method, "params": params or {}})
+    chan.send(protocol.rpc_request(req_id, method, params))
 
 
 def _await_response(chan: _SocketChannel, req_id: int, timeout: float, max_messages: int):
@@ -262,16 +262,14 @@ def _await_response(chan: _SocketChannel, req_id: int, timeout: float, max_messa
         seen += 1
         if seen > max_messages:
             raise WakeError("timeout", f"response cap exceeded ({max_messages} messages)")
-        if "method" in msg:
+        if protocol.is_server_call(msg):
             continue
         if msg.get("id") != req_id:
             continue
-        if "error" in msg and msg["error"] is not None:
-            err = msg["error"]
-            detail = err.get("message") if isinstance(err, dict) else str(err)
-            raise WakeError("rpc_error", f"{detail or err}")
-        result = msg.get("result")
-        return result if isinstance(result, dict) else {}
+        err = protocol.error_payload(msg)
+        if err is not None:
+            raise WakeError("rpc_error", protocol.error_detail(err))
+        return protocol.response_result(msg)
 
 
 def _session_status(entry: dict):
@@ -312,11 +310,11 @@ _OFFERED_PROTOCOL = 2
 
 
 def _initialize_params(version=_OFFERED_PROTOCOL) -> dict:
-    return {
-        "protocolVersion": version,
-        "clientCapabilities": {"fs": {"readTextFile": False, "writeTextFile": False}},
-        "clientInfo": {"name": "sessions-bridge-wake", "version": "0"},
-    }
+    return protocol.initialize_params(
+        version,
+        client_name="sessions-bridge-wake",
+        capabilities={"fs": {"readTextFile": False, "writeTextFile": False}},
+    )
 
 
 def _attach(lock_data: dict, agent_id: str):
@@ -537,18 +535,18 @@ def wake_session(
                     if e.reason == "timeout":
                         return "sent_unconfirmed"
                     raise
-                if "method" in msg:
+                if protocol.is_server_call(msg):
                     params = msg.get("params") or {}
                     if params.get("sessionId") == session_id and load_done:
                         return "sent"
                     continue
                 if msg.get("id") == prompt_id:
-                    if msg.get("error") is not None:
+                    err = protocol.error_payload(msg)
+                    if err is not None:
                         # e.g. the session went busy between list and
                         # prompt and the host rejected it - surfaces
                         # as a session-level failure, not a sent wake
-                        err = msg["error"]
-                        detail = err.get("message") if isinstance(err, dict) else str(err)
+                        detail = protocol.error_detail(err)
                         raise WakeError("rpc_error", f"session/prompt: {detail}")
                     return "sent"
             return "sent_unconfirmed"

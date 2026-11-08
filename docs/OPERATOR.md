@@ -450,7 +450,15 @@ Daemon files in the state dir:
   `wake_unconfirmed`, `wake_unconfirmed_escalated`,
   `wake_verify_failed`, `mail_stall_escalated`,
   `mail_stall_deferred`, `mail_stall_deferred_busy`,
-  `mail_stall_verify_failed`, `mail_stall_deferred_halted`.
+  `mail_stall_verify_failed`, `mail_stall_deferred_halted`,
+  `session_unregistered`, `lease_auto_renewed`,
+  `lease_renew_verify_failed`, `pass_timing`.
+- `pass_timing` is the per-iteration instrumentation line (v0.3.15):
+  one event per loop carrying every pass duration as
+  `schedule=Xms relay=Xms pending_scan=Xms wake=Xms
+  lease_renew=Xms sweep=Xms mail_stall=Xms question_janitor=Xms`.
+  A pass quietly outgrowing the daemon interval shows up here
+  before the fleet looks stalled.
 - `logs/daemon.log` - the detached daemon's stderr (decision lines are
   echoed there too).
 
@@ -698,6 +706,23 @@ flagged risks from the deferred design stay in force:
 refuses (conflict) while the session is mid-turn. Useful to verify
 the transport or to nudge a session on demand.
 
+## Code layering notes (v0.3.15)
+
+- `acp/protocol.py` is the single home of the NDJSON framing,
+  JSON-RPC envelope, response classification and `initialize`
+  payload shared by both ACP transports (`acp/client.py` stdio,
+  `wake/acp_host.py` socket). Protocol fixes now land in one place -
+  the two implementations cannot drift on wire semantics, only on
+  transport I/O and their own error vocabularies.
+- `state/verdict.py` holds the typed verdicts db functions return
+  for compound operations (tagged pydantic unions; first consumer
+  `unregister_session`). New compound returns belong there, not in
+  new ad-hoc `{"status": ...}` dict shapes - the `kind`
+  discriminator is the machine-checked contract.
+- `bridge unregister` returns a typed verdict internally; the CLI
+  JSON surface is unchanged except for the added
+  `mailbox_tombstoned` / `mailbox_dir_recreated` fields.
+
 ## systemd --user service (auto-start on boot)
 
 On systemd machines the daemon runs best as a user unit (v0.3.12):
@@ -895,7 +920,7 @@ Global flags: `--db PATH` (`SESSIONS_BRIDGE_DB`), `--queue-dir DIR`
 | `bridge disarm <sid>` / `bridge disarm --all` | leave managed mode + send a `disarm` mailbox message. |
 | `bridge halt <sid>` / `bridge halt --all [--stop-daemon]` | graceful fleet stop: sets `halted_at`, queues the `halt` semantic and wakes; `--all` reports each target's wake outcome, mailbox depth and live task; `--stop-daemon` SIGTERMs the supervisor after the broadcast (v0.3.11). |
 | `bridge resume <sid>` / `bridge resume --all` | lift a halt: clears `halted_at`, queues the `resume` semantic and wakes the session (v0.3.11). |
-| `bridge unregister <sid> [--force]` | remove a dead/ghost registration and all its state (v0.3.14): refuses when a live task exists, when the heartbeat is fresh, or when the acp-host still lists the session (`--force` skips the two liveness legs; the live-task refusal always applies). Deletes sessions/heartbeat/tasks/notifications/questions/schedules/wake_state rows and the mailbox dir - `audit_events` and the decision journal keep the audit trail. |
+| `bridge unregister <sid> [--force]` | remove a dead/ghost registration and all its state (v0.3.14): refuses when a live task exists, when the heartbeat is fresh, or when the acp-host still lists the session (`--force` skips the two liveness legs; the live-task refusal always applies). Deletes sessions/heartbeat/tasks/notifications/questions/schedules/wake_state rows and the mailbox dir - `audit_events` and the decision journal keep the audit trail. Since v0.3.15 the mailbox is tombstone-renamed before the delete commits: a refusal restores it, a success removes the tombstone, and mail landing in a recreated `queue/<sid>` during the delete is post-delete state that survives (`mailbox_dir_recreated`/`mailbox_tombstoned` in the JSON output). |
 | `bridge register <sid> [--role worker\|orchestrator] [--workspace DIR] [--force]` | join the bus and stamp the heartbeat; orchestrator is a CAS singleton. |
 | `bridge ask --session SID --task ID "text"` | post a worker question; refused when another question is pending (`pending_exists`), the task hit the 3-question budget (`question_limit`), or no active orchestrator exists (`no_orchestrator`). |
 | `bridge ack --session SID [--up-to N]` | advance the session's mailbox ack watermark. |

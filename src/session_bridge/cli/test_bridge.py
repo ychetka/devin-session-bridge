@@ -2604,3 +2604,56 @@ def test_item198_gwt7_verify_failure_proceeds(env, monkeypatch, capsys):
     assert rc == ExitCode.OK
     assert out["data"]["host_check"] == "verify_failed:attach_failed"
     assert db.get_session(SID, path=env.db) is None
+
+
+# --- item_203: unregister mailbox tombstone (audit F1) -------------------------
+
+
+def test_item203_gwt1_refusal_restores_tombstoned_mailbox(env, capsys):
+    """[ITEM-203.GWT-1] a refused unregister must leave the mailbox
+    untouched: the dir is tombstone-renamed before the db call and
+    restored on refusal - the msg files are back under <sid>."""
+    _ghost(env)
+    db.notify(SID, NotificationKind.DISARM, "bye", path=env.db)
+    _mailbox(env)
+    _task(env)  # live task refuses
+
+    rc, _out = _run(["unregister", SID, "--json"], capsys)
+    assert rc == ExitCode.CONFLICT
+    mdir = Path(env.qdir) / SID
+    assert mdir.is_dir() and (mdir / "msg_1.txt").exists()
+    # no tombstone left behind
+    assert not list(env.qdir.glob(".unregistered-*"))
+
+
+def test_item203_gwt2_recreated_mailbox_dir_survives(env, monkeypatch, capsys):
+    """[ITEM-203.GWT-2] the F1 race: a same-sid writer (re-register,
+    foreign relay) creates a FRESH <sid> dir during the delete. The
+    pre-delete mailbox went to the tombstone and is removed; the new
+    dir belongs to the post-delete world and must survive - the old
+    code's late rmtree would have wiped it."""
+    _ghost(env)
+    db.notify(SID, NotificationKind.DISARM, "bye", path=env.db)
+    _mailbox(env)
+
+    orig = db.unregister_session
+
+    def racing_unregister(sid, *, force=False, path=None):
+        verdict = orig(sid, force=force, path=path)
+        # a writer materializes a fresh mailbox mid-delete
+        fresh = Path(env.qdir) / sid
+        fresh.mkdir(parents=True, exist_ok=True)
+        (fresh / "msg_99.txt").write_text("notification_id: 99\nkind: notice\n\nnew")
+        return verdict
+
+    monkeypatch.setattr(bridge.db, "unregister_session", racing_unregister)
+
+    rc, out = _run(["unregister", SID, "--json"], capsys)
+    assert rc == ExitCode.OK
+    assert out["data"]["mailbox_tombstoned"] is True
+    assert out["data"]["mailbox_dir_recreated"] is True
+    assert out["data"]["mailbox_files_removed"] == 1  # only the pre-delete mail
+    mdir = Path(env.qdir) / SID
+    assert (mdir / "msg_99.txt").exists()  # post-delete mail survives
+    assert not (mdir / "msg_1.txt").exists()  # pre-delete mail is gone
+    assert not list(env.qdir.glob(".unregistered-*"))

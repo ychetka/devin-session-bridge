@@ -1977,3 +1977,28 @@ def test_item189_gwt7_end_to_end_run_survives_expiry(env, monkeypatch):
 
     assert _lease_row(env, tid)["lease_expires_at"] > int(time.time()) + 60
     assert db.recover_stale(path=env.db) == []
+
+
+# --- task #203: per-pass timing instrumentation --------------------------------
+
+
+def test_item203_gwt3_pass_timing_event_emitted(env):
+    """[ITEM-203.GWT-3] one daemon iteration emits a consolidated
+    pass_timing decision naming every instrumented pass - the
+    metric that makes a pass quietly outgrowing the interval
+    visible in the decision journal."""
+    daemon.run(env.db, env.qdir, once=True, notify_send=env.notifier)
+    events = [d["event"] for d in _decisions(env)]
+    assert "pass_timing" in events
+    detail = next(d["detail"] for d in _decisions(env) if d["event"] == "pass_timing")
+    for name in (
+        "schedule",
+        "relay",
+        "pending_scan",
+        "wake",
+        "lease_renew",
+        "sweep",
+        "mail_stall",
+        "question_janitor",
+    ):
+        assert f"{name}=" in detail

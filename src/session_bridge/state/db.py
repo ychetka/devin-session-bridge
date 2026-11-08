@@ -67,6 +67,12 @@ from .contract import (
     Transport,
     validate_question_transition,
 )
+from .verdict import (
+    UnregisterDeleted,
+    UnregisterNotFound,
+    UnregisterRefusedFreshHeartbeat,
+    UnregisterRefusedLiveTask,
+)
 
 
 class BridgeDBError(Exception):
@@ -1567,15 +1573,17 @@ def unregister_session(session_id: str, *, force: bool = False, path=None):
     stale notification rows and an undrained mailbox that never
     clears.
 
-    Return shapes, all decided inside the deletion transaction:
-    ``None`` - the sid is not registered (the CLI distinguishes
-    "unknown" from "removed"); ``{"refused": "live_task", ...}`` -
-    a live task still owns the lifecycle and --force cannot
-    override it (deleting it mid-flight is a kill, not cleanup);
-    ``{"refused": "fresh_heartbeat", ...}`` - a heartbeat younger
-    than ``HEARTBEAT_STALE_SECONDS`` means a live client is on the
-    bus right now (``force=True`` skips only this leg); otherwise a
-    per-table delete-count dict.
+    Return shapes, all decided inside the deletion transaction - a
+    ``state.verdict.UnregisterVerdict`` member (task #203: typed
+    verdicts replace the stringly-typed dict contract):
+    ``UnregisterNotFound`` - the sid is not registered;
+    ``UnregisterRefusedLiveTask`` - a live task still owns the
+    lifecycle and --force cannot override it (deleting it
+    mid-flight is a kill, not cleanup);
+    ``UnregisterRefusedFreshHeartbeat`` - a heartbeat younger than
+    ``HEARTBEAT_STALE_SECONDS`` means a live client is on the bus
+    right now (``force=True`` skips only this leg); otherwise
+    ``UnregisterDeleted`` carrying the per-table delete counts.
 
     The db-side invariants are re-verified inside the same
     ``BEGIN IMMEDIATE`` - a check-then-delete TOCTOU gap would
@@ -1604,18 +1612,17 @@ def unregister_session(session_id: str, *, force: bool = False, path=None):
                 is None
             ):
                 con.rollback()
-                return None
+                return UnregisterNotFound()
             live = con.execute(
                 f"SELECT id, status FROM tasks WHERE session_id=? AND status IN ({_LIVE_SQL})",
                 (session_id,),
             ).fetchone()
             if live is not None:
                 con.rollback()
-                return {
-                    "refused": "live_task",
-                    "task_id": live["id"],
-                    "task_status": live["status"],
-                }
+                return UnregisterRefusedLiveTask(
+                    task_id=live["id"],
+                    task_status=live["status"],
+                )
             if not force:
                 hb = con.execute(
                     "SELECT last_seen_at FROM worker_heartbeats WHERE session_id=?",
@@ -1623,10 +1630,9 @@ def unregister_session(session_id: str, *, force: bool = False, path=None):
                 ).fetchone()
                 if hb is not None and ts - hb["last_seen_at"] < HEARTBEAT_STALE_SECONDS:
                     con.rollback()
-                    return {
-                        "refused": "fresh_heartbeat",
-                        "age_seconds": ts - hb["last_seen_at"],
-                    }
+                    return UnregisterRefusedFreshHeartbeat(
+                        age_seconds=ts - hb["last_seen_at"],
+                    )
             counts = {}
             for table in (
                 "tasks",
@@ -1651,7 +1657,7 @@ def unregister_session(session_id: str, *, force: bool = False, path=None):
             )
             counts["questions_unclaimed"] = cur.rowcount
             con.commit()
-            return counts
+            return UnregisterDeleted(counts=counts)
         except BaseException:
             con.rollback()
             raise

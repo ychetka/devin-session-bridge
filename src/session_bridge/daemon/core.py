@@ -1453,19 +1453,56 @@ def run(
             _write_heartbeat(state_directory)
             try:
                 now = int(time.time())
-                _schedule_pass(db_path, state_directory, now)
-                _relay_pass(db_path, queue_dir, state_directory)
+                # per-pass timing instrumentation (task #203, audit
+                # finding): the loop is a sequence of full-scan passes;
+                # without durations a pass quietly outgrowing the
+                # interval is invisible until the fleet looks stalled.
+                # One consolidated decision event per iteration keeps
+                # the journal grep-able without per-pass line spam.
+                timings: dict[str, float] = {}
+
+                def _timed(name, fn, *a, _acc=timings):
+                    start = time.monotonic()
+                    try:
+                        return fn(*a)
+                    finally:
+                        _acc[name] = round((time.monotonic() - start) * 1000, 1)
+
+                _timed("schedule", _schedule_pass, db_path, state_directory, now)
+                _timed("relay", _relay_pass, db_path, queue_dir, state_directory)
                 # one mailbox-dir scan per pass shared by the wake and
                 # stall legs (review: computing it twice per pass was a
                 # wasted second connection + listdir round)
-                pending = _pending_mailbox_dirs(db_path, queue_dir)
-                _wake_pass(db_path, state_directory, now, wake_policy, notify, queue_dir, pending)
-                _lease_renew_pass(db_path, state_directory, now)
-                _sweep_pass(db_path, state_directory, notify, now)
-                stall_age = _mail_stall_pass(
-                    db_path, state_directory, now, notify, queue_dir, pending
+                pending = _timed("pending_scan", _pending_mailbox_dirs, db_path, queue_dir)
+                _timed(
+                    "wake",
+                    _wake_pass,
+                    db_path,
+                    state_directory,
+                    now,
+                    wake_policy,
+                    notify,
+                    queue_dir,
+                    pending,
                 )
-                _question_janitor_pass(db_path, state_directory)
+                _timed("lease_renew", _lease_renew_pass, db_path, state_directory, now)
+                _timed("sweep", _sweep_pass, db_path, state_directory, notify, now)
+                stall_age = _timed(
+                    "mail_stall",
+                    _mail_stall_pass,
+                    db_path,
+                    state_directory,
+                    now,
+                    notify,
+                    queue_dir,
+                    pending,
+                )
+                _timed("question_janitor", _question_janitor_pass, db_path, state_directory)
+                _decision(
+                    state_directory,
+                    "pass_timing",
+                    detail=" ".join(f"{name}={ms}ms" for name, ms in timings.items()),
+                )
                 # metric line: the oldest undrained-mail age rides along
                 # in the heartbeat file (external watchdogs read line 1
                 # only - line 2 is observability, not a contract)
