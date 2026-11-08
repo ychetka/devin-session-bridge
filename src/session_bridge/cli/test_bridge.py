@@ -2474,3 +2474,126 @@ def test_item180_gwt12_disarm_drops_halt_flag(env, monkeypatch, capsys):
 
     _run(["disarm", SID, "--json"], capsys)
     assert _sess(env, SID)["halted_at"] is None
+
+
+# --- item_198: bridge unregister - dead/ghost registration removal ----------------
+
+
+def _ghost(env, sid=SID):
+    res = db.register(sid, f"/repo/{sid}", path=env.db)
+    assert res.accepted
+    # register stamps a heartbeat - a ghost's is stale by definition
+    _one(
+        env.db,
+        "UPDATE worker_heartbeats SET last_seen_at=? WHERE session_id=?",
+        (int(time.time()) - db.HEARTBEAT_STALE_SECONDS - 60, sid),
+    )
+
+
+def _mailbox(env, sid=SID):
+    mdir = Path(env.qdir) / sid
+    mdir.mkdir(parents=True, exist_ok=True)
+    (mdir / "msg_1.txt").write_text("notification_id: 1\nkind: disarm\n\nbye")
+    return mdir
+
+
+def _decisions(env):
+    path = Path(env.db).parent / daemon.DECISION_LOG_FILENAME
+    if not path.exists():
+        return []
+    return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+
+
+def test_item198_gwt1_ghost_removed_everywhere(env, capsys):
+    """[ITEM-198.GWT-1] a ghost registration - no heartbeat row, no
+    tasks, stale outbox + mailbox files - is fully removed:
+    sessions row, notifications and the mailbox dir all go, the
+    removal is decision-logged, and the sid leaves status views."""
+    _ghost(env)
+    db.notify(SID, NotificationKind.DISARM, "bye", path=env.db)
+    mdir = _mailbox(env)
+
+    rc, out = _run(["unregister", SID, "--json"], capsys)
+
+    assert rc == ExitCode.OK and out["status"] == "unregistered"
+    assert out["data"]["counts"]["sessions"] == 1
+    assert out["data"]["counts"]["notifications"] == 1
+    assert out["data"]["mailbox_files_removed"] == 1
+    assert db.get_session(SID, path=env.db) is None
+    assert not mdir.exists()
+    assert any(d["event"] == "session_unregistered" and d["sid"] == SID for d in _decisions(env))
+    # the status fold must not resurrect the ghost
+    tasks = db.list_tasks(path=env.db)
+    assert all(t["session_id"] != SID for t in tasks)
+
+
+def test_item198_gwt2_unknown_sid_not_found(env, capsys):
+    """[ITEM-198.GWT-2] unregister on a never-registered sid is a
+    clean not_found, not a silent no-op."""
+    rc, out = _run(["unregister", "never-seen", "--json"], capsys)
+    assert rc == ExitCode.NOT_FOUND and out["status"] == "not_found"
+
+
+def test_item198_gwt3_live_task_refused(env, capsys):
+    """[ITEM-198.GWT-3] a live task still owns the lifecycle -
+    removal is refused, and even --force cannot kill a live task."""
+    _ghost(env)
+    _task(env)
+    rc, out = _run(["unregister", SID, "--json"], capsys)
+    assert rc == ExitCode.CONFLICT and out["status"] == "conflict"
+    assert db.get_session(SID, path=env.db) is not None
+
+    rc, _ = _run(["unregister", SID, "--force", "--json"], capsys)
+    assert rc == ExitCode.CONFLICT
+    assert db.get_session(SID, path=env.db) is not None
+
+
+def test_item198_gwt4_fresh_heartbeat_refused(env, capsys):
+    """[ITEM-198.GWT-4] a fresh heartbeat is a live client on the bus
+    right now - refused; the refusal carries the age evidence."""
+    _ghost(env)
+    db.heartbeat(SID, path=env.db)
+    rc, out = _run(["unregister", SID, "--json"], capsys)
+    assert rc == ExitCode.CONFLICT and out["status"] == "conflict"
+    assert "heartbeat" in out["error"]
+    assert db.get_session(SID, path=env.db) is not None
+
+
+def test_item198_gwt5_host_present_refused(env, monkeypatch, capsys):
+    """[ITEM-198.GWT-5] the acp-host still lists the session - a
+    resumable Devin session is alive evidence: refused."""
+    _ghost(env)
+    monkeypatch.setattr(bridge, "find_lockfile", lambda *a, **k: {"_p": 1})
+    monkeypatch.setattr(bridge, "verify_sessions", lambda sids, **k: {SID: "idle"})
+    rc, out = _run(["unregister", SID, "--json"], capsys)
+    assert rc == ExitCode.CONFLICT and out["status"] == "conflict"
+    assert db.get_session(SID, path=env.db) is not None
+
+
+def test_item198_gwt6_force_skips_liveness(env, monkeypatch, capsys):
+    """[ITEM-198.GWT-6] --force skips the heartbeat and host legs -
+    the operator override for a session the liveness signals lie
+    about; the live-task refusal still applies (GWT-3)."""
+    _ghost(env)
+    db.heartbeat(SID, path=env.db)  # fresh - would refuse without force
+    monkeypatch.setattr(bridge, "verify_sessions", lambda sids, **k: {SID: "working"})
+    rc, out = _run(["unregister", SID, "--force", "--json"], capsys)
+    assert rc == ExitCode.OK and out["data"]["host_check"] == "force"
+    assert db.get_session(SID, path=env.db) is None
+
+
+def test_item198_gwt7_verify_failure_proceeds(env, monkeypatch, capsys):
+    """[ITEM-198.GWT-7] the host check is best-effort: an attach
+    failure proves nothing either way, so removal proceeds and the
+    output records which leg ran."""
+    _ghost(env)
+    monkeypatch.setattr(bridge, "find_lockfile", lambda *a, **k: {"_p": 1})
+
+    def boom(sids, **k):
+        raise bridge.WakeError("attach_failed", "nope")
+
+    monkeypatch.setattr(bridge, "verify_sessions", boom)
+    rc, out = _run(["unregister", SID, "--json"], capsys)
+    assert rc == ExitCode.OK
+    assert out["data"]["host_check"] == "verify_failed:attach_failed"
+    assert db.get_session(SID, path=env.db) is None

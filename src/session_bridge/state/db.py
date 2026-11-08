@@ -1559,6 +1559,74 @@ def set_session_halted(session_id: str, halted: bool, *, path=None) -> None:
     _retry(op)
 
 
+def unregister_session(session_id: str, *, path=None):
+    """Delete a session registration and every session-scoped row.
+
+    Task #198: fleet status was haunted by ghost registrations -
+    sessions that registered once and vanished keep an active row,
+    stale notification rows and an undrained mailbox that never
+    clears. Removal is unconditional at this layer: every refusal
+    (live task, fresh heartbeat, verifiably-alive host presence)
+    lives in the caller, because by the time unregister runs every
+    session-scoped row is garbage by definition and deleting it is
+    the point. Returns a per-table delete-count dict, or ``None``
+    when the sid is not registered so the CLI can distinguish
+    "unknown" from "removed".
+
+    Deleted: tasks (all statuses - history lives in audit_events and
+    the decision journal, not in rows that would resurrect the ghost
+    in every status fold), worker_heartbeats, questions asked BY the
+    sid, notifications addressed TO the sid, schedules, wake_state,
+    the sessions row itself. ``audit_events`` is deliberately spared:
+    it is the append-only journal, not session state. Questions from
+    OTHER askers this sid had claimed return to ``pending`` so the
+    asker's slot frees instead of dangling on a dead claimer.
+    """
+
+    def op():
+        con = connect(path)
+        try:
+            con.execute("BEGIN IMMEDIATE")
+            if (
+                con.execute("SELECT 1 FROM sessions WHERE session_id=?", (session_id,)).fetchone()
+                is None
+            ):
+                con.rollback()
+                return None
+            counts = {}
+            for table in (
+                "tasks",
+                "worker_heartbeats",
+                "questions",
+                "notifications",
+                "schedules",
+                "wake_state",
+                "sessions",
+            ):
+                cur = con.execute(f"DELETE FROM {table} WHERE session_id=?", (session_id,))
+                counts[table] = cur.rowcount
+            cur = con.execute(
+                "UPDATE questions SET state=?, claimed_by=NULL,"
+                " claimed_at=NULL"
+                " WHERE claimed_by=? AND state=?",
+                (
+                    QuestionState.PENDING.value,
+                    session_id,
+                    QuestionState.CLAIMED.value,
+                ),
+            )
+            counts["questions_unclaimed"] = cur.rowcount
+            con.commit()
+            return counts
+        except BaseException:
+            con.rollback()
+            raise
+        finally:
+            con.close()
+
+    return _retry(op)
+
+
 def set_session_status(session_id: str, status, *, path=None) -> bool:
     """Set ``sessions.status`` (active|dead); True only on a real flip.
 

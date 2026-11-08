@@ -2098,3 +2098,41 @@ def test_item189_gwt8_auto_renew_cas_and_ceiling(db_path):
     # non-lease-live statuses never qualify
     assert db.finish_task(tid, "w1", ok=True, note="done", path=db_path) is True
     assert db.auto_renew_lease(tid, "w1", ceiling_seconds=3600, path=db_path) is False
+
+
+def test_item198_gwt8_unregister_session_counts_and_spared_audit(db_path):
+    """[ITEM-198.GWT-8] unregister_session deletes every
+    session-scoped row (sessions, heartbeats, tasks, notifications,
+    questions, schedules, wake_state), re-pends questions OTHER
+    askers lost their claimer to, spares audit_events, and returns
+    None for an unknown sid."""
+    res = db.register("ghost", "/r", path=db_path)
+    assert res.accepted
+    tid = db.enqueue("ghost", "x", path=db_path)
+    db.notify("ghost", NotificationKind.DISARM, "bye", path=db_path)
+    db.heartbeat("ghost", path=db_path)
+    # another asker's question the ghost had claimed must re-pend,
+    # not dangle on a dead claimer
+    res2 = db.register("asker", "/r2", path=db_path)
+    assert res2.accepted
+    res3 = db.register("orc", "/r3", role="orchestrator", path=db_path)
+    assert res3.accepted
+    tid2 = db.enqueue("asker", "y", path=db_path)
+    qid = db.ask("asker", tid2, "q?", path=db_path).question_id
+    assert db.claim_question(qid, "ghost", path=db_path)
+
+    counts = db.unregister_session("ghost", path=db_path)
+
+    assert counts["sessions"] == 1 and counts["tasks"] == 1
+    assert counts["notifications"] == 1
+    assert counts["worker_heartbeats"] == 1
+    assert counts["questions_unclaimed"] == 1
+    assert db.get_session("ghost", path=db_path) is None
+    assert db.get_task(tid, path=db_path) is None
+    row = db.get_question(qid, path=db_path)
+    assert row["state"] == "pending" and row["claimed_by"] is None
+    # the asker is untouched
+    assert db.get_session("asker", path=db_path) is not None
+    assert db.get_task(tid2, path=db_path) is not None
+    # unknown sid -> None, nothing deleted
+    assert db.unregister_session("nope", path=db_path) is None
