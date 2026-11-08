@@ -396,6 +396,34 @@ Design answers (task #180):
   at its next drain; `--all` reports every target's wake outcome,
   mailbox depth and live task so the operator sees who is mid-turn.
 
+Post-halt assessment of the deferred urgent-interrupt /
+human-override items (task #198, v0.3.14):
+
+- **What halt/resume already consumed**: the shared priority-flag
+  delivery class (kind-level priority in the drain contract), a
+  durable fleet-stop flag with enforced claim refusal, parked-mail
+  semantics, and the coarse human override "stop the whole fleet
+  now". `bridge escalate reply ... override:<text>` covers the
+  DoA-gate override shape.
+- **Force-interrupt a busy session is not a bus-layer feature**: a
+  wake/drain prompt is ordinary turn input - it queues behind the
+  open turn and cannot preempt it (the parked-subagent spike,
+  task #184, established this for subagent processes; it applies
+  identically to the session's own turn). True interruption is
+  host-plane (`devin rm`, Desktop close), outside the bridge's
+  reach. Documented out of scope.
+- **Priority queue jump is a non-problem**: `ux_tasks_live_session`
+  gives every session at most one live task, so a task can never
+  queue-jump ahead of another for the same session - "urgent" means
+  push to a session whose slot is free, or kill the live task.
+- **Remaining real gap - operator force-fail of a running task**:
+  `bridge finish` is owner-CAS'd, so a wedged session's running
+  task survives until lease recovery (or `lease_auto_renew`'s
+  ceiling while it reports busy). A `bridge kill <task_id>` - CAS
+  `running|dispatch_decided > failed` ignoring lease_owner, with
+  the same `requeue_dead_worker` dirty-tree note - would close the
+  "stop THIS task now" piece. Small, deferred as a separate item.
+
 ## Daemon lifecycle
 
 | Command | Effect |
@@ -867,6 +895,7 @@ Global flags: `--db PATH` (`SESSIONS_BRIDGE_DB`), `--queue-dir DIR`
 | `bridge disarm <sid>` / `bridge disarm --all` | leave managed mode + send a `disarm` mailbox message. |
 | `bridge halt <sid>` / `bridge halt --all [--stop-daemon]` | graceful fleet stop: sets `halted_at`, queues the `halt` semantic and wakes; `--all` reports each target's wake outcome, mailbox depth and live task; `--stop-daemon` SIGTERMs the supervisor after the broadcast (v0.3.11). |
 | `bridge resume <sid>` / `bridge resume --all` | lift a halt: clears `halted_at`, queues the `resume` semantic and wakes the session (v0.3.11). |
+| `bridge unregister <sid> [--force]` | remove a dead/ghost registration and all its state (v0.3.14): refuses when a live task exists, when the heartbeat is fresh, or when the acp-host still lists the session (`--force` skips the two liveness legs; the live-task refusal always applies). Deletes sessions/heartbeat/tasks/notifications/questions/schedules/wake_state rows and the mailbox dir - `audit_events` and the decision journal keep the audit trail. |
 | `bridge register <sid> [--role worker\|orchestrator] [--workspace DIR] [--force]` | join the bus and stamp the heartbeat; orchestrator is a CAS singleton. |
 | `bridge ask --session SID --task ID "text"` | post a worker question; refused when another question is pending (`pending_exists`), the task hit the 3-question budget (`question_limit`), or no active orchestrator exists (`no_orchestrator`). |
 | `bridge ack --session SID [--up-to N]` | advance the session's mailbox ack watermark. |

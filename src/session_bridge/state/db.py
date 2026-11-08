@@ -1559,6 +1559,108 @@ def set_session_halted(session_id: str, halted: bool, *, path=None) -> None:
     _retry(op)
 
 
+def unregister_session(session_id: str, *, force: bool = False, path=None):
+    """Delete a session registration and every session-scoped row.
+
+    Task #198: fleet status was haunted by ghost registrations -
+    sessions that registered once and vanished keep an active row,
+    stale notification rows and an undrained mailbox that never
+    clears.
+
+    Return shapes, all decided inside the deletion transaction:
+    ``None`` - the sid is not registered (the CLI distinguishes
+    "unknown" from "removed"); ``{"refused": "live_task", ...}`` -
+    a live task still owns the lifecycle and --force cannot
+    override it (deleting it mid-flight is a kill, not cleanup);
+    ``{"refused": "fresh_heartbeat", ...}`` - a heartbeat younger
+    than ``HEARTBEAT_STALE_SECONDS`` means a live client is on the
+    bus right now (``force=True`` skips only this leg); otherwise a
+    per-table delete-count dict.
+
+    The db-side invariants are re-verified inside the same
+    ``BEGIN IMMEDIATE`` - a check-then-delete TOCTOU gap would
+    silently delete a task enqueued, or a heartbeat stamped,
+    between the CLI's refusal legs and the delete. The acp-host
+    presence leg cannot live here (network I/O does not belong in a
+    write txn); it stays in the caller as a best-effort pre-check.
+
+    Deleted: tasks (all statuses - history lives in audit_events and
+    the decision journal, not in rows that would resurrect the ghost
+    in every status fold), worker_heartbeats, questions asked BY the
+    sid, notifications addressed TO the sid, schedules, wake_state,
+    the sessions row itself. ``audit_events`` is deliberately spared:
+    it is the append-only journal, not session state. Questions from
+    OTHER askers this sid had claimed return to ``pending`` so the
+    asker's slot frees instead of dangling on a dead claimer.
+    """
+    ts = _now()
+
+    def op():
+        con = connect(path)
+        try:
+            con.execute("BEGIN IMMEDIATE")
+            if (
+                con.execute("SELECT 1 FROM sessions WHERE session_id=?", (session_id,)).fetchone()
+                is None
+            ):
+                con.rollback()
+                return None
+            live = con.execute(
+                f"SELECT id, status FROM tasks WHERE session_id=? AND status IN ({_LIVE_SQL})",
+                (session_id,),
+            ).fetchone()
+            if live is not None:
+                con.rollback()
+                return {
+                    "refused": "live_task",
+                    "task_id": live["id"],
+                    "task_status": live["status"],
+                }
+            if not force:
+                hb = con.execute(
+                    "SELECT last_seen_at FROM worker_heartbeats WHERE session_id=?",
+                    (session_id,),
+                ).fetchone()
+                if hb is not None and ts - hb["last_seen_at"] < HEARTBEAT_STALE_SECONDS:
+                    con.rollback()
+                    return {
+                        "refused": "fresh_heartbeat",
+                        "age_seconds": ts - hb["last_seen_at"],
+                    }
+            counts = {}
+            for table in (
+                "tasks",
+                "worker_heartbeats",
+                "questions",
+                "notifications",
+                "schedules",
+                "wake_state",
+                "sessions",
+            ):
+                cur = con.execute(f"DELETE FROM {table} WHERE session_id=?", (session_id,))
+                counts[table] = cur.rowcount
+            cur = con.execute(
+                "UPDATE questions SET state=?, claimed_by=NULL,"
+                " claimed_at=NULL"
+                " WHERE claimed_by=? AND state=?",
+                (
+                    QuestionState.PENDING.value,
+                    session_id,
+                    QuestionState.CLAIMED.value,
+                ),
+            )
+            counts["questions_unclaimed"] = cur.rowcount
+            con.commit()
+            return counts
+        except BaseException:
+            con.rollback()
+            raise
+        finally:
+            con.close()
+
+    return _retry(op)
+
+
 def set_session_status(session_id: str, status, *, path=None) -> bool:
     """Set ``sessions.status`` (active|dead); True only on a real flip.
 

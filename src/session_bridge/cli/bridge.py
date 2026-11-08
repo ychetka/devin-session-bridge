@@ -66,6 +66,7 @@ from session_bridge.cli.contract import (
     JsonResponse,
 )
 from session_bridge.daemon import core as daemon
+from session_bridge.mailbox import mailbox_dir
 from session_bridge.state import db
 from session_bridge.state.contract import (
     LEASE_SECONDS,
@@ -80,7 +81,13 @@ from session_bridge.state.contract import (
     TaskStatus,
     Transport,
 )
-from session_bridge.wake import WakeError, wake_session
+from session_bridge.wake import (
+    SESSION_ABSENT,
+    WakeError,
+    find_lockfile,
+    verify_sessions,
+    wake_session,
+)
 
 __all__ = ["main", "pump"]
 
@@ -1785,6 +1792,152 @@ _HALT_BODY = (
 _RESUME_BODY = "RESUME: the halt is lifted - normal mailbox duty resumes"
 
 
+def _cmd_unregister(args) -> int:
+    """``bridge unregister <sid> [--force]``: remove a dead registration (task #198).
+
+    Ghost registrations - a sid that registered once and vanished -
+    keep an active sessions row, stale outbox rows and an undrained
+    mailbox that haunts every fleet status. Removal is guarded by
+    three refusals:
+
+    - a live task still owns the lifecycle: fail/requeue it first;
+      deleting it mid-flight is a kill, not a cleanup. Enforced
+      inside the deletion transaction - no --force override.
+    - a fresh heartbeat means a live client is on the bus right now
+      (authoritative for unmanaged sessions); also enforced inside
+      the transaction so a heartbeat stamped between the legs and
+      the delete cannot be lost to a TOCTOU gap.
+    - the acp-host still lists the session: ANY listed entry -
+      including a statusless one - is a resumable Devin session and
+      therefore alive evidence no stale row can refute. The host
+      check is best-effort and cannot live in the write txn
+      (network I/O): a missing lockfile or failed attach proves
+      nothing either way, so it does not refuse (``host_check`` in
+      the output records which leg ran); ``--force`` skips this leg
+      and the heartbeat leg for the case the operator knows better.
+
+    Deletion covers every session-scoped row plus the mailbox
+    directory (delivery artifacts, not history); ``audit_events``
+    and the decision journal keep the audit trail.
+    """
+    sid = args.session_id
+    srow = db.get_session(sid, path=args.db)
+    if srow is None:
+        resp = JsonResponse(
+            session=sid,
+            status="not_found",
+            error=f"no registration for {sid}",
+        )
+        return _emit(args, resp, ExitCode.NOT_FOUND, f"not registered: {sid}")
+
+    host_check = "force"
+    if not args.force:
+        lock_data = find_lockfile()
+        if lock_data is None:
+            host_check = "no_lockfile"
+        else:
+            try:
+                st = verify_sessions([sid], lock_data=lock_data).get(sid)
+            except WakeError as e:
+                host_check = f"verify_failed:{e.reason}"
+            else:
+                # listed at all - even statusless (None) - is alive
+                # evidence: the host can still resume it
+                if st != SESSION_ABSENT:
+                    resp = JsonResponse(
+                        session=sid,
+                        status="conflict",
+                        error=f"verifiably alive in acp-host (status={st}) (--force to override)",
+                    )
+                    return _emit(
+                        args,
+                        resp,
+                        ExitCode.CONFLICT,
+                        f"conflict: {sid} alive in acp-host status={st} (--force to override)",
+                    )
+                host_check = "absent"
+
+    counts = db.unregister_session(sid, force=args.force, path=args.db)
+    if counts is None:
+        # raced with a concurrent unregister/cleanup - the row is
+        # already gone, which is the outcome the caller wanted
+        resp = JsonResponse(
+            session=sid,
+            status="not_found",
+            error=f"no registration for {sid} (removed concurrently)",
+        )
+        return _emit(
+            args,
+            resp,
+            ExitCode.NOT_FOUND,
+            f"not registered: {sid} (removed concurrently)",
+        )
+    if counts.get("refused") == "live_task":
+        resp = JsonResponse(
+            session=sid,
+            status="conflict",
+            error=(
+                f"task {counts['task_id']} is {counts['task_status']}"
+                " - close it before unregistering"
+            ),
+        )
+        return _emit(
+            args,
+            resp,
+            ExitCode.CONFLICT,
+            f"conflict: task {counts['task_id']} still {counts['task_status']}",
+        )
+    if counts.get("refused") == "fresh_heartbeat":
+        resp = JsonResponse(
+            session=sid,
+            status="conflict",
+            error=(
+                f"fresh heartbeat {counts['age_seconds']}s ago"
+                " - session is alive (--force to override)"
+            ),
+        )
+        return _emit(
+            args,
+            resp,
+            ExitCode.CONFLICT,
+            f"conflict: {sid} heartbeat {counts['age_seconds']}s ago (--force to override)",
+        )
+    mdir = mailbox_dir(sid, db_path=args.db, queue_dir=args.queue_dir)
+    mail_files = 0
+    if os.path.isdir(mdir):
+        try:
+            mail_files = len(os.listdir(mdir))
+        except OSError:
+            mail_files = None
+        shutil.rmtree(mdir, ignore_errors=True)
+    mailbox_removed = not os.path.isdir(mdir)
+    daemon._decision(
+        _state_dir(args),
+        "session_unregistered",
+        sid,
+        f"counts={counts} mail_files={mail_files} host={host_check}",
+    )
+    resp = JsonResponse(
+        session=sid,
+        status="unregistered",
+        queue_depth=_queue_depth(args),
+        data={
+            "counts": counts,
+            "mailbox_files_removed": mail_files,
+            "mailbox_removed": mailbox_removed,
+            "host_check": host_check,
+        },
+    )
+    tail = "" if mailbox_removed else " (mailbox dir survived removal!)"
+    files_text = "unknown" if mail_files is None else str(mail_files)
+    return _emit(
+        args,
+        resp,
+        ExitCode.OK,
+        f"unregistered {sid} ({files_text} mailbox file(s), host={host_check}){tail}",
+    )
+
+
 def _halt_targets(args) -> tuple[list[str], int | None]:
     """Session ids the halt/resume applies to; empty + usage rc.
 
@@ -3289,6 +3442,18 @@ def _parse_args(argv) -> argparse.Namespace:
     sp.add_argument("--reason", default=None, help="optional note appended to the RESUME body")
     _add_json(sp)
 
+    sp = sub.add_parser(
+        "unregister",
+        help="remove a dead/ghost registration and all its state",
+    )
+    sp.add_argument("session_id")
+    sp.add_argument(
+        "--force",
+        action="store_true",
+        help="skip the heartbeat and acp-host liveness refusals",
+    )
+    _add_json(sp)
+
     # supervisor daemon (item_13d); literal command name like
     # arm/disarm - the Command enum in cli/contract.py is frozen
     sp = sub.add_parser(
@@ -3542,6 +3707,7 @@ _HANDLERS = {
     "disarm": _cmd_disarm,
     "halt": _cmd_halt,
     "resume": _cmd_resume,
+    "unregister": _cmd_unregister,
     "daemon": _cmd_daemon,
     "register": _cmd_register,
     "ask": _cmd_ask,

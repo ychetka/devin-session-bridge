@@ -2098,3 +2098,73 @@ def test_item189_gwt8_auto_renew_cas_and_ceiling(db_path):
     # non-lease-live statuses never qualify
     assert db.finish_task(tid, "w1", ok=True, note="done", path=db_path) is True
     assert db.auto_renew_lease(tid, "w1", ceiling_seconds=3600, path=db_path) is False
+
+
+def test_item198_gwt8_unregister_session_counts_and_spared_audit(db_path):
+    """[ITEM-198.GWT-8] unregister_session deletes every
+    session-scoped row (sessions, heartbeats, tasks, notifications,
+    questions, schedules, wake_state), re-pends questions OTHER
+    askers lost their claimer to, spares audit_events, and returns
+    None for an unknown sid."""
+    res = db.register("ghost", "/r", path=db_path)
+    assert res.accepted
+    tid = db.enqueue("ghost", "x", path=db_path)
+    db.notify("ghost", NotificationKind.DISARM, "bye", path=db_path)
+    db.heartbeat("ghost", path=db_path)
+    # live tasks refuse the whole op - fold the fixture to terminal
+    # so the delete path itself is what the counts prove; the
+    # heartbeat row is aged too (a fresh one also refuses)
+    _exec(db_path, "UPDATE tasks SET status='done' WHERE id=?", (tid,))
+    _exec(
+        db_path,
+        "UPDATE worker_heartbeats SET last_seen_at=? WHERE session_id='ghost'",
+        (int(time.time()) - db.HEARTBEAT_STALE_SECONDS - 60,),
+    )
+    # another asker's question the ghost had claimed must re-pend,
+    # not dangle on a dead claimer
+    res2 = db.register("asker", "/r2", path=db_path)
+    assert res2.accepted
+    res3 = db.register("orc", "/r3", role="orchestrator", path=db_path)
+    assert res3.accepted
+    tid2 = db.enqueue("asker", "y", path=db_path)
+    qid = db.ask("asker", tid2, "q?", path=db_path).question_id
+    assert db.claim_question(qid, "ghost", path=db_path)
+
+    counts = db.unregister_session("ghost", path=db_path)
+
+    assert counts["sessions"] == 1 and counts["tasks"] == 1
+    assert counts["notifications"] == 1
+    assert counts["worker_heartbeats"] == 1
+    assert counts["questions_unclaimed"] == 1
+    assert db.get_session("ghost", path=db_path) is None
+    assert db.get_task(tid, path=db_path) is None
+    row = db.get_question(qid, path=db_path)
+    assert row["state"] == "pending" and row["claimed_by"] is None
+    # the asker is untouched
+    assert db.get_session("asker", path=db_path) is not None
+    assert db.get_task(tid2, path=db_path) is not None
+    # unknown sid -> None, nothing deleted
+    assert db.unregister_session("nope", path=db_path) is None
+
+
+def test_item198_gwt9_unregister_refusals_inside_txn(db_path):
+    """[ITEM-198.GWT-9] the db-side invariants are re-verified inside
+    the deletion transaction (TOCTOU fix): a live task refuses even
+    with force=True; a fresh heartbeat refuses unless force=True."""
+    res = db.register("s9", "/r9", path=db_path)
+    assert res.accepted
+    tid = db.enqueue("s9", "x", path=db_path)
+    out = db.unregister_session("s9", path=db_path)
+    assert out["refused"] == "live_task" and out["task_id"] == tid
+    out = db.unregister_session("s9", force=True, path=db_path)
+    assert out["refused"] == "live_task"  # force cannot kill a live task
+
+    # fold the queued task out of live states so the heartbeat leg is next
+    _exec(db_path, "UPDATE tasks SET status='failed' WHERE id=?", (tid,))
+    db.heartbeat("s9", path=db_path)
+    out = db.unregister_session("s9", path=db_path)
+    assert out["refused"] == "fresh_heartbeat" and out["age_seconds"] <= 2
+    # force skips the heartbeat leg
+    out = db.unregister_session("s9", force=True, path=db_path)
+    assert out["sessions"] == 1
+    assert db.get_session("s9", path=db_path) is None
