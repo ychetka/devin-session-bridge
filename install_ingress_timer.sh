@@ -12,6 +12,9 @@
 #
 # Env overrides: SESSIONS_BRIDGE_BIN, SESSIONS_BRIDGE_UNIT_DIR,
 # SESSIONS_BRIDGE_SYSTEMCTL (same as install_daemon_unit.sh).
+#
+# Auto-start on boot requires linger (same as the daemon unit):
+#   loginctl enable-linger "$USER"
 
 set -euo pipefail
 

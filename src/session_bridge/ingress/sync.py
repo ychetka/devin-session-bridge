@@ -64,7 +64,7 @@ def _load_state(state_dir: str) -> dict:
         "forwards": {
             str(k): v
             for k, v in forwards.items()
-            if isinstance(v, dict) and isinstance(v.get("pid"), int)
+            if str(k).isdigit() and isinstance(v, dict) and isinstance(v.get("pid"), int)
         }
     }
 

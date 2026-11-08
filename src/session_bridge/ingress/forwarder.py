@@ -38,9 +38,10 @@ def _enter_netns(pid: str) -> None:
 
 def _pump(a: socket.socket, b: socket.socket) -> None:
     """One direction a -> b. On EOF from a, propagate half-close to b
-    (SHUT_WR) but keep a open for the reverse pump - closing both
-    sockets on first EOF would break half-close protocols (e.g. a
-    request/response client that shuts down its write side early)."""
+    (SHUT_WR) and stop reading a - but do NOT close a: the reverse
+    pump may still be streaming the upstream's response into it
+    (half-close protocols). The caller closes both sockets after
+    both directions have finished."""
     try:
         while True:
             d = a.recv(65536)
@@ -50,14 +51,11 @@ def _pump(a: socket.socket, b: socket.socket) -> None:
     except OSError:
         pass
     finally:
-        try:
-            b.shutdown(socket.SHUT_WR)
-        except OSError:
-            pass
-        try:
-            a.close()
-        except OSError:
-            pass
+        for s, op in ((a, socket.SHUT_RD), (b, socket.SHUT_WR)):
+            try:
+                s.shutdown(op)
+            except OSError:
+                pass
 
 
 def main(argv: list[str]) -> int:
@@ -87,8 +85,15 @@ def main(argv: list[str]) -> int:
         except OSError:
             conn.close()
             return
-        threading.Thread(target=_pump, args=(up, conn), daemon=True).start()
+        reverse = threading.Thread(target=_pump, args=(up, conn), daemon=True)
+        reverse.start()
         _pump(conn, up)
+        reverse.join(timeout=30)
+        for s in (conn, up):
+            try:
+                s.close()
+            except OSError:
+                pass
 
     while True:
         conn, _ = srv.accept()

@@ -2711,6 +2711,8 @@ def _cmd_ingress(args) -> int:
             f"kept={summary.get('kept', [])} "
             f"errors={len(errors)}"
         ]
+        if not ok:
+            lines.append(f"skipped: {summary.get('reason')}")
         for err in errors:
             detail = err.get("spec") or err.get("row") or "?"
             lines.append(f"  port {err.get('port', detail)}: {err['error']}")

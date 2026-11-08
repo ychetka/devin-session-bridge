@@ -220,6 +220,23 @@ def test_sync_unresolved_target_errors(tmp_path):
     assert "unresolved" in out["errors"][0]["error"]
 
 
+def test_sync_concurrent_lock_skips(tmp_path):
+    """A second sync while the lock is held reports skipped, not a
+    crash - the timer and a manual call may legitimately race."""
+    import fcntl
+
+    state_dir = str(tmp_path / "state")
+    os.makedirs(state_dir)
+    lock = open(os.path.join(state_dir, sync_mod.LOCK_FILE), "w")
+    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    try:
+        out = sync_mod.sync(state_dir, _rows((9992, "fwd=tcp:127.0.0.1:1")))
+        assert out["status"] == "skipped"
+    finally:
+        fcntl.flock(lock, fcntl.LOCK_UN)
+        lock.close()
+
+
 def test_reserve_bind_requires_fwd(tmp_path):
     from session_bridge.cli import bridge
 
