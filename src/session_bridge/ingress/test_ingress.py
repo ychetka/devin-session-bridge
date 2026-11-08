@@ -91,13 +91,75 @@ def _free_port() -> int:
 
 
 def test_desired_forwards_filters():
-    d = sync_mod.desired_forwards(
+    d, errs = sync_mod.desired_forwards(
         [
             *_rows((80, "fwd=tcp:127.0.0.1:9 x"), (81, "plain row"), (82, None)),
             {"resource_type": "netns_id", "resource_id": "n", "purpose": "fwd=tcp:x:1"},
         ]
     )
-    assert set(d) == {80}
+    assert set(d) == {80} and errs == []
+
+
+def test_desired_forwards_row_isolation():
+    """A poisoned row degrades to a per-row error, not a crash of the
+    whole reconcile (review r1: stray fwd= in free text must not
+    DoS the timer for every other project)."""
+    d, errs = sync_mod.desired_forwards(
+        _rows(
+            (80, "fwd=bogus-spec"),
+            (81, "fwd=tcp:127.0.0.1:9 good"),
+            (82, "note: fwd=with:bad"),
+        )
+    )
+    assert set(d) == {81}
+    assert {e["row"] for e in errs} == {"80", "82"}
+
+
+def test_sync_bad_row_does_not_block_good_forward(tmp_path):
+    state_dir = str(tmp_path / "state")
+    good = _free_port()
+    rows = _rows((good, "fwd=tcp:127.0.0.1:1"), (88, "fwd=bogus"))
+    out = sync_mod.sync(state_dir, rows)
+    assert out["started"] == [good]
+    assert any(e["row"] == "88" for e in out["errors"])
+    sync_mod.sync(state_dir, [])
+
+
+def test_corrupt_state_file_degrades(tmp_path):
+    state_dir = str(tmp_path / "state")
+    os.makedirs(state_dir)
+    open(sync_mod._state_path(state_dir), "w").write("{not json")
+    port = _free_port()
+    out = sync_mod.sync(state_dir, _rows((port, "fwd=tcp:127.0.0.1:1")))
+    assert out["started"] == [port]
+    sync_mod.sync(state_dir, [])
+
+
+def test_unresolved_target_stops_old_forwarder(tmp_path):
+    """A forwarder whose target vanishes is torn down, not stranded
+    against a dead netns."""
+    state_dir = str(tmp_path / "state")
+    port = _free_port()
+    out = sync_mod.sync(state_dir, _rows((port, "fwd=tcp:127.0.0.1:1")))
+    assert out["started"] == [port]
+    pid = json.load(open(sync_mod._state_path(state_dir)))["forwards"][str(port)]["pid"]
+
+    # spec flips to an unresolvable ns-pidfile -> forwarder dies
+    missing = tmp_path / "gone.pid"
+    out = sync_mod.sync(state_dir, _rows((port, f"fwd=ns-pidfile:{missing}:80")))
+    assert out["stopped"] == [port] and len(out["errors"]) == 1
+    deadline = time.time() + 3
+    while time.time() < deadline and sync_mod._is_our_forwarder(pid, str(port)):
+        time.sleep(0.05)
+    assert not sync_mod._is_our_forwarder(pid, str(port))
+
+
+def test_bind_validation():
+    with pytest.raises(ValueError):
+        parse_fwd_spec("tcp:127.0.0.1:9", bind="not-an-ip")
+    with pytest.raises(ValueError):
+        parse_fwd_spec("tcp:127.0.0.1:9", bind="hostname.local")
+    assert parse_fwd_spec("tcp:127.0.0.1:9", bind="::1").bind == "::1"
 
 
 def test_sync_spawn_keep_stop(tmp_path):
@@ -156,6 +218,39 @@ def test_sync_unresolved_target_errors(tmp_path):
     )
     assert out["started"] == [] and len(out["errors"]) == 1
     assert "unresolved" in out["errors"][0]["error"]
+
+
+def test_reserve_bind_requires_fwd(tmp_path):
+    from session_bridge.cli import bridge
+
+    db_path = str(tmp_path / "state.db")
+    db.init(db_path)
+    rc = bridge.main(
+        [
+            "--db", db_path,
+            "reserve", "tcp_port", "59997",
+            "--project", "t",
+            "--bind", "127.0.0.1",
+        ]
+    )
+    assert rc == ExitCode.USAGE
+
+
+def test_reserve_bind_rejects_non_ip(tmp_path):
+    from session_bridge.cli import bridge
+
+    db_path = str(tmp_path / "state.db")
+    db.init(db_path)
+    rc = bridge.main(
+        [
+            "--db", db_path,
+            "reserve", "tcp_port", "59996",
+            "--project", "t",
+            "--fwd", "tcp:127.0.0.1:9",
+            "--bind", "hostname.local",
+        ]
+    )
+    assert rc == ExitCode.USAGE
 
 
 def test_e2e_tcp_relay(tmp_path):

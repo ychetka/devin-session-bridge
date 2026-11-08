@@ -159,13 +159,20 @@ Spec grammar:
 is stored as a `bind=<addr>` token next to `fwd=`.
 
 Reconcile semantics: a forwarder is kept while its row, spec and
-resolved target are unchanged; a changed spec or a changed pidfile
-target (stack restart) kills and respawns it. The reconciler only
-kills processes it spawned (cmdline marker + port must match), and
-`ns-pidfile` rows whose pidfile is unreadable produce a sync error,
-not a crash. Forwarder output lands in
-`<state_dir>/logs/ingress-fwd-<port>.log`; runtime bookkeeping in
-`<state_dir>/ingress.json`.
+resolved target are unchanged; a changed spec, a changed pidfile
+target (stack restart) or an unresolvable target kills and respawns
+it. The reconciler only kills processes it spawned (cmdline marker +
+port must match); malformed rows land in per-row sync errors instead
+of blocking other projects' forwards, and a sync with row errors
+exits non-zero so exit-code-gated deploys see partial failure.
+Forwarder output lands in `<state_dir>/logs/ingress-fwd-<port>.log`;
+runtime bookkeeping in `<state_dir>/ingress.json`.
+
+Trust model: `reserve --fwd` is deploy-script code, not untrusted
+input - any project may declare a listener (including wildcard binds
+or a setns target) for resources it owns; the registry arbitrates
+WHO holds a port, not WHAT the forward does. Abuse between projects
+is an orchestrator escalation, not a parser concern.
 
 trade-ai's own netns/dockerd stays trade-ai-owned: the project
 declares `fwd=ns-pidfile:<docker-static>/inner.pid:<inner>` rows and

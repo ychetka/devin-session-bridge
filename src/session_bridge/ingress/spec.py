@@ -20,6 +20,7 @@ Everything not matching the two tokens is ordinary free text.
 
 from __future__ import annotations
 
+import ipaddress
 import re
 from dataclasses import dataclass
 
@@ -55,8 +56,19 @@ def _port(raw: str, what: str) -> int:
     return port
 
 
+def validate_bind(bind: str) -> str:
+    """Bind addresses are literal IPs - a hostname would silently
+    turn the forwarder into a DNS-dependent deploy step."""
+    try:
+        ipaddress.ip_address(bind)
+    except ValueError:
+        raise ValueError(f"bind must be a literal IP address, got {bind!r}") from None
+    return bind
+
+
 def parse_fwd_spec(spec: str, *, bind: str = DEFAULT_BIND) -> ForwardSpec:
     """Parse a bare ``<kind>:<arg>:<port>`` spec string."""
+    validate_bind(bind)
     parts = spec.split(":")
     if len(parts) < 3 or parts[0] not in _KINDS:
         raise ValueError(

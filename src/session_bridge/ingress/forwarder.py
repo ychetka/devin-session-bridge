@@ -37,6 +37,10 @@ def _enter_netns(pid: str) -> None:
 
 
 def _pump(a: socket.socket, b: socket.socket) -> None:
+    """One direction a -> b. On EOF from a, propagate half-close to b
+    (SHUT_WR) but keep a open for the reverse pump - closing both
+    sockets on first EOF would break half-close protocols (e.g. a
+    request/response client that shuts down its write side early)."""
     try:
         while True:
             d = a.recv(65536)
@@ -46,11 +50,14 @@ def _pump(a: socket.socket, b: socket.socket) -> None:
     except OSError:
         pass
     finally:
-        for s in (a, b):
-            try:
-                s.shutdown(socket.SHUT_RDWR)
-            except OSError:
-                pass
+        try:
+            b.shutdown(socket.SHUT_WR)
+        except OSError:
+            pass
+        try:
+            a.close()
+        except OSError:
+            pass
 
 
 def main(argv: list[str]) -> int:

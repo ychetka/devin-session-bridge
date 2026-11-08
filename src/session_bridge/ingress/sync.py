@@ -51,10 +51,22 @@ def _log_path(state_dir: str, port: int) -> str:
 
 
 def _load_state(state_dir: str) -> dict:
+    """Reconciler bookkeeping; a corrupt/malformed file degrades to
+    empty state rather than crash-looping the 30s timer."""
     try:
-        return json.load(open(_state_path(state_dir)))
+        data = json.load(open(_state_path(state_dir)))
     except (OSError, ValueError):
         return {"forwards": {}}
+    forwards = data.get("forwards") if isinstance(data, dict) else None
+    if not isinstance(forwards, dict):
+        return {"forwards": {}}
+    return {
+        "forwards": {
+            str(k): v
+            for k, v in forwards.items()
+            if isinstance(v, dict) and isinstance(v.get("pid"), int)
+        }
+    }
 
 
 def _save_state(state_dir: str, state: dict) -> None:
@@ -133,16 +145,23 @@ def _spawn(state_dir: str, port: int, spec: ForwardSpec) -> int:
     return proc.pid
 
 
-def desired_forwards(rows) -> dict:
-    """{port: ForwardSpec} for tcp_port rows carrying a fwd token."""
-    out = {}
+def desired_forwards(rows) -> tuple[dict, list]:
+    """({port: ForwardSpec}, row_errors) for tcp_port rows carrying a
+    fwd token. Per-row isolation: a malformed row or a stray fwd=
+    substring in free text lands in row_errors - it must never poison
+    the whole reconcile for every other project."""
+    out, errors = {}, []
     for r in rows:
         if r["resource_type"] != "tcp_port":
             continue
-        spec = parse_purpose(r["purpose"])
-        if spec is not None:
-            out[int(r["resource_id"])] = spec
-    return out
+        try:
+            spec = parse_purpose(r["purpose"])
+            port = int(r["resource_id"])
+            if spec is not None:
+                out[port] = spec
+        except (ValueError, TypeError) as e:
+            errors.append({"row": r["resource_id"], "error": str(e)})
+    return out, errors
 
 
 def sync(state_dir: str, rows) -> dict:
@@ -155,8 +174,8 @@ def sync(state_dir: str, rows) -> dict:
             return {"status": "skipped", "reason": "another sync holds ingress.lock"}
         state = _load_state(state_dir)
         tracked = state["forwards"]
-        desired = desired_forwards(rows)
-        summary = {"started": [], "stopped": [], "kept": [], "errors": []}
+        desired, row_errors = desired_forwards(rows)
+        summary = {"started": [], "stopped": [], "kept": [], "errors": row_errors}
         now = int(time.time())
 
         # stop forwards whose row is gone or lost its fwd declaration
@@ -171,6 +190,14 @@ def sync(state_dir: str, rows) -> dict:
             resolved = resolve_target(spec)
             rec = tracked.get(port_s)
             if not resolved:
+                # target gone (stack down / pidfile unreadable): a
+                # listener pointing at a dead netns is worse than no
+                # listener - drop it; it respawns when the target is
+                # resolvable again
+                if rec is not None:
+                    tracked.pop(port_s)
+                    _kill(rec["pid"], port_s)
+                    summary["stopped"].append(port)
                 summary["errors"].append(
                     {"port": port, "error": "forward target unresolved", "spec": spec.spec_text}
                 )
@@ -216,7 +243,7 @@ def sync(state_dir: str, rows) -> dict:
 def status(state_dir: str, rows) -> dict:
     """Read-only view: desired rows vs tracked forwarder state."""
     tracked = _load_state(state_dir)["forwards"]
-    desired = desired_forwards(rows)
+    desired, row_errors = desired_forwards(rows)
     items = []
     for port, spec in sorted(desired.items()):
         rec = tracked.get(str(port))
@@ -234,4 +261,4 @@ def status(state_dir: str, rows) -> dict:
     # tracked forwarders whose row disappeared (should not happen
     # after a successful sync, but visible if it does)
     orphans = [int(p) for p in tracked if int(p) not in desired]
-    return {"forwards": items, "orphaned": orphans}
+    return {"forwards": items, "orphaned": orphans, "row_errors": row_errors}

@@ -2699,6 +2699,7 @@ def _cmd_ingress(args) -> int:
     if args.ingress_action == "sync":
         summary = ingress_sync.sync(sdir, rows)
         ok = summary.get("status") == "ok"
+        errors = summary.get("errors", [])
         resp = JsonResponse(
             status="ok" if ok else "skipped",
             data=summary,
@@ -2708,11 +2709,15 @@ def _cmd_ingress(args) -> int:
             f"started={summary.get('started', [])} "
             f"stopped={summary.get('stopped', [])} "
             f"kept={summary.get('kept', [])} "
-            f"errors={len(summary.get('errors', []))}"
+            f"errors={len(errors)}"
         ]
-        for err in summary.get("errors", []):
-            lines.append(f"  port {err['port']}: {err['error']} ({err.get('spec')})")
-        return _emit(args, resp, ExitCode.OK, "\n".join(lines))
+        for err in errors:
+            detail = err.get("spec") or err.get("row") or "?"
+            lines.append(f"  port {err.get('port', detail)}: {err['error']}")
+        # partial failures are visible to exit-code-gated callers:
+        # some forwards materialized, some failed -> not a clean OK
+        code = ExitCode.OK if ok and not errors else ExitCode.INTERNAL
+        return _emit(args, resp, code, "\n".join(lines))
     view = ingress_sync.status(sdir, rows)
     resp = JsonResponse(status="ok", data=view)
     if not view["forwards"]:
@@ -2724,6 +2729,8 @@ def _cmd_ingress(args) -> int:
     ]
     for port in view["orphaned"]:
         lines.append(f"{port} ORPHAN (tracked but row gone)")
+    for err in view.get("row_errors", []):
+        lines.append(f"row {err['row']}: BAD FWD ({err['error']})")
     return _emit(args, resp, ExitCode.OK, "\n".join(lines))
 
 
