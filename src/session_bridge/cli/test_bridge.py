@@ -2862,8 +2862,8 @@ def test_item207_gwt10_event_roundtrip_and_kind_gate(env, capsys):
 # --- task #208 (directive 426): host-level resource allocations ------------------
 
 
-def test_item208_gwt7_reserve_conflict_names_incumbent(env, capsys):
-    """[ITEM-208.GWT-7] `bridge reserve` grants a free key and the
+def test_item208_gwt11_reserve_conflict_names_incumbent(env, capsys):
+    """[ITEM-208.GWT-11] `bridge reserve` grants a free key and the
     conflicted caller gets CONFLICT with the incumbent owner in the
     wire payload - the hard-fail signal deploy scripts gate on."""
     rc, out = _run(
@@ -2891,8 +2891,8 @@ def test_item208_gwt7_reserve_conflict_names_incumbent(env, capsys):
     assert out["data"]["purpose"] == "n8n forward"
 
 
-def test_item208_gwt8_release_owner_gate_and_list(env, capsys):
-    """[ITEM-208.GWT-8] `bridge release` refuses a non-owner
+def test_item208_gwt12_release_owner_gate_and_list(env, capsys):
+    """[ITEM-208.GWT-12] `bridge release` refuses a non-owner
     (CONFLICT naming the incumbent), frees for the owner, and
     `bridge allocations` lists with type/project filters."""
     _run(["reserve", "tcp_port", "8443", "--project", "trade-ai", "--json"], capsys)
@@ -2919,8 +2919,8 @@ def test_item208_gwt8_release_owner_gate_and_list(env, capsys):
     assert [i["resource_type"] for i in out["data"]["allocations"]] == ["netns_id"]
 
 
-def test_item208_gwt9_reserve_usage_gates(env, capsys):
-    """[ITEM-208.GWT-9] bad resource_type, empty project and
+def test_item208_gwt13_reserve_usage_gates(env, capsys):
+    """[ITEM-208.GWT-13] bad resource_type, empty project and
     non-positive --ttl are USAGE refusals, never silent writes."""
     rc, _ = _run(["reserve", "bogus", "1", "--project", "p", "--json"], capsys)
     assert rc == ExitCode.USAGE
@@ -2933,8 +2933,8 @@ def test_item208_gwt9_reserve_usage_gates(env, capsys):
     assert out["data"]["allocations"] == []
 
 
-def test_item208_gwt10_wildcard_enforced_release_usage_and_session(env, capsys):
-    """[ITEM-208.GWT-10] the {project}-* wildcard lease conflicts a
+def test_item208_gwt14_wildcard_enforced_release_usage_and_session(env, capsys):
+    """[ITEM-208.GWT-14] the {project}-* wildcard lease conflicts a
     foreign exact request at the CLI boundary; `release` refuses a
     typo'd type as USAGE; `--session` lands in the allocations row."""
     _run(

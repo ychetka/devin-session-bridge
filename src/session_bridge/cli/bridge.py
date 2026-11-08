@@ -2552,20 +2552,29 @@ def _cmd_reserve(args) -> int:
     if isinstance(verdict, ReserveConflict):
         resp = JsonResponse(
             status="conflict",
-            error=f"{args.resource_type}/{args.resource_id} held by {verdict.owner}",
+            error=f"{args.resource_type}/{verdict.resource_id} held by {verdict.owner}",
             data={
                 "owner": verdict.owner,
+                "incumbent_resource_id": verdict.resource_id,
                 "purpose": verdict.purpose,
                 "created_at": verdict.created_at,
                 "expires_at": verdict.expires_at,
             },
+        )
+        # the incumbent key differs from the request only on a
+        # wildcard (systemd_unit_prefix `P-*`) conflict - name it so
+        # release --force arbitration needs no second query
+        key_note = (
+            f" via wildcard {verdict.resource_id}"
+            if verdict.resource_id != args.resource_id
+            else ""
         )
         return _emit(
             args,
             resp,
             ExitCode.CONFLICT,
             f"conflict: {args.resource_type}/{args.resource_id} held by {verdict.owner}"
-            + (f" ({verdict.purpose})" if verdict.purpose else ""),
+            f"{key_note}" + (f" ({verdict.purpose})" if verdict.purpose else ""),
         )
     assert isinstance(verdict, ReserveGranted)
     resp = JsonResponse(

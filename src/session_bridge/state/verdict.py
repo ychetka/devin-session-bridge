@@ -93,10 +93,14 @@ class ReserveGranted(_Verdict):
 
 class ReserveConflict(_Verdict):
     """A different project holds the key; its row is echoed so the
-    caller can report the existing owner without a second query."""
+    caller can report the existing owner - and on a wildcard
+    ``systemd_unit_prefix`` conflict, so the orchestrator's
+    ``release --force`` arbitration learns the incumbent's actual
+    key without a second query."""
 
     kind: Literal["conflict"] = "conflict"
     owner: str
+    resource_id: str
     purpose: str | None
     created_at: int
     expires_at: int | None

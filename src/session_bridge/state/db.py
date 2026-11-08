@@ -2160,9 +2160,11 @@ def reserve(
     one ``BEGIN IMMEDIATE`` transaction: the writer lock serializes
     racers end-to-end, so a concurrent reserve sees either a free
     key or the committed incumbent, never a lost update. A key held
-    by the SAME project renews (``purpose``/``session_id`` keep the
-    stored value when the caller passes none, ``expires_at`` is
-    re-stated), so a deploy pre-flight calling reserve() on every
+    by the SAME project renews (``purpose``/``session_id``/
+    ``expires_at`` keep the stored value when the caller passes
+    none - a bare re-run preserves the incumbent TTL instead of
+    silently making it permanent; clearing requires release +
+    re-reserve), so a deploy pre-flight calling reserve() on every
     run is idempotent. A key held by a different project yields
     ReserveConflict echoing the incumbent row; the caller reports
     the owner and hard-fails. For ``systemd_unit_prefix`` the check
@@ -2207,6 +2209,7 @@ def reserve(
                     con.execute("COMMIT")
                     return ReserveConflict(
                         owner=conflict_row["project_id"],
+                        resource_id=conflict_row["resource_id"],
                         purpose=conflict_row["purpose"],
                         created_at=conflict_row["created_at"],
                         expires_at=conflict_row["expires_at"],
@@ -2220,7 +2223,8 @@ def reserve(
                     " ON CONFLICT(resource_type,resource_id) DO UPDATE SET"
                     " purpose=COALESCE(excluded.purpose,allocations.purpose),"
                     " session_id=COALESCE(excluded.session_id,allocations.session_id),"
-                    " updated_at=excluded.updated_at,expires_at=excluded.expires_at",
+                    " expires_at=COALESCE(excluded.expires_at,allocations.expires_at),"
+                    " updated_at=excluded.updated_at",
                     (
                         resource_type,
                         resource_id,
@@ -2233,7 +2237,14 @@ def reserve(
                     ),
                 )
                 con.execute("COMMIT")
-                return ReserveGranted(renewed=renewed, expires_at=expires_at)
+                # report the expiry actually stored: a bare renew
+                # (no --ttl) keeps the incumbent TTL via COALESCE
+                final_expires = (
+                    expires_at
+                    if expires_at is not None
+                    else (row["expires_at"] if row is not None else None)
+                )
+                return ReserveGranted(renewed=renewed, expires_at=final_expires)
             except BaseException:
                 if con.in_transaction:
                     con.execute("ROLLBACK")
