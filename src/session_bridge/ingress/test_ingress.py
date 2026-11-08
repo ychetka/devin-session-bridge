@@ -38,9 +38,17 @@ def test_parse_ns_pid():
 
 
 def test_parse_rejects_garbage():
-    for bad in ["", "bogus", "bogus:1:2", "tcp:127.0.0.1", "tcp::80",
-                "ns-pid:abc:80", "tcp:127.0.0.1:0", "tcp:127.0.0.1:70000",
-                "ns-pidfile:relative.pid:80"]:
+    for bad in [
+        "",
+        "bogus",
+        "bogus:1:2",
+        "tcp:127.0.0.1",
+        "tcp::80",
+        "ns-pid:abc:80",
+        "tcp:127.0.0.1:0",
+        "tcp:127.0.0.1:70000",
+        "ns-pidfile:relative.pid:80",
+    ]:
         with pytest.raises(ValueError):
             parse_fwd_spec(bad)
 
@@ -244,10 +252,15 @@ def test_reserve_bind_requires_fwd(tmp_path):
     db.init(db_path)
     rc = bridge.main(
         [
-            "--db", db_path,
-            "reserve", "tcp_port", "59997",
-            "--project", "t",
-            "--bind", "127.0.0.1",
+            "--db",
+            db_path,
+            "reserve",
+            "tcp_port",
+            "59997",
+            "--project",
+            "t",
+            "--bind",
+            "127.0.0.1",
         ]
     )
     assert rc == ExitCode.USAGE
@@ -260,11 +273,17 @@ def test_reserve_bind_rejects_non_ip(tmp_path):
     db.init(db_path)
     rc = bridge.main(
         [
-            "--db", db_path,
-            "reserve", "tcp_port", "59996",
-            "--project", "t",
-            "--fwd", "tcp:127.0.0.1:9",
-            "--bind", "hostname.local",
+            "--db",
+            db_path,
+            "reserve",
+            "tcp_port",
+            "59996",
+            "--project",
+            "t",
+            "--fwd",
+            "tcp:127.0.0.1:9",
+            "--bind",
+            "hostname.local",
         ]
     )
     assert rc == ExitCode.USAGE
@@ -320,12 +339,19 @@ def test_reserve_fwd_flag(tmp_path, capsys):
     port = _free_port()
     rc = bridge.main(
         [
-            "--db", db_path,
-            "reserve", "tcp_port", str(port),
-            "--project", "t",
-            "--fwd", "tcp:127.0.0.1:9000",
-            "--bind", "127.0.0.1",
-            "--purpose", "demo",
+            "--db",
+            db_path,
+            "reserve",
+            "tcp_port",
+            str(port),
+            "--project",
+            "t",
+            "--fwd",
+            "tcp:127.0.0.1:9000",
+            "--bind",
+            "127.0.0.1",
+            "--purpose",
+            "demo",
         ]
     )
     assert rc == ExitCode.OK
@@ -342,10 +368,15 @@ def test_reserve_fwd_rejects_non_port(tmp_path):
     db.init(db_path)
     rc = bridge.main(
         [
-            "--db", db_path,
-            "reserve", "netns_id", "x",
-            "--project", "t",
-            "--fwd", "tcp:127.0.0.1:9",
+            "--db",
+            db_path,
+            "reserve",
+            "netns_id",
+            "x",
+            "--project",
+            "t",
+            "--fwd",
+            "tcp:127.0.0.1:9",
         ]
     )
     assert rc == ExitCode.USAGE

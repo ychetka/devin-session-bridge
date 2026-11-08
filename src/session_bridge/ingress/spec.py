@@ -71,9 +71,7 @@ def parse_fwd_spec(spec: str, *, bind: str = DEFAULT_BIND) -> ForwardSpec:
     validate_bind(bind)
     parts = spec.split(":")
     if len(parts) < 3 or parts[0] not in _KINDS:
-        raise ValueError(
-            f"fwd spec must be one of {', '.join(_KINDS)}:<arg>:<port>, got {spec!r}"
-        )
+        raise ValueError(f"fwd spec must be one of {', '.join(_KINDS)}:<arg>:<port>, got {spec!r}")
     kind = parts[0]
     if kind == "ns-pidfile":
         arg = ":".join(parts[1:-1])  # paths may contain ':'
