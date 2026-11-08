@@ -1798,18 +1798,23 @@ def _cmd_unregister(args) -> int:
     Ghost registrations - a sid that registered once and vanished -
     keep an active sessions row, stale outbox rows and an undrained
     mailbox that haunts every fleet status. Removal is guarded by
-    three refusals, each provable before the delete:
+    three refusals:
 
     - a live task still owns the lifecycle: fail/requeue it first;
-      deleting it mid-flight is a kill, not a cleanup.
+      deleting it mid-flight is a kill, not a cleanup. Enforced
+      inside the deletion transaction - no --force override.
     - a fresh heartbeat means a live client is on the bus right now
-      (authoritative for unmanaged sessions).
-    - the acp-host still lists the session: a resumable Devin session
-      is alive evidence no stale row can give. The host check is
-      best-effort - a missing lockfile or failed attach proves
+      (authoritative for unmanaged sessions); also enforced inside
+      the transaction so a heartbeat stamped between the legs and
+      the delete cannot be lost to a TOCTOU gap.
+    - the acp-host still lists the session: ANY listed entry -
+      including a statusless one - is a resumable Devin session and
+      therefore alive evidence no stale row can refute. The host
+      check is best-effort and cannot live in the write txn
+      (network I/O): a missing lockfile or failed attach proves
       nothing either way, so it does not refuse (``host_check`` in
-      the output records which leg ran); ``--force`` skips both
-      liveness legs for the case the operator knows better.
+      the output records which leg ran); ``--force`` skips this leg
+      and the heartbeat leg for the case the operator knows better.
 
     Deletion covers every session-scoped row plus the mailbox
     directory (delivery artifacts, not history); ``audit_events``
@@ -1825,43 +1830,8 @@ def _cmd_unregister(args) -> int:
         )
         return _emit(args, resp, ExitCode.NOT_FOUND, f"not registered: {sid}")
 
-    live = db.get_live_task(sid, path=args.db)
-    if live is not None:
-        resp = JsonResponse(
-            session=sid,
-            status="conflict",
-            error=f"task {live['id']} is {live['status']} - close it before unregistering",
-        )
-        return _emit(
-            args,
-            resp,
-            ExitCode.CONFLICT,
-            f"conflict: task {live['id']} still {live['status']}",
-        )
-
     host_check = "force"
     if not args.force:
-        con = db.connect(args.db)
-        try:
-            hb = con.execute(
-                "SELECT last_seen_at FROM worker_heartbeats WHERE session_id=?",
-                (sid,),
-            ).fetchone()
-        finally:
-            con.close()
-        hb_age = None if hb is None else int(time.time()) - hb["last_seen_at"]
-        if hb_age is not None and hb_age < db.HEARTBEAT_STALE_SECONDS:
-            resp = JsonResponse(
-                session=sid,
-                status="conflict",
-                error=f"fresh heartbeat {hb_age}s ago - session is alive (--force to override)",
-            )
-            return _emit(
-                args,
-                resp,
-                ExitCode.CONFLICT,
-                f"conflict: {sid} heartbeat {hb_age}s ago (--force to override)",
-            )
         lock_data = find_lockfile()
         if lock_data is None:
             host_check = "no_lockfile"
@@ -1871,7 +1841,9 @@ def _cmd_unregister(args) -> int:
             except WakeError as e:
                 host_check = f"verify_failed:{e.reason}"
             else:
-                if st is not None and st != SESSION_ABSENT:
+                # listed at all - even statusless (None) - is alive
+                # evidence: the host can still resume it
+                if st != SESSION_ABSENT:
                     resp = JsonResponse(
                         session=sid,
                         status="conflict",
@@ -1885,7 +1857,51 @@ def _cmd_unregister(args) -> int:
                     )
                 host_check = "absent"
 
-    counts = db.unregister_session(sid, path=args.db)
+    counts = db.unregister_session(sid, force=args.force, path=args.db)
+    if counts is None:
+        # raced with a concurrent unregister/cleanup - the row is
+        # already gone, which is the outcome the caller wanted
+        resp = JsonResponse(
+            session=sid,
+            status="not_found",
+            error=f"no registration for {sid} (removed concurrently)",
+        )
+        return _emit(
+            args,
+            resp,
+            ExitCode.NOT_FOUND,
+            f"not registered: {sid} (removed concurrently)",
+        )
+    if counts.get("refused") == "live_task":
+        resp = JsonResponse(
+            session=sid,
+            status="conflict",
+            error=(
+                f"task {counts['task_id']} is {counts['task_status']}"
+                " - close it before unregistering"
+            ),
+        )
+        return _emit(
+            args,
+            resp,
+            ExitCode.CONFLICT,
+            f"conflict: task {counts['task_id']} still {counts['task_status']}",
+        )
+    if counts.get("refused") == "fresh_heartbeat":
+        resp = JsonResponse(
+            session=sid,
+            status="conflict",
+            error=(
+                f"fresh heartbeat {counts['age_seconds']}s ago"
+                " - session is alive (--force to override)"
+            ),
+        )
+        return _emit(
+            args,
+            resp,
+            ExitCode.CONFLICT,
+            f"conflict: {sid} heartbeat {counts['age_seconds']}s ago (--force to override)",
+        )
     mdir = mailbox_dir(sid, db_path=args.db, queue_dir=args.queue_dir)
     mail_files = 0
     if os.path.isdir(mdir):
@@ -1894,6 +1910,7 @@ def _cmd_unregister(args) -> int:
         except OSError:
             mail_files = -1
         shutil.rmtree(mdir, ignore_errors=True)
+    mailbox_removed = not os.path.isdir(mdir)
     daemon._decision(
         _state_dir(args),
         "session_unregistered",
@@ -1907,14 +1924,16 @@ def _cmd_unregister(args) -> int:
         data={
             "counts": counts,
             "mailbox_files_removed": mail_files,
+            "mailbox_removed": mailbox_removed,
             "host_check": host_check,
         },
     )
+    tail = "" if mailbox_removed else " (mailbox dir survived removal!)"
     return _emit(
         args,
         resp,
         ExitCode.OK,
-        f"unregistered {sid} ({mail_files} mailbox file(s), host={host_check})",
+        f"unregistered {sid} ({mail_files} mailbox file(s), host={host_check}){tail}",
     )
 
 

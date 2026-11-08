@@ -2561,10 +2561,17 @@ def test_item198_gwt4_fresh_heartbeat_refused(env, capsys):
 
 def test_item198_gwt5_host_present_refused(env, monkeypatch, capsys):
     """[ITEM-198.GWT-5] the acp-host still lists the session - a
-    resumable Devin session is alive evidence: refused."""
+    resumable Devin session is alive evidence: refused. A statusless
+    entry (None) is listed too - 'present but unknown state' can
+    never read as 'absent' (review: statusless must refuse)."""
     _ghost(env)
     monkeypatch.setattr(bridge, "find_lockfile", lambda *a, **k: {"_p": 1})
     monkeypatch.setattr(bridge, "verify_sessions", lambda sids, **k: {SID: "idle"})
+    rc, out = _run(["unregister", SID, "--json"], capsys)
+    assert rc == ExitCode.CONFLICT and out["status"] == "conflict"
+    assert db.get_session(SID, path=env.db) is not None
+
+    monkeypatch.setattr(bridge, "verify_sessions", lambda sids, **k: {SID: None})
     rc, out = _run(["unregister", SID, "--json"], capsys)
     assert rc == ExitCode.CONFLICT and out["status"] == "conflict"
     assert db.get_session(SID, path=env.db) is not None
