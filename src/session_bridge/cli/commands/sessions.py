@@ -528,10 +528,11 @@ def _cmd_kill(args) -> int:
 
     The detach path for a session that is gone or must be cut loose
     NOW, without ``unregister``'s liveness refusals and row deletion:
-    the session row flips to ``dead``, live tasks demote to
-    ``dispatch_decided`` with leases released (a resurrected session
-    can re-claim them; the orchestrator can reroute), staged
-    dispatch leases release, and the heartbeat row is removed.
+    the session row flips to ``dead``, live tasks requeue with their
+    leases released (``queued`` is the only claimable re-entry state
+    - a resurrected session re-dispatches them through the normal
+    pump/claim path), staged ``dispatch_decided`` rows fold back to
+    ``queued``, and the heartbeat row is removed.
     Every effect lands inside one transaction together with a
     ``session_killed`` ``decision_events`` row, so the durable audit
     cannot separate from the effect.
@@ -550,7 +551,8 @@ def _cmd_kill(args) -> int:
         status="ok",
         data={
             "killed": True,
-            "tasks_demoted": verdict.tasks_demoted,
+            "tasks_requeued": verdict.tasks_requeued,
+            "staged_folded": verdict.staged_folded,
             "heartbeat_removed": verdict.heartbeat_removed,
             "status_before": verdict.status_before,
             "mode": verdict.mode,
@@ -558,7 +560,8 @@ def _cmd_kill(args) -> int:
     )
     human = (
         f"killed {sid}: status {verdict.status_before}->dead,"
-        f" {verdict.tasks_demoted} task(s) demoted to dispatch_decided,"
+        f" {verdict.tasks_requeued} task(s) requeued,"
+        f" {verdict.staged_folded} staged folded,"
         f" heartbeat {'removed' if verdict.heartbeat_removed else 'absent'}"
     )
     return _emit(args, resp, ExitCode.OK, human)

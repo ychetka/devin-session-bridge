@@ -2966,7 +2966,7 @@ def test_item208_gwt14_wildcard_enforced_release_usage_and_session(env, capsys):
 
 def test_item210_gwt16_kill_cli_and_event(env, capsys):
     """[ITEM-210.GWT-16] `bridge kill <sid>` detaches a session's live
-    state: dead row, demoted task, heartbeat gone, durable
+    state: dead row, requeued task, heartbeat gone, durable
     session_killed event readable back through `bridge events`."""
     db.register("w1", "/repo/w", path=env.db)
     db.heartbeat("w1", path=env.db)
@@ -2976,10 +2976,10 @@ def test_item210_gwt16_kill_cli_and_event(env, capsys):
     rc, out = _run(["kill", "w1", "--json"], capsys)
     assert rc == ExitCode.OK
     d = out["data"]
-    assert d["killed"] and d["tasks_demoted"] == 1 and d["heartbeat_removed"]
+    assert d["killed"] and d["tasks_requeued"] == 1 and d["heartbeat_removed"]
     assert d["status_before"] == "active"
     assert db.get_session("w1", path=env.db)["status"] == "dead"
-    assert db.get_task(tid, path=env.db)["status"] == "dispatch_decided"
+    assert db.get_task(tid, path=env.db)["status"] == "queued"
 
     rc, out = _run(["kill", "ghost", "--json"], capsys)
     assert rc == ExitCode.NOT_FOUND and out["status"] == "not_found"

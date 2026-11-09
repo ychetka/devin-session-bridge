@@ -2417,10 +2417,12 @@ def test_item208_gwt8_renew_keeps_purpose_release_gates(db_path):
 
 def test_item210_gwt15_kill_detaches_live_state(db_path):
     """[ITEM-210.GWT-15] kill_session: the session flips to dead, a
-    running task demotes to dispatch_decided with its lease released,
-    the staged dispatch_decided lease is released, the heartbeat row
-    is removed and a session_killed event is journaled - all in one
-    transaction. Unknown sids answer KillNotFound."""
+    running task requeues with its lease released (queued is the only
+    claimable re-entry state - leaseless dispatch_decided is
+    unclaimable limbo), staged dispatch_decided folds back to queued,
+    the heartbeat row is removed and a session_killed event is
+    journaled - all in one transaction. Unknown sids answer
+    KillNotFound."""
     assert isinstance(db.kill_session("ghost", path=db_path), KillNotFound)
 
     res = db.register("w1", "/repo/w", path=db_path)
@@ -2432,19 +2434,26 @@ def test_item210_gwt15_kill_detaches_live_state(db_path):
 
     v = db.kill_session("w1", path=db_path)
     assert isinstance(v, Killed)
-    assert v.tasks_demoted == 1 and v.heartbeat_removed and v.status_before == "active"
+    assert v.tasks_requeued == 1 and v.heartbeat_removed and v.status_before == "active"
 
     t = db.get_task(running, path=db_path)
-    assert t["status"] == TaskStatus.DISPATCH_DECIDED.value
+    assert t["status"] == TaskStatus.QUEUED.value
     assert t["lease_owner"] is None and t["lease_expires_at"] is None
     s = db.get_session("w1", path=db_path)
     assert s["status"] == SessionStatus.DEAD.value
     assert _one(db_path, "SELECT COUNT(*) c FROM worker_heartbeats WHERE session_id='w1'")["c"] == 0
     ev = db.list_events(session_id="w1", kind="session_killed", path=db_path)
-    assert len(ev) == 1 and "tasks_demoted=1" in ev[0]["body"]
+    assert len(ev) == 1 and "tasks_requeued=1" in ev[0]["body"]
 
-    # a task staged as dispatch_decided loses only its claim-window
-    # lease (one live task per session -> own session for this leg)
+    # no limbo: a resurrected session claims the requeued task through
+    # the normal managed path (review finding regression check)
+    db.register("w1", "/repo/w", path=db_path)
+    assert db.claim_managed(running, "w1", "w1-owner", path=db_path)
+    assert db.get_task(running, path=db_path)["status"] == TaskStatus.RUNNING.value
+
+    # a task staged as dispatch_decided folds back to queued with its
+    # claim-window lease released (one live task per session -> own
+    # session for this leg)
     db.register("w2", "/repo/w2", path=db_path)
     staged = db.enqueue("w2", "staged", path=db_path)
     _exec(
@@ -2458,9 +2467,9 @@ def test_item210_gwt15_kill_detaches_live_state(db_path):
         ),
     )
     v2 = db.kill_session("w2", path=db_path)
-    assert isinstance(v2, Killed) and v2.tasks_demoted == 0
+    assert isinstance(v2, Killed) and v2.tasks_requeued == 0 and v2.staged_folded == 1
     t2 = db.get_task(staged, path=db_path)
-    assert t2["status"] == TaskStatus.DISPATCH_DECIDED.value
+    assert t2["status"] == TaskStatus.QUEUED.value
     assert t2["lease_owner"] is None
 
     # a queued task never claimed a lease and stays queued
@@ -2469,6 +2478,14 @@ def test_item210_gwt15_kill_detaches_live_state(db_path):
     db.kill_session("w3", path=db_path)
     assert db.get_task(queued, path=db_path)["status"] == TaskStatus.QUEUED.value
 
-    # idempotent on an already-dead row: registration still exists
+    # a repeat kill still performs its effects: w1 resurrected above
+    # and re-claimed the task, so the second kill requeues it again
     v4 = db.kill_session("w1", path=db_path)
-    assert isinstance(v4, Killed) and v4.status_before == "dead"
+    assert isinstance(v4, Killed) and v4.status_before == "active" and v4.tasks_requeued == 1
+
+    # idempotent on an already-dead row with nothing left to change:
+    # a no-op repeat kill writes no duplicate audit event
+    db.register("w4", "/repo/w4", path=db_path)
+    assert isinstance(db.kill_session("w4", path=db_path), Killed)
+    assert isinstance(db.kill_session("w4", path=db_path), Killed)
+    assert len(db.list_events(session_id="w4", kind="session_killed", path=db_path)) == 1

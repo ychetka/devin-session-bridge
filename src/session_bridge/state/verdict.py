@@ -150,10 +150,11 @@ class KillNotFound(_Verdict):
 
 class Killed(_Verdict):
     """Live bridge state detached: session dead, leases released,
-    live tasks demoted, heartbeat row removed."""
+    live tasks requeued, heartbeat row removed."""
 
     kind: Literal["killed"] = "killed"
-    tasks_demoted: int
+    tasks_requeued: int
+    staged_folded: int
     heartbeat_removed: bool
     status_before: str
     mode: str | None

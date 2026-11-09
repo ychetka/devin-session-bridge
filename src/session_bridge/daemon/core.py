@@ -1328,7 +1328,7 @@ def _mail_stall_pass(
             ).fetchone()
         finally:
             con.close()
-        last_seen_s = now - hb["last_seen_at"] if hb is not None else -1
+        last_seen_s = max(0, now - hb["last_seen_at"]) if hb is not None else -1
         fields = (
             f"unacked={r['count']} oldest_mail_age_s={age}"
             f" pending_questions={pq} last_seen_s={last_seen_s}"
@@ -1342,6 +1342,18 @@ def _mail_stall_pass(
             " - drain is not reaching it"
             " (manual `bridge wake` or escalate to developer)"
         )
+        # journal BEFORE delivery: the decision_events row is the
+        # restart-proof payload the orchestrator's tg_escalate forward
+        # is sourced from - a crash between delivery and journaling
+        # must not lose it
+        db.record_event(
+            sid,
+            "mail_stall",
+            f"reason=mail_stall project={project or '-'} {fields}"
+            f" pending_foreign={r.get('foreign', 0)}"
+            f" target={target}",
+            path=db_path,
+        )
         if target == "orchestrator":
             db.notify(orch_sid, NotificationKind.NOTICE, body, path=db_path)
         else:
@@ -1352,14 +1364,6 @@ def _mail_stall_pass(
             sid,
             f"age={age}s count={r['count']} -> {target}"
             + (f" {orch_sid}" if target == "orchestrator" else ""),
-        )
-        db.record_event(
-            sid,
-            "mail_stall",
-            f"reason=mail_stall project={project or '-'} {fields}"
-            f" pending_foreign={r.get('foreign', 0)}"
-            f" target={target}",
-            path=db_path,
         )
     return max_age
 

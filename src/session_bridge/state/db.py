@@ -1742,18 +1742,29 @@ def kill_session(session_id: str, *, path=None) -> KillVerdict:
     The kill path for a session that must be detached NOW, without
     unregister's liveness refusals and row deletion: the session row
     flips to ``dead``, live tasks (``running``/``awaiting_user``)
-    demote to ``dispatch_decided`` with their leases released so a
-    resurrected session can re-claim them or the orchestrator can
-    reroute, staged ``dispatch_decided`` leases are released too, and
-    the heartbeat row is removed so metronome writes cannot keep the
-    corpse warm. ``queued`` tasks are left queued - they never
-    claimed a lease.
+    requeue with their leases released so a resurrected session
+    re-dispatches them through the normal pump/claim path, staged
+    ``dispatch_decided`` rows fold back to ``queued`` the same way
+    (``release_claim`` semantics - deterministic, no wait for the
+    claim-window lease to lapse), and the heartbeat row is removed so
+    metronome writes cannot keep the corpse warm. ``queued`` tasks
+    are left queued - they never claimed a lease.
+
+    ``queued`` - not ``dispatch_decided`` - is the only valid
+    re-entry state (review finding): a leaseless ``dispatch_decided``
+    row is unclaimable (``claim_managed`` binds ``lease_owner``),
+    invisible to recovery (``recover_stale`` needs
+    ``lease_expires_at``) and blocks ``ux_tasks_live_session``
+    forever - a terminal limbo, not a demotion.
 
     ``KillNotFound`` when the sid is not registered; ``Killed``
     carrying effect counts otherwise. All effects land inside one
     ``BEGIN IMMEDIATE`` and a ``session_killed`` row is appended to
     ``decision_events`` in the same transaction, so the durable audit
-    cannot be lost between commit and a second write.
+    cannot be lost between commit and a second write. A repeat kill
+    that changes nothing (already dead, no live tasks, no heartbeat)
+    writes no duplicate event and does not bump ``updated_at`` - the
+    command stays idempotent for audit as well as state.
     """
     ts = _now()
 
@@ -1774,44 +1785,54 @@ def kill_session(session_id: str, *, path=None) -> KillVerdict:
                 " updated_at=?"
                 " WHERE session_id=? AND status IN (?,?)",
                 (
-                    TaskStatus.DISPATCH_DECIDED.value,
+                    TaskStatus.QUEUED.value,
                     ts,
                     session_id,
                     TaskStatus.RUNNING.value,
                     TaskStatus.AWAITING_USER.value,
                 ),
             )
-            demoted = cur.rowcount
-            # staged dispatches hold a claim-window lease; release it
-            # so a reroute elsewhere is never blocked by a dead claim
-            con.execute(
-                "UPDATE tasks SET lease_owner=NULL,"
+            requeued = cur.rowcount
+            # staged dispatches hold a claim-window lease; fold them
+            # back to queued so the kill leaves zero leased rows and
+            # nothing waits on a dead claimant's expiry
+            cur = con.execute(
+                "UPDATE tasks SET status=?, lease_owner=NULL,"
                 " lease_expires_at=NULL, lease_renewed_at=NULL,"
                 " updated_at=?"
                 " WHERE session_id=? AND status=? AND lease_owner IS NOT NULL",
-                (ts, session_id, TaskStatus.DISPATCH_DECIDED.value),
+                (
+                    TaskStatus.QUEUED.value,
+                    ts,
+                    session_id,
+                    TaskStatus.DISPATCH_DECIDED.value,
+                ),
             )
+            staged = cur.rowcount
             hb = con.execute(
                 "DELETE FROM worker_heartbeats WHERE session_id=?",
                 (session_id,),
             ).rowcount
-            con.execute(
-                "UPDATE sessions SET status=?, updated_at=? WHERE session_id=?",
-                (SessionStatus.DEAD.value, ts, session_id),
-            )
-            con.execute(
-                "INSERT INTO decision_events(session_id,kind,body,created_at) VALUES (?,?,?,?)",
-                (
-                    session_id,
-                    "session_killed",
-                    f"tasks_demoted={demoted} heartbeat_removed={bool(hb)}"
-                    f" status_before={row['status']} mode={row['mode']}",
-                    ts,
-                ),
-            )
+            flipped = con.execute(
+                "UPDATE sessions SET status=?, updated_at=? WHERE session_id=? AND status<>?",
+                (SessionStatus.DEAD.value, ts, session_id, SessionStatus.DEAD.value),
+            ).rowcount
+            if flipped or requeued or staged or hb:
+                con.execute(
+                    "INSERT INTO decision_events(session_id,kind,body,created_at) VALUES (?,?,?,?)",
+                    (
+                        session_id,
+                        "session_killed",
+                        f"tasks_requeued={requeued} staged_folded={staged}"
+                        f" heartbeat_removed={bool(hb)}"
+                        f" status_before={row['status']} mode={row['mode']}",
+                        ts,
+                    ),
+                )
             con.commit()
             return Killed(
-                tasks_demoted=demoted,
+                tasks_requeued=requeued,
+                staged_folded=staged,
                 heartbeat_removed=bool(hb),
                 status_before=row["status"],
                 mode=row["mode"],
