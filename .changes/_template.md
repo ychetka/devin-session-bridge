@@ -17,3 +17,15 @@ why: why this change exists and why it was done this way.
 # refs: task IDs, issue/PR, directive/decision links.
 refs: issue #N
 ---
+
+## Spec impact
+# Required (task 226 / issue #107): list every docs/specs requirement
+# anchor this change touches - the PR applies its own spec delta, so
+# adds/modifies anchors must exist in docs/specs after the change and
+# removes anchors must be gone. Use a bare "-" when the change touches
+# no documented behavior. Anchors are kebab-case slugs of
+# "### Requirement: <name>" headings; tools/check_spec_anchors.sh
+# validates them (verify_constraints.sh runs it).
+- adds: docs/specs/<domain>.md#<requirement-anchor>
+- modifies: docs/specs/<domain>.md#<requirement-anchor>
+- removes: docs/specs/<domain>.md#<requirement-anchor>
