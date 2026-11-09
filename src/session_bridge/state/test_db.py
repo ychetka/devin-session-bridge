@@ -2683,32 +2683,25 @@ def test_quota_terminal_writers_clear_step_fields(db_path):
     assert db.get_task(tid2, path=db_path)["step_state"] is None
 
 
-def test_lease_ttl_env_override(tmp_path):
+def test_lease_ttl_env_override():
     """issue #105 (directive): ``SB_LEASE_TTL_S`` resolves once at db
-    import; a malformed value falls back to the contract default
-    instead of crashing the CLI import path."""
+    import; a malformed value falls back to the contract default,
+    and sub-floor values clamp at 2x the default renew margin."""
     code = "from session_bridge.state import db; print(db.LEASE_SECONDS)"
-    src = os.path.join(os.path.dirname(__file__), "..", "..")
-    env = {
-        **os.environ,
-        "PYTHONPATH": os.path.abspath(src),
-        "SB_LEASE_TTL_S": "7200",
-    }
-    out = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True)
-    assert out.returncode == 0
-    assert out.stdout.strip() == "7200"
-    env["SB_LEASE_TTL_S"] = "banana"
-    out = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True)
-    assert out.returncode == 0
-    assert out.stdout.strip() == "3600"
-    # below the 300s floor the resolved value clamps, never self-defeats
-    env["SB_LEASE_TTL_S"] = "36"
-    out = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True)
-    assert out.returncode == 0
-    assert out.stdout.strip() == "300"
+    src = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 
+    def resolved(env_override):
+        env = {**os.environ, "PYTHONPATH": src}
+        env.pop("SB_LEASE_TTL_S", None)
+        env.update(env_override)
+        out = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True)
+        assert out.returncode == 0
+        return out.stdout.strip()
 
-def test_lease_ttl_default_is_one_hour():
-    """issue #105: the documented default moved to 1h (task 213
-    postmortem) - contract and resolved value agree with no env."""
-    assert db.LEASE_SECONDS == 3600
+    assert resolved({"SB_LEASE_TTL_S": "7200"}) == "7200"
+    assert resolved({"SB_LEASE_TTL_S": "banana"}) == "3600"
+    # below the 600s floor (2x renew margin) the resolved value clamps
+    assert resolved({"SB_LEASE_TTL_S": "36"}) == "600"
+    # and the no-env default is the contract's 1h regardless of the
+    # ambient environment this suite was launched under
+    assert resolved({}) == "3600"

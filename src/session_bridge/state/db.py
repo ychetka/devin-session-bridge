@@ -106,11 +106,13 @@ def _env_int(name: str, default: int) -> int:
 #: unless ``SB_LEASE_TTL_S`` overrides it. Resolved once at import;
 #: every lease writer and downstream consumer (daemon auto-renew
 #: limit, dispatch renew interval, worker-log age) reads this value.
-#: Floored at 300s: a lease shorter than the default renew margin
-#: sits inside the renewal window permanently (and below 60s the
-#: renew cadence outruns the lease itself) - a floor at resolution
-#: is the only clamp possible for a base constant.
-LEASE_SECONDS: Final[int] = max(300, _env_int("SB_LEASE_TTL_S", contract.LEASE_SECONDS))
+#: Floored at 600s = 2x the default renew margin (300s, daemon
+#: ``SESSIONS_BRIDGE_LEASE_RENEW_MARGIN``): at or below the margin a
+#: lease sits inside the renewal window permanently - every pass
+#: would rewrite the row and re-verify the session for the whole
+#: ceiling. A floor at resolution is the only clamp possible for a
+#: base constant (db cannot reach the daemon's margin tunable).
+LEASE_SECONDS: Final[int] = max(600, _env_int("SB_LEASE_TTL_S", contract.LEASE_SECONDS))
 
 
 def _default_db_path() -> str:
