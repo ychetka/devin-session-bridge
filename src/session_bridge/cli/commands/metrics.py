@@ -39,7 +39,21 @@ _FIX_ROUND_ACTIONS = frozenset({"commit", "push", "commit_push"})
 # as daemon/core.py): consecutive ``mail_stall`` decision events
 # spaced at most this far apart are one episode, not N incidents -
 # the daemon re-arms and re-journals every cadence inside a stall.
-_STALL_REALERT_S = int(os.environ.get("SB_STALL_REALERT_S", "3600"))
+# Guarded parse: a malformed env must not brick module import (the
+# whole CLI imports this module via bridge.py).
+try:
+    _STALL_REALERT_S = int(os.environ.get("SB_STALL_REALERT_S", "3600"))
+except ValueError:
+    _STALL_REALERT_S = 3600
+if _STALL_REALERT_S <= 0:
+    _STALL_REALERT_S = 3600
+
+# Episode boundary: same-episode gaps are one cadence plus daemon
+# poll jitter (~POLL_INTERVAL_SECONDS + pass latency); +25% headroom
+# keeps jittered re-alerts inside their episode. Documented
+# approximation: a gap between cadence and this bound is still read
+# as same-episode.
+_STALL_EPISODE_GAP_S = _STALL_REALERT_S * 5 // 4
 
 
 def _parse_cycle_ts(ts) -> float | None:
@@ -132,25 +146,27 @@ def _stall_episodes(con, sid: str, since: int) -> int:
     episodes = 0
     prev = None
     for r in rows:
-        if prev is None or r["created_at"] - prev > _STALL_REALERT_S:
+        if prev is None or r["created_at"] - prev > _STALL_EPISODE_GAP_S:
             episodes += 1
         prev = r["created_at"]
     return episodes
 
 
-def _session_metrics(con, sid: str, since: int, fin_col: str) -> dict:
+def _session_metrics(con, sid: str, since: int, fin_expr: str) -> dict:
     """Bridge-db counters for one session inside the window.
 
-    ``fin_col`` is ``finished_at`` on current schemas, ``updated_at``
-    as a read-only fallback for pre-migration files (see init()).
+    ``fin_expr`` is ``COALESCE(finished_at,updated_at)`` on current
+    schemas (NULL-stamped terminal rows from a mixed-version window
+    still count), ``updated_at`` as a read-only fallback for
+    pre-migration files (see init()).
     """
     done_rows = con.execute(
-        f"SELECT created_at, {fin_col} AS fin FROM tasks WHERE session_id=?"
-        f" AND status=? AND {fin_col}>=?",
+        f"SELECT created_at, {fin_expr} AS fin FROM tasks WHERE session_id=?"
+        f" AND status=? AND {fin_expr}>=?",
         (sid, TaskStatus.DONE.value, since),
     ).fetchall()
     failed = con.execute(
-        f"SELECT COUNT(*) c FROM tasks WHERE session_id=? AND status=? AND {fin_col}>=?",
+        f"SELECT COUNT(*) c FROM tasks WHERE session_id=? AND status=? AND {fin_expr}>=?",
         (sid, TaskStatus.FAILED.value, since),
     ).fetchone()["c"]
     live_sql = ", ".join(f"'{s.value}'" for s in sorted(LIVE_STATUSES, key=str))
@@ -227,10 +243,15 @@ def _cmd_fleet_metrics(args) -> int:
         ).fetchall()
         # pre-finished_at files (created before v0.6 and never re-init'ed)
         # degrade to updated_at - approximate but the report still runs.
+        # COALESCE additionally covers NULL-stamped terminal rows written
+        # by a mixed-version daemon between schema upgrade and binary
+        # rollout.
         task_cols = {r["name"] for r in con.execute("PRAGMA table_info(tasks)")}
-        fin_col = "finished_at" if "finished_at" in task_cols else "updated_at"
+        fin_expr = (
+            "COALESCE(finished_at,updated_at)" if "finished_at" in task_cols else "updated_at"
+        )
         per_session = {
-            r["session_id"]: _session_metrics(con, r["session_id"], since, fin_col)
+            r["session_id"]: _session_metrics(con, r["session_id"], since, fin_expr)
             for r in sessions
         }
         orch_rows = con.execute(
@@ -239,8 +260,8 @@ def _cmd_fleet_metrics(args) -> int:
             (since,),
         ).fetchall()
         task_lat = con.execute(
-            f"SELECT {fin_col} - created_at AS d FROM tasks"
-            f" WHERE status=? AND {fin_col}>=? AND {fin_col}>created_at",
+            f"SELECT {fin_expr} - created_at AS d FROM tasks"
+            f" WHERE status=? AND {fin_expr}>=? AND {fin_expr}>created_at",
             (TaskStatus.DONE.value, since),
         ).fetchall()
     finally:
@@ -357,7 +378,7 @@ def _cmd_fleet_metrics(args) -> int:
     ]
     for i in sorted(data["incidents"], key=lambda r: str(r["ts"])):
         lines.append(
-            f"| {str(i['ts'])[:10]} | {_md(i['repo'])} | {_md(i['item'])}"
+            f"| {_md(str(i['ts'])[:10])} | {_md(i['repo'])} | {_md(i['item'])}"
             f" | {_md(i['action'])} | {_md(i['failure_class'])}"
             f" | {_md(i['status'])} | {_md(i['result'])} |"
         )

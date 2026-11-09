@@ -44,6 +44,7 @@ import os
 import re
 import sqlite3
 import time
+import urllib.parse
 from dataclasses import dataclass
 from enum import Enum
 
@@ -444,9 +445,14 @@ def connect_ro(path=None) -> sqlite3.Connection:
     an empty database - the caller turns that into a user-facing error.
     """
     target = _path(path)
-    con = sqlite3.connect(f"file:{target}?mode=ro", uri=True, timeout=5)
+    # percent-encode so a path carrying '?' or '%' stays inside the
+    # URI's file component
+    uri = f"file:{urllib.parse.quote(target)}?mode=ro"
+    con = sqlite3.connect(uri, uri=True, timeout=5)
     con.row_factory = sqlite3.Row
     con.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
+    # Probe the header so a corrupt file fails here, not mid-report.
+    con.execute("PRAGMA schema_version").fetchone()
     return con
 
 

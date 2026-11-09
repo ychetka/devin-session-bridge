@@ -29,8 +29,11 @@ created as a side effect).
   exact-kind `plan_delta` decision_events, questions asked, and
   median `finished_at - created_at` cycle time. `mail_stall` decision
   events collapse into episodes: the daemon re-journals every
-  `SB_STALL_REALERT_S` inside one stall, so events spaced at most one
-  cadence apart count once.
+  `SB_STALL_REALERT_S` plus poll jitter inside one stall, so events
+  spaced at most `realert * 1.25` apart count once (documented
+  approximation - the jitter bound keeps delayed re-alerts inside
+  their episode without merging genuinely separate stalls, which need
+  the 1800s threshold to re-arm).
 - Per-repo (unique normalized session `cwd` values = the
   session-to-repo registry): incidents grouped by `failure_class`
   (failures and escalations both count; an escalated row without a

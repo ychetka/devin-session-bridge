@@ -3088,15 +3088,17 @@ def test_item98_gwt2_window_filter_and_no_cycle_log(env, capsys, tmp_path):
 
 def test_item98_gwt3_stall_events_collapse_to_episodes(env, capsys):
     """[ITEM-98.GWT-3] consecutive mail_stall decision events inside
-    one re-alert cadence count as ONE episode; a gap over
-    SB_STALL_REALERT_S opens a new episode - the daemon re-journals
-    every cadence inside a stall, so the raw count would inflate the
-    metric for the worst stalls."""
+    one re-alert cadence (plus poll jitter) count as ONE episode; a
+    gap beyond the episode bound opens a new episode - the daemon
+    re-journals every cadence inside a stall, so the raw count would
+    inflate the metric for the worst stalls."""
     db.register("w1", "/tmp/none", path=env.db)
     base = int(time.time()) - 20000
     con = db.connect(env.db)
     try:
-        for off in (0, 600, 1200, 8400):
+        # 0 -> +3720 -> +7320: realert cadence with poll jitter stays
+        # ONE episode; +20000 (gap ~12700s) opens a second.
+        for off in (0, 3720, 7320, 20000):
             con.execute(
                 "INSERT INTO decision_events(session_id,kind,body,created_at) VALUES(?,?,?,?)",
                 ("w1", "mail_stall", "x", base + off),
