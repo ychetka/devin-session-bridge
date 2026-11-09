@@ -90,7 +90,8 @@ def test_gwt1_groups_sections_by_type_and_scope(tmp_path):
     out = res.stdout
     assert out.startswith("## [0.5.2] - ")
     uf, _, cb = out.partition("### Codebase")
-    assert "#### feat **(breaking)**" in uf and "frobnicate" in uf
+    assert "#### feat" in uf and "frobnicate" in uf
+    assert "**[breaking]**" in uf  # per-entry marker, not group-wide
     assert "#### fix" in uf and "wake detection" in uf
     assert "Internal tidy" not in uf
     assert "#### cli" in cb and "#### daemon" in cb
@@ -214,7 +215,8 @@ def test_gwt8_validation_branches(tmp_path):
     user_summary on a visible entry."""
     repo = _scratch(tmp_path)
     _entry(repo, "0001-badtype.md", type="banana")
-    assert _run(repo).returncode != 0 and "bad type" in _run(repo).stderr
+    res = _run(repo)
+    assert res.returncode != 0 and "bad type" in res.stderr
     (repo / ".changes" / "0001-badtype.md").unlink()
 
     _entry(repo, "0002-badbool.md", visible="maybe")

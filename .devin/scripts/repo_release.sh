@@ -88,6 +88,14 @@ else
     echo '{"status":"error","failure_class":"upstream_error","message":"tag create/push failed"}'; exit 1; }
 fi
 
+if gh release view "$TAG" >/dev/null 2>&1; then
+  # Idempotent re-run: the release landed on a previous attempt but
+  # the success output was lost - report released instead of failing
+  # on the already-existing release.
+  echo "{\"status\":\"released\",\"tag\":\"$TAG\",\"from\":\"$LATEST\",\"sha\":\"$SHA\",\"note\":\"already-existed\"}"
+  exit 0
+fi
+
 if [ -n "$NOTES" ]; then
   gh release create "$TAG" --notes "$NOTES" >/dev/null 2>&1
 else

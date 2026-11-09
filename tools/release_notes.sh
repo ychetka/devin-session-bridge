@@ -106,11 +106,10 @@ for t in TYPES:
     group = [e for e in visible if e["type"] == t]
     if not group:
         continue
-    flag = " **(breaking)**" if any(e["breaking"] == "true" for e in group) else ""
-    out.append(f"#### {t}{flag}")
+    out.append(f"#### {t}")
     for e in group:
         refs = f" ({e['refs']})" if e["refs"] not in ("", "-") else ""
-        brk = " **[breaking]**" if e["breaking"] == "true" and not flag else ""
+        brk = " **[breaking]**" if e["breaking"] == "true" else ""
         out.append(f"- {e['user_summary']} `{e['scope']}`{brk}{refs}")
     out.append("")
 
