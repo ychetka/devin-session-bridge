@@ -982,8 +982,13 @@ def requeue_or_fail(task_id: int, note: str | None = None, *, path=None):
     was already moved.
     """
     ts = _now()
+    # a quota park landing between the caller's SELECT and this UPDATE
+    # wins: the CAS guard refuses to fold a row that parked mid-race
+    # (same predicate recover_stale's SELECT and requeue_dead_worker
+    # carry - task #216 review)
     guard = (
-        " WHERE id=? AND status IN (?, ?) AND lease_expires_at IS NOT NULL AND lease_expires_at<?"
+        " WHERE id=? AND status IN (?, ?) AND lease_expires_at IS NOT NULL"
+        " AND lease_expires_at<? AND COALESCE(step_state,'')<>'waiting_quota'"
     )
     guard_args = (
         TaskStatus.RUNNING.value,
@@ -1466,7 +1471,8 @@ def set_awaiting_user(task_id: int, owner: str, note: str | None = None, *, path
             cur = con.execute(
                 "UPDATE tasks SET status=?, note=COALESCE(?,note),"
                 " lease_owner=NULL, lease_expires_at=NULL, updated_at=?"
-                " WHERE id=? AND status=? AND lease_owner=?",
+                + _STEP_CLEAR_SQL
+                + " WHERE id=? AND status=? AND lease_owner=?",
                 (
                     TaskStatus.AWAITING_USER.value,
                     note,

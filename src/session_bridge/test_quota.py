@@ -82,3 +82,25 @@ def test_junk_and_ambiguous_text():
     """No marker or no window, no park."""
     assert parse_quota_signal("random prose") is None
     assert parse_reset_at("rate limit someday", 1000) is None
+
+
+def test_malformed_clock_time_no_crash():
+    """Review r1: 'resets at 24:30 UTC' / '99:99 UTC' matched the clock
+    regex but crashed datetime.replace - worker text must degrade to
+    signal-without-window, never raise."""
+    for text in ("rate limit resets at 24:30 UTC", "quota reset at 99:99 UTC"):
+        sig = parse_quota_signal(text)
+        assert sig is not None
+        assert sig["reset_at"] is None
+
+
+def test_absurd_relative_duration_no_overflow():
+    """Review r1: 'retry after 99999999999999999999 hours' overflowed
+    the sqlite epoch bind - absurd windows degrade to no-window."""
+    sig = parse_quota_signal("rate limited, retry after 99999999999999999999 hours")
+    assert sig is not None
+    assert sig["reset_at"] is None
+    # and a sane-but-large window still parses
+    now = int(time.time())
+    sig = parse_quota_signal("rate limited, retry after 48 hours", now)
+    assert sig["reset_at"] == now + 172800

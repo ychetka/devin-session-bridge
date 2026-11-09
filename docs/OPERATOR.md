@@ -153,10 +153,12 @@ Storage layout (state dir = the directory holding `state.db`, default
    reset window is open, daemon wakes and `bridge wake` are
    suppressed (`suppressed: waiting_quota until <reset_at>`); when
    `quota_reset_at` passes, the daemon's quota pass clears the park,
-   re-arms the lease and sends exactly one control probe. A provider
-   still limited re-parks via the self-report channel with the new
-   reset. HALT stays senior - a halted session's park is not swept
-   until `bridge resume`. Channels: manual `bridge quota-park <sid>
+   re-arms the lease and sends one control probe; a probe that cannot
+   be delivered (paced, no lockfile, transport error) re-parks for a
+   short defer window instead of burning the attempt budget on a
+   lapsed lease. A provider still limited re-parks via the
+   self-report channel with the new reset. HALT stays senior - a
+   halted session's park is not swept until `bridge resume`. Channels: manual `bridge quota-park <sid>
    --task N --reset-at <iso|HH:MM UTC> --note "<error>" [--model M]
    [--checkpoint "<where>"]`, early release `bridge quota-resume
    <sid> --task N`, and auto-park when a `bridge event`/`bridge

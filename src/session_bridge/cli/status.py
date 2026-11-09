@@ -83,11 +83,10 @@ def _session_views(args) -> tuple[list[dict], list[Event], int]:
 
         notify_task = None
         log_path = stderr_tail = None
-        if (
-            live is not None
-            and live["status"] == TaskStatus.RUNNING.value
-            and live["step_state"] == "waiting_quota"
-        ):
+        if live is not None and live["step_state"] == "waiting_quota":
+            # the park overrides the lifecycle word on every live
+            # status - quota_park accepts any live task, not just
+            # running (task #216 review)
             state = STATE_PARKED
             action = f"waiting_quota until {_quota_reset_label(live)}"
         elif live is not None and live["status"] == TaskStatus.RUNNING.value:

@@ -2267,3 +2267,22 @@ def test_quota_halt_wins_over_reset(env, monkeypatch):
     db.set_session_halted(SID, False, path=env.db)
     assert daemon.run(env.db, env.qdir, once=True, notify_send=env.notifier) == daemon.RUN_OK
     assert calls == [SID]
+
+
+def test_quota_undelivered_probe_defers_not_spends(env, monkeypatch):
+    """GWT-216-15 (review r1): a probe that cannot be delivered - here
+    no acp-host lockfile - re-parks the task for a short defer window
+    instead of leaving the re-armed lease to burn an attempt."""
+    _managed_fresh(env)
+    tid = _parked_task(env, reset_in=-10)
+    calls = []
+    monkeypatch.setattr(daemon, "wake_session", lambda sid, *a, **k: calls.append(sid) or "sent")
+    monkeypatch.setattr(daemon, "find_lockfile", lambda *a, **k: None)
+
+    assert daemon.run(env.db, env.qdir, once=True, notify_send=env.notifier) == daemon.RUN_OK
+    assert calls == []
+    row = db.get_task(tid, path=env.db)
+    assert row["step_state"] == "waiting_quota"
+    assert row["quota_source"] == "probe-defer"
+    assert row["attempt"] == 0
+    assert any(d["event"] == "quota_probe_deferred" for d in _decisions(env))

@@ -1099,6 +1099,39 @@ def _lease_renew_pass(db_path, state_directory, now: int) -> None:
             )
 
 
+#: how long a released park re-parks when its single control probe
+#: could not be delivered (paced, no lockfile, WakeError) - spending
+#: the episode without delivering the nudge would let the re-armed
+#: lease lapse into recover_stale and burn an attempt, which is the
+#: exact failure the park exists to prevent (task #216 review).
+_QUOTA_PROBE_DEFER_SECONDS = 120
+
+
+def _defer_probe(db_path, state_directory, sid, task_id, now: int, why: str) -> None:
+    """Re-park a released task when its control probe could not run.
+
+    A short fresh window keeps ``waiting_quota`` semantics alive (no
+    attempt spent, no wake noise) until the next sweep retries the
+    probe - the alternative, leaving the re-armed lease to lapse,
+    would fold the task into ``recover_stale`` for a delivery problem,
+    not a worker problem.
+    """
+    if db.quota_park(
+        task_id,
+        sid,
+        now + _QUOTA_PROBE_DEFER_SECONDS,
+        f"control probe deferred ({why})",
+        "probe-defer",
+        path=db_path,
+    ):
+        _decision(
+            state_directory,
+            "quota_probe_deferred",
+            sid,
+            f"task={task_id} why={why}",
+        )
+
+
 def _quota_pass(db_path, state_directory, now: int, policy: WakePolicy) -> None:
     """Lift expired ``waiting_quota`` parks and fire the control probe.
 
@@ -1112,11 +1145,16 @@ def _quota_pass(db_path, state_directory, now: int, policy: WakePolicy) -> None:
     failures extend the park instead of burning attempts or spamming
     wakes. The ordinary wake cooldown applies so a reset storm cannot
     burst probes past the pacing policy.
+
+    A probe that never lands (paced, no lockfile, WakeError) is not
+    spent silently: ``_defer_probe`` re-parks the task for a short
+    defer window and the next sweep retries - otherwise the re-armed
+    lease would lapse into ``recover_stale`` and burn the attempt
+    budget the park protects.
     """
     rows = db.unpark_quota_expired(now, path=db_path)
     if not rows:
         return
-    lock_data = find_lockfile()
     for r in rows:
         sid = r["session_id"]
         _decision(state_directory, "quota_unparked", sid, f"task={r['id']}")
@@ -1127,14 +1165,16 @@ def _quota_pass(db_path, state_directory, now: int, policy: WakePolicy) -> None:
             task_id=r["id"],
             path=db_path,
         )
+        # Re-read the lockfile per attempt like _wake_pass: the host
+        # can rotate (restart -> new port/token) between candidates of
+        # one pass, and a stale key must not poison the breaker.
+        lock_data = find_lockfile()
         if lock_data is None:
+            _defer_probe(db_path, state_directory, sid, r["id"], now, "no_lockfile")
             continue
         host_key = lock_data["_path"]
         if policy.check(sid, host_key) is not None:
-            # cooldown/breaker pacing may absorb the probe - it is
-            # already spent by the sweep, so no retry queue exists;
-            # the session resumes on its next organic wake
-            _decision(state_directory, "quota_probe_paced", sid, f"task={r['id']}")
+            _defer_probe(db_path, state_directory, sid, r["id"], now, "paced")
             continue
         policy.record_attempt(sid)
         try:
@@ -1155,6 +1195,7 @@ def _quota_pass(db_path, state_directory, now: int, policy: WakePolicy) -> None:
                 sid,
                 f"task={r['id']} reason={e.reason}",
             )
+            _defer_probe(db_path, state_directory, sid, r["id"], now, f"probe_{e.reason}")
             continue
         policy.record_result(host_key, True)
         _decision(state_directory, "quota_probe_sent", sid, f"task={r['id']} outcome={outcome}")

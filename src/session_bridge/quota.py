@@ -41,9 +41,17 @@ _RESET_AT_ISO = re.compile(
 
 _UNIT_SECONDS = {"s": 1, "m": 60, "h": 3600}
 
+#: ceiling for relative reset windows ("retry after N hours"): worker
+#: text is untrusted input, so an absurd duration degrades to
+#: "signal without a window" instead of overflowing the epoch bind.
+_MAX_RELATIVE_SECONDS = 30 * 86400
 
-def _clock_reset(hh: int, mm: int, now: float) -> float:
-    """Epoch of the next ``HH:MM`` UTC wall-clock point after ``now``."""
+
+def _clock_reset(hh: int, mm: int, now: float) -> float | None:
+    """Epoch of the next ``HH:MM`` UTC wall-clock point after ``now``,
+    or None when the captured time is not a real clock time."""
+    if not (0 <= hh <= 23 and 0 <= mm <= 59):
+        return None
     base = datetime.now(timezone.utc)
     today = base.replace(hour=hh, minute=mm, second=0, microsecond=0)
     if today.timestamp() <= now:
@@ -66,11 +74,14 @@ def parse_reset_at(text: str, now: float | None = None) -> int | None:
             pass
     m = _RESET_AT_CLOCK.search(text)
     if m:
-        return int(_clock_reset(int(m.group(1)), int(m.group(2)), now))
+        reset = _clock_reset(int(m.group(1)), int(m.group(2)), now)
+        if reset is not None:
+            return int(reset)
     m = _RESET_IN.search(text)
     if m:
-        unit = m.group(2)[0].lower()
-        return int(now + int(m.group(1)) * _UNIT_SECONDS[unit])
+        seconds = int(m.group(1)) * _UNIT_SECONDS[m.group(2)[0].lower()]
+        if seconds <= _MAX_RELATIVE_SECONDS:
+            return int(now + seconds)
     return None
 
 
