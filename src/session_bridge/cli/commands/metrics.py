@@ -174,7 +174,7 @@ def _session_metrics(con, sid: str, since: int, fin_expr: str) -> dict:
         f"SELECT COUNT(*) c FROM tasks WHERE session_id=? AND status IN ({live_sql})",
         (sid,),
     ).fetchone()["c"]
-    cycles = [r["fin"] - r["created_at"] for r in done_rows]
+    cycles = [r["fin"] - r["created_at"] for r in done_rows if r["fin"] > r["created_at"]]
     plan_delta = con.execute(
         "SELECT COUNT(*) c FROM decision_events WHERE session_id=?"
         " AND kind='plan_delta' AND created_at>=?",

@@ -449,11 +449,15 @@ def connect_ro(path=None) -> sqlite3.Connection:
     # URI's file component
     uri = f"file:{urllib.parse.quote(target)}?mode=ro"
     con = sqlite3.connect(uri, uri=True, timeout=5)
-    con.row_factory = sqlite3.Row
-    con.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
-    # Probe the header so a corrupt file fails here, not mid-report.
-    con.execute("PRAGMA schema_version").fetchone()
-    return con
+    try:
+        con.row_factory = sqlite3.Row
+        con.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
+        # Probe the header so a corrupt file fails here, not mid-report.
+        con.execute("PRAGMA schema_version").fetchone()
+        return con
+    except BaseException:
+        con.close()
+        raise
 
 
 def init(path=None) -> None:
