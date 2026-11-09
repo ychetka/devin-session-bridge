@@ -381,6 +381,7 @@ _TASK_COLUMN_MIGRATIONS = (
     ("quota_source", "TEXT"),
     ("quota_model", "TEXT"),
     ("quota_checkpoint", "TEXT"),
+    ("quota_defer_count", "INTEGER"),
 )
 
 # Columns the item_139 schema adds to wake_state, applied idempotently
@@ -395,7 +396,7 @@ _SESSION_FIELDS = frozenset({"cwd", "title", "queue_paused", "park_cycles_left",
 #: finishes, requeues, retries, manual demotes).
 _QUOTA_CLEAR_SQL = (
     ", quota_reset_at=NULL, quota_note=NULL, quota_source=NULL,"
-    " quota_model=NULL, quota_checkpoint=NULL"
+    " quota_model=NULL, quota_checkpoint=NULL, quota_defer_count=NULL"
 )
 _STEP_CLEAR_SQL = ", step_state=NULL" + _QUOTA_CLEAR_SQL
 
@@ -1235,6 +1236,8 @@ def quota_park(
     source: str,
     model: str | None = None,
     checkpoint: str | None = None,
+    defer: bool = False,
+    require_unparked: bool = False,
     *,
     path=None,
 ) -> bool:
@@ -1244,8 +1247,16 @@ def quota_park(
     claimant still owns the step, no second claimant can be issued a
     lease, and ``recover_stale``/``requeue_dead_worker`` skip the row
     while ``step_state='waiting_quota'``. ``source`` records
-    provenance (``manual`` / ``self-report``); ``reset_at`` is the
-    provider's quota-reset epoch the daemon's quota pass waits on.
+    provenance (``manual`` / ``self-report`` / ``probe-defer``);
+    ``reset_at`` is the provider's quota-reset epoch the daemon's
+    quota pass waits on.
+
+    ``defer=True`` is the probe-deferral re-park: it increments the
+    per-episode ``quota_defer_count`` while every real park (manual,
+    self-report) resets it - consecutive deferrals bound at the daemon
+    layer without leaking across episodes. ``require_unparked=True``
+    CASes on ``step_state IS NULL`` so a defer can never overwrite a
+    fresher park that landed mid-sweep.
     """
     ts = _now()
 
@@ -1255,14 +1266,19 @@ def quota_park(
             cur = con.execute(
                 f"UPDATE tasks SET step_state='waiting_quota',"
                 f" quota_reset_at=?, quota_note=?, quota_source=?,"
-                f" quota_model=?, quota_checkpoint=?, updated_at=?"
-                f" WHERE id=? AND session_id=? AND status IN ({_LIVE_SQL})",
+                f" quota_model=?, quota_checkpoint=?,"
+                f" quota_defer_count=CASE WHEN ? THEN"
+                f" COALESCE(quota_defer_count,0)+1 ELSE 0 END,"
+                f" updated_at=?"
+                f" WHERE id=? AND session_id=? AND status IN ({_LIVE_SQL})"
+                + (" AND step_state IS NULL" if require_unparked else ""),
                 (
                     reset_at,
                     note,
                     source,
                     model,
                     checkpoint,
+                    defer,
                     ts,
                     task_id,
                     session_id,
@@ -1366,7 +1382,8 @@ def quota_resume(task_id: int, session_id: str, *, path=None) -> bool:
                 "UPDATE tasks SET step_state=NULL,"
                 " quota_reset_at=NULL, quota_note=NULL,"
                 " quota_source=NULL, quota_model=NULL,"
-                " quota_checkpoint=NULL, lease_expires_at=?,"
+                " quota_checkpoint=NULL, quota_defer_count=NULL,"
+                " lease_expires_at=?,"
                 " lease_renewed_at=?, updated_at=?"
                 " WHERE id=? AND session_id=?"
                 " AND step_state='waiting_quota'"

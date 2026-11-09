@@ -1123,19 +1123,16 @@ def _defer_probe(db_path, state_directory, sid, task_id, now: int, why: str, row
     would fold the task into ``recover_stale`` for a delivery problem,
     not a worker problem. ``row`` carries the swept park's metadata so
     the defer does not NULL the operator's model/checkpoint fields.
-    Bounded: past ``_QUOTA_PROBE_DEFER_LIMIT`` consecutive defers the
-    park is not renewed and a ``quota_probe_gave_up`` event marks the
-    hand-off back to the ordinary lease lifecycle.
+    Bounded per episode: ``quota_defer_count`` increments on each
+    defer and resets on every real park, so past
+    ``_QUOTA_PROBE_DEFER_LIMIT`` consecutive defers the park is not
+    renewed and a ``quota_probe_gave_up`` event marks the hand-off
+    back to the ordinary lease lifecycle. The re-park CASes on
+    ``step_state IS NULL`` - a fresher self-report park landing
+    mid-sweep always wins over a stale defer.
     """
-    con = db.connect(db_path)
-    try:
-        defers = con.execute(
-            "SELECT COUNT(*) AS c FROM decision_events"
-            " WHERE session_id=? AND kind='quota_probe_deferred' AND task_id=?",
-            (sid, task_id),
-        ).fetchone()["c"]
-    finally:
-        con.close()
+    task = db.get_task(task_id, path=db_path)
+    defers = (task["quota_defer_count"] or 0) if task is not None else 0
     if defers >= _QUOTA_PROBE_DEFER_LIMIT:
         _decision(
             state_directory,
@@ -1160,6 +1157,8 @@ def _defer_probe(db_path, state_directory, sid, task_id, now: int, why: str, row
         "probe-defer",
         model=row["quota_model"] if row is not None else None,
         checkpoint=row["quota_checkpoint"] if row is not None else None,
+        defer=True,
+        require_unparked=True,
         path=db_path,
     ):
         _decision(
@@ -1176,14 +1175,21 @@ def _defer_probe(db_path, state_directory, sid, task_id, now: int, why: str, row
             path=db_path,
         )
     else:
-        # the task moved on mid-pass (finished/requeued/failed) - the
-        # defer was for a row that no longer exists; journal, do not
-        # resurrect
+        # the task moved on mid-pass - finished, requeued, or a fresher
+        # park landed first; journal durably, do not resurrect or
+        # overwrite
         _decision(
             state_directory,
             "quota_probe_defer_lost",
             sid,
             f"task={task_id} why={why}",
+        )
+        db.record_event(
+            sid,
+            "quota_probe_defer_lost",
+            f"task={task_id} defer lost CAS ({why})",
+            task_id=task_id,
+            path=db_path,
         )
 
 

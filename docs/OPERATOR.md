@@ -156,8 +156,11 @@ Storage layout (state dir = the directory holding `state.db`, default
    re-arms the lease and sends one control probe; a probe that cannot
    be delivered (paced, no lockfile, transport error) re-parks for a
    short defer window instead of burning the attempt budget on a
-   lapsed lease. A provider still limited re-parks via the
-   self-report channel with the new reset. HALT stays senior - a
+   lapsed lease. Defers are bounded per park episode
+   (`quota_defer_count`, reset by every real park) - past the limit
+   the task is released back to the ordinary lease lifecycle with a
+   durable `quota_probe_gave_up` event. A provider still limited
+   re-parks via the self-report channel with the new reset. HALT stays senior - a
    halted session's park is not swept until `bridge resume`. Channels: manual `bridge quota-park <sid>
    --task N --reset-at <iso|HH:MM UTC> --note "<error>" [--model M]
    [--checkpoint "<where>"]`, early release `bridge quota-resume
