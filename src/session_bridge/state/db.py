@@ -1767,10 +1767,12 @@ def kill_session(session_id: str, *, path=None) -> KillVerdict:
     command stays idempotent for audit as well as state.
 
     Kill detaches bridge state; it is not a ban. A session whose
-    process is still alive self-revives on its next ``register`` /
-    ``heartbeat`` call (both write ``active`` again) - cutting that
-    off needs the process or its hooks stopped first, which is the
-    operator's side of the contract.
+    process is still alive self-revives on its next ``register``
+    call - or, for UNMANAGED sessions, on its next ``heartbeat``
+    (item_122 revives dead unmanaged rows only; a managed row stays
+    dead until it re-registers) - so cutting that off needs the
+    process or its hooks stopped first, which is the operator's side
+    of the contract.
     """
     ts = _now()
 
@@ -3279,7 +3281,7 @@ def mark_mail_escalated(
                 (session_id, ts, ts),
             )
             stamped = cur.rowcount == 1
-            if stamped and event_body is not None:
+            if stamped and event_body:
                 con.execute(
                     "INSERT INTO decision_events(session_id,kind,body,created_at) VALUES (?,?,?,?)",
                     (session_id, "mail_stall", event_body, ts),
