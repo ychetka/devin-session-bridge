@@ -2,6 +2,7 @@
 
 import json
 import multiprocessing
+import os
 import sqlite3
 import subprocess
 import sys
@@ -15,7 +16,6 @@ from session_bridge.state import db
 from session_bridge.state.contract import (
     BUSY_TIMEOUT_MS,
     CLAIM_TIMEOUT_SECONDS,
-    LEASE_SECONDS,
     MAX_ATTEMPTS,
     MAX_QUESTIONS_PER_TASK,
     PENDING_TIMEOUT_SECONDS,
@@ -307,7 +307,7 @@ def test_item04_lease_lifecycle(db_path):
     row = db.get_task(tid, path=db_path)
     assert row["status"] == "running"
     assert row["lease_expires_at"] is not None
-    assert abs(row["lease_expires_at"] - (time.time() + LEASE_SECONDS)) < 5
+    assert abs(row["lease_expires_at"] - (time.time() + db.LEASE_SECONDS)) < 5
     expires_before = row["lease_expires_at"]
 
     # renew_lease is CAS-guarded on the owner
@@ -2098,7 +2098,7 @@ def test_item189_gwt8_auto_renew_cas_and_ceiling(db_path):
     # right owner, fresh touch -> renewed a full lease ahead
     assert db.auto_renew_lease(tid, "w1", ceiling_seconds=3600, path=db_path) is True
     row = db.get_task(tid, path=db_path)
-    assert row["lease_expires_at"] >= int(time.time()) + LEASE_SECONDS - 5
+    assert row["lease_expires_at"] >= int(time.time()) + db.LEASE_SECONDS - 5
     assert row["lease_renewed_at"] == touched  # baseline preserved
 
     # explicit touch aged past the ceiling -> refused (zombie bound)
@@ -2590,7 +2590,7 @@ def test_unpark_quota_expired_releases_and_rearms(db_path):
     assert row["quota_reset_at"] is None
     assert row["quota_note"] is None
     assert row["status"] == TaskStatus.RUNNING.value
-    assert row["lease_expires_at"] >= now + LEASE_SECONDS - 5
+    assert row["lease_expires_at"] >= now + db.LEASE_SECONDS - 5
 
 
 def test_quota_repark_extends_reset(db_path):
@@ -2643,7 +2643,7 @@ def test_quota_resume_releases_early_and_refuses(db_path):
     assert row["step_state"] is None
     assert row["quota_reset_at"] is None
     assert row["status"] == TaskStatus.RUNNING.value
-    assert row["lease_expires_at"] >= int(time.time()) + LEASE_SECONDS - 5
+    assert row["lease_expires_at"] >= int(time.time()) + db.LEASE_SECONDS - 5
 
 
 def test_waiting_quota_task_lookup_boundary(db_path):
@@ -2681,3 +2681,26 @@ def test_quota_terminal_writers_clear_step_fields(db_path):
     # unpark clears the paused step
     assert db.unpark(tid2, path=db_path)
     assert db.get_task(tid2, path=db_path)["step_state"] is None
+
+
+def test_lease_ttl_env_override(tmp_path):
+    """issue #105 (directive): ``SB_LEASE_TTL_S`` resolves once at db
+    import; a malformed value falls back to the contract default
+    instead of crashing the CLI import path."""
+    code = "from session_bridge.state import db; print(db.LEASE_SECONDS)"
+    env = {
+        **os.environ,
+        "PYTHONPATH": "src",
+        "SB_LEASE_TTL_S": "7200",
+    }
+    out = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True)
+    assert out.stdout.strip() == "7200"
+    env["SB_LEASE_TTL_S"] = "banana"
+    out = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True)
+    assert out.stdout.strip() == "3600"
+
+
+def test_lease_ttl_default_is_one_hour():
+    """issue #105: the documented default moved to 1h (task 213
+    postmortem) - contract and resolved value agree with no env."""
+    assert db.LEASE_SECONDS == 3600

@@ -47,12 +47,13 @@ import time
 import urllib.parse
 from dataclasses import dataclass
 from enum import Enum
+from typing import Final
 
+from . import contract
 from .contract import (
     BUSY_TIMEOUT_MS,
     CLAIM_TIMEOUT_SECONDS,
     JOURNAL_MODE,
-    LEASE_SECONDS,
     LIVE_STATUSES,
     MAX_ATTEMPTS,
     MAX_QUESTIONS_PER_TASK,
@@ -89,6 +90,23 @@ from .verdict import (
 
 class BridgeDBError(Exception):
     """Unrecoverable state.db problem (e.g. a corrupt database file)."""
+
+
+def _env_int(name: str, default: int) -> int:
+    """Env-derived int with a safe default: a malformed override must
+    not crash the module import (bridge.py loads this module at CLI
+    startup - a typoed env var would brick the whole CLI)."""
+    try:
+        return int(os.environ.get(name, ""))
+    except ValueError:
+        return default
+
+
+#: Resolved claim-lease TTL (issue #105): the contract default (1h)
+#: unless ``SB_LEASE_TTL_S`` overrides it. Resolved once at import;
+#: every lease writer and downstream consumer (daemon auto-renew
+#: limit, dispatch renew interval, worker-log age) reads this value.
+LEASE_SECONDS: Final[int] = _env_int("SB_LEASE_TTL_S", contract.LEASE_SECONDS)
 
 
 def _default_db_path() -> str:

@@ -554,7 +554,7 @@ Each pass (~5s, with up to ~1s startup jitter):
    it, bounded by the question janitor TTLs); once that touch is
    older than
    `SESSIONS_BRIDGE_LEASE_AUTO_RENEW_SECONDS` (default 6x
-   `LEASE_SECONDS` ~= 3h, clamped to >= one lease length) the row no
+   `LEASE_SECONDS`, clamped to >= one lease length) the row no
    longer qualifies and expiry recovery takes over - a wedged turn
    that keeps reporting busy cannot hold the task forever. Idle,
    absent, statusless, unmanaged and unverifiable sessions are simply
@@ -1075,6 +1075,7 @@ the target workspace as `.devin/orchestrator/PLAYBOOK.md`).
 | `SESSIONS_BRIDGE_CYCLES_MAX` | 5 | park budget for installed hooks. |
 | `SB_STALL_THRESHOLD_S` | 1800 | undrained-mail age before the daemon escalates to the orchestrator. |
 | `SB_STALL_REALERT_S` | 3600 | cadence for re-alerting a still-stalled session inside the same episode. |
+| `SB_LEASE_TTL_S` | 3600 | claim-lease TTL applied at every lease write (v0.8.0); the auto-renew ceiling and worker-log retention scale with it. |
 | `SESSIONS_BRIDGE_MAIL_STALL_SECONDS` | 1800 | legacy alias of `SB_STALL_THRESHOLD_S`; the canonical name wins when both are set. |
 | `SESSIONS_BRIDGE_GHOST_TTL` | 86400 | seconds after `sessions.updated_at` before a no-heartbeat-row unmanaged registration (ghost) is swept dead. |
 | `SESSIONS_BRIDGE_BUSY_GRACE_SECONDS` | 7200 (4x stall) | ceiling on mid-turn busy grace - a still-busy session escalates past it; clamped at the stall threshold. |
