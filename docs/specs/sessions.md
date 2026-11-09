@@ -1,0 +1,53 @@
+# Sessions - registration, liveness, control
+
+Sessions register in the bus, report liveness via heartbeats, and
+answer to fleet-level control: halt, resume, kill, unregister.
+
+### Requirement: managed sessions are orchestrator-owned
+
+A session SHALL carry a role/mode distinguishing managed
+(orchestrator-dispatched, lease-aware) from unmanaged registrations;
+only managed sessions participate in task claims and auto-renew.
+
+#### Scenario: unmanaged session never claims
+
+- **WHEN** an unmanaged session tries to claim a managed task
+- **THEN** the claim path refuses - managed tasks go through dispatch
+  or owner-claim only
+
+### Requirement: HALT pauses the fleet semantically
+
+`bridge halt` SHALL stamp `halted_at` on the target session(s) so that
+wakes, quota sweeps and escalations stop until `bridge resume` clears
+it - HALT is senior to every automatic path.
+
+#### Scenario: halted session keeps its lease and work
+
+- **WHEN** a session is halted mid-task
+- **THEN** its task stays parked untouched (no recovery, no requeue)
+- **AND** after `bridge resume` the ordinary lifecycle resumes exactly
+  where it stopped
+
+### Requirement: kill removes the session, not its work
+
+`bridge kill` SHALL unregister a session and fold its live tasks back
+to `queued` for re-claim - work survives the worker.
+
+#### Scenario: killed session's task re-enters the pipeline
+
+- **WHEN** `bridge kill <sid>` lands on a session with a running task
+- **THEN** the session row is removed and the task returns to
+  `queued`, claimable by the next worker
+- **AND** a second kill of the same session is an idempotent no-op
+
+### Requirement: stale heartbeats mark sessions dead
+
+A session whose heartbeat falls silent past
+`HEARTBEAT_STALE_SECONDS` SHALL be treated as dead for wake and
+lease purposes - silence is never evidence of health.
+
+#### Scenario: ghost session cleanup
+
+- **WHEN** an unmanaged registration never produced a heartbeat row
+  past `SESSIONS_BRIDGE_GHOST_TTL`
+- **THEN** the lazy GC marks it dead instead of letting it pin state
