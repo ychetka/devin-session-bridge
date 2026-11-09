@@ -3206,15 +3206,28 @@ def sessions_with_undrained_mail(*, path=None) -> dict:
     return _retry(op)
 
 
-def mark_mail_escalated(session_id: str, *, path=None) -> bool:
+def mark_mail_escalated(
+    session_id: str,
+    *,
+    rearm_after: int | None = None,
+    now: int | None = None,
+    path=None,
+) -> bool:
     """Stamp ``wake_state.mail_escalated_at`` once per stall episode.
 
     Returns True only for the caller that actually set the stamp - the
     upsert's NULL guard makes repeated daemon passes no-ops until
     :func:`clear_mail_escalated` opens a fresh episode, so the
     orchestrator gets one directive per stall, not one per pass.
+    ``rearm_after`` (seconds, task #210 directive 445) additionally
+    lets a stamp older than that window re-set itself: a chronically
+    stalled session re-alerts on the cadence instead of being
+    silenced by its own episode stamp forever.
     """
-    ts = _now()
+    ts = now if now is not None else _now()
+    guard = "wake_state.mail_escalated_at IS NULL"
+    if rearm_after is not None:
+        guard += f" OR wake_state.mail_escalated_at<={ts - int(rearm_after)}"
 
     def op():
         con = connect(path)
@@ -3225,7 +3238,7 @@ def mark_mail_escalated(session_id: str, *, path=None) -> bool:
                 " ON CONFLICT(session_id) DO UPDATE SET"
                 " mail_escalated_at=excluded.mail_escalated_at,"
                 " updated_at=excluded.updated_at"
-                " WHERE wake_state.mail_escalated_at IS NULL",
+                f" WHERE {guard}",
                 (session_id, ts, ts),
             )
             return cur.rowcount == 1

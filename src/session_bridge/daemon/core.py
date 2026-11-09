@@ -52,6 +52,7 @@ from session_bridge.state import db
 from session_bridge.state.contract import (
     WAKE_UNCONFIRMED_ESCALATE_STREAK,
     NotificationKind,
+    QuestionState,
     SessionMode,
     SessionRole,
     SessionStatus,
@@ -889,7 +890,19 @@ def _env_int(name: str, default: int) -> int:
 #: Undrained actionable mail older than this triggers one escalation
 #: per stall episode (item_139) - a session whose relayed mail sits
 #: unacked this long is unreachable by every other signal we have.
-_MAIL_STALL_SECONDS = _env_int("SESSIONS_BRIDGE_MAIL_STALL_SECONDS", 1800)
+#: ``SB_STALL_THRESHOLD_S`` (directive 445) is the canonical env
+#: override; ``SESSIONS_BRIDGE_MAIL_STALL_SECONDS`` stays as the
+#: legacy alias so existing deployments keep working.
+_MAIL_STALL_SECONDS = _env_int(
+    "SB_STALL_THRESHOLD_S",
+    _env_int("SESSIONS_BRIDGE_MAIL_STALL_SECONDS", 1800),
+)
+
+#: Re-alert cadence inside one stall episode (directive 445): a
+#: session whose stall never resolves re-escalates every hour
+#: instead of being silenced by its own episode stamp - the alert
+#: is the last human-visible signal for a wedged drain contract.
+_MAIL_STALL_REALERT_SECONDS = _env_int("SB_STALL_REALERT_S", 3600)
 
 #: Busy grace has a ceiling (task #174 review): a session whose
 #: statusEnum reports live work defers escalation only while the mail
@@ -1128,11 +1141,16 @@ def _mail_stall_pass(
 
     For every session whose actionable mail (relayed, unacked,
     non-heartbeat_tick, still on disk) sits past
-    ``_MAIL_STALL_SECONDS`` the daemon pushes a directive into the
-    active orchestrator's mailbox naming the session and the wait
-    age - the orchestrator can manual-wake or escalate to the
-    developer. The orchestrator's own stall goes to ``notify_send``
-    instead (a self-addressed directive would sit undrained too).
+    ``_MAIL_STALL_SECONDS`` the daemon pushes a ``notice``
+    notification carrying the ``[MAIL_STALL]`` marker into the active
+    orchestrator's mailbox - naming the stalled sid, project, unacked
+    count, oldest mail age, pending questions and last-seen age
+    (directive 445) - so the orchestrator can manual-wake, forward to
+    ``tg_escalate`` or escalate to the developer. The orchestrator's
+    own stall goes to ``notify_send`` instead (a self-addressed
+    notice would sit undrained too). Each escalation also appends a
+    durable ``decision_events`` row (``kind=mail_stall``) with the
+    same payload fields (task #210 item 3).
 
     "Still on disk" is load-bearing (task #143): consumed-but-unacked
     mail - file deleted, ack pending at a turn boundary - is not a
@@ -1145,7 +1163,11 @@ def _mail_stall_pass(
     Dedup is the ``wake_state.mail_escalated_at`` stamp: one
     escalation per stall episode, cleared when the mailbox drains or
     when the oldest remaining mail is newer than the stamp (the
-    escalated items drained - a newer stall is a fresh episode).
+    escalated items drained - a newer stall is a fresh episode). A
+    stamp older than ``_MAIL_STALL_REALERT_SECONDS`` (default 3600s)
+    re-arms itself: a stall that never resolves re-alerts on the
+    cadence inside the same episode instead of going silent forever
+    (directive 445).
     Returns the maximum undrained age seen this pass - the caller
     writes it into ``daemon_heartbeat.txt`` as the stall metric.
     """
@@ -1278,27 +1300,50 @@ def _mail_stall_pass(
                 f"age={age}s count={r['count']} no escalation target",
             )
             continue
-        if not db.mark_mail_escalated(sid, path=db_path):
-            continue  # already escalated this episode
-        # task #210 item 3: the escalation payload names the project so
-        # the orchestrator's tg_escalate forward carries it verbatim;
-        # the durable decision_events row keeps the same fields
-        # restart-proof for audit.
+        if not db.mark_mail_escalated(
+            sid, rearm_after=_MAIL_STALL_REALERT_SECONDS, now=now, path=db_path
+        ):
+            continue  # already escalated this episode, cadence not due
+        # task #210 item 3 / directive 445: the escalation payload
+        # names project, unacked count, oldest mail age, pending
+        # questions and last-seen age so the orchestrator's
+        # tg_escalate forward carries it verbatim; delivery rides
+        # NOTICE + the [MAIL_STALL] marker (a parseable alert class,
+        # not an obey-directive), and the durable decision_events row
+        # keeps the same fields restart-proof for audit.
         sess = db.get_session(sid, path=db_path)
         project = None
         if sess is not None:
             cwd = sess["cwd"]
             project = (os.path.basename(cwd.rstrip("/")) or cwd) if cwd else sess["title"]
+        con = db.connect(db_path)
+        try:
+            pq = con.execute(
+                "SELECT COUNT(*) AS c FROM questions WHERE session_id=? AND state=?",
+                (sid, QuestionState.PENDING.value),
+            ).fetchone()["c"]
+            hb = con.execute(
+                "SELECT last_seen_at FROM worker_heartbeats WHERE session_id=?",
+                (sid,),
+            ).fetchone()
+        finally:
+            con.close()
+        last_seen_s = now - hb["last_seen_at"] if hb is not None else -1
+        fields = (
+            f"unacked={r['count']} oldest_mail_age_s={age}"
+            f" pending_questions={pq} last_seen_s={last_seen_s}"
+        )
         body = (
-            f"mail undrained {age // 60}m: {sid}"
+            f"[MAIL_STALL] mail undrained {age // 60}m: {sid}"
             + (f" ({project})" if project else "")
             + f" has {r['count']} unacked"
             f" notification(s) + {r.get('foreign', 0)} unregistered"
-            " mailbox file(s) - drain is not reaching it"
+            f" mailbox file(s) {fields}"
+            " - drain is not reaching it"
             " (manual `bridge wake` or escalate to developer)"
         )
         if target == "orchestrator":
-            db.notify(orch_sid, NotificationKind.DIRECTIVE, body, path=db_path)
+            db.notify(orch_sid, NotificationKind.NOTICE, body, path=db_path)
         else:
             notify_send("sessions-bridge MAIL STALL", body)
         _decision(
@@ -1311,10 +1356,9 @@ def _mail_stall_pass(
         db.record_event(
             sid,
             "mail_stall",
-            f"reason=mail_stall age_seconds={age}"
-            f" pending_registered={r['count']}"
+            f"reason=mail_stall project={project or '-'} {fields}"
             f" pending_foreign={r.get('foreign', 0)}"
-            f" project={project or '-'} target={target}",
+            f" target={target}",
             path=db_path,
         )
     return max_age

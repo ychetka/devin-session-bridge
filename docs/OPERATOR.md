@@ -570,13 +570,15 @@ Each pass (~5s, with up to ~1s startup jitter):
    ref before starting". A silent orchestrator raises one deduped
    `notify-send -u critical`.
 6. Mail stall: any session whose oldest undrained actionable mail is
-   older than `SESSIONS_BRIDGE_MAIL_STALL_SECONDS` (default 1800s)
-   gets one escalation per stall episode - a directive pushed into
-   the active orchestrator's mailbox naming the session and the wait
-   age (`mail_stall_escalated` decision), so the orchestrator can
-   manual-wake it or escalate to the developer. The orchestrator's
+   older than `SB_STALL_THRESHOLD_S` (default 1800s; the legacy
+   `SESSIONS_BRIDGE_MAIL_STALL_SECONDS` alias still works) gets one
+   escalation per stall episode - a `notice` notification carrying
+   the `[MAIL_STALL]` marker pushed into the active orchestrator's
+   mailbox (`mail_stall_escalated` decision), so the orchestrator
+   can manual-wake it, forward to `tg_escalate` or escalate to the
+   developer. The orchestrator's
    own stall (or the absence of an active holder) falls back to
-   `notify-send` - a self-addressed directive would sit undrained
+   `notify-send` - a self-addressed notice would sit undrained
    too. With no delivery target at all the pass logs
    `mail_stall_deferred` and retries next pass without consuming the
    episode. A session verifiably mid-turn (session/list statusEnum
@@ -592,8 +594,10 @@ Each pass (~5s, with up to ~1s startup jitter):
    dedup stamp lives in `wake_state.mail_escalated_at`;
    it is cleared when the mailbox fully drains OR when the oldest
    remaining mail is newer than the stamp (the escalated items were
-   drained - what sits there now is a new stall), so a chronically
-   stalled session is not limited to one escalation ever. Unconsumed
+   drained - what sits there now is a new stall). A stamp older than
+   `SB_STALL_REALERT_S` (default 3600s) re-arms itself: a stall that
+   never resolves re-alerts on the cadence inside the same episode
+   (v0.5.0). Unconsumed
    `msg_*.txt` files count as undrained mail too - their mtime is the
    age evidence for mail the outbox never registered (v0.3.4). The
    pass also writes the maximum undrained age as
@@ -601,13 +605,13 @@ Each pass (~5s, with up to ~1s startup jitter):
    second line of `daemon_heartbeat.txt` (line 1 stays the unix
    timestamp - the watchdog contract is unchanged). Since v0.5.0 each
    escalation also appends a durable `decision_events` row
-   (`kind=mail_stall`, one per episode like the directive itself)
-   carrying `reason=mail_stall`, the stalled sid, `age_seconds`,
-   `pending_registered`/`pending_foreign` counts, the project name
-   (cwd basename) and the delivery target - the restart-proof
+   (`kind=mail_stall`) carrying `reason=mail_stall`, the stalled
+   sid, `project` (cwd basename), `unacked`, `oldest_mail_age_s`,
+   `pending_questions`, `last_seen_s`, `pending_foreign` and the
+   delivery `target` - the restart-proof
    payload the orchestrator's `tg_escalate` forward is sourced from;
-   the notification body names the project inline (`<sid>
-   (<project>)`).
+   the notification body names the same fields inline (`[MAIL_STALL]
+   ... <sid> (<project>)`).
 
 ## Wake transport (acp-host)
 
@@ -1035,6 +1039,8 @@ the target workspace as `.devin/orchestrator/PLAYBOOK.md`).
 | `SESSIONS_BRIDGE_STOP_TIMEOUT` | 600 | Stop hook timeout written by install_hooks.sh. |
 | `SESSIONS_BRIDGE_CYCLE_SECONDS` | 150 | park cycle length for installed hooks. |
 | `SESSIONS_BRIDGE_CYCLES_MAX` | 5 | park budget for installed hooks. |
-| `SESSIONS_BRIDGE_MAIL_STALL_SECONDS` | 1800 | undrained-mail age before the daemon escalates to the orchestrator. |
+| `SB_STALL_THRESHOLD_S` | 1800 | undrained-mail age before the daemon escalates to the orchestrator. |
+| `SB_STALL_REALERT_S` | 3600 | cadence for re-alerting a still-stalled session inside the same episode. |
+| `SESSIONS_BRIDGE_MAIL_STALL_SECONDS` | 1800 | legacy alias of `SB_STALL_THRESHOLD_S`; the canonical name wins when both are set. |
 | `SESSIONS_BRIDGE_GHOST_TTL` | 86400 | seconds after `sessions.updated_at` before a no-heartbeat-row unmanaged registration (ghost) is swept dead. |
 | `SESSIONS_BRIDGE_BUSY_GRACE_SECONDS` | 7200 (4x stall) | ceiling on mid-turn busy grace - a still-busy session escalates past it; clamped at the stall threshold. |
