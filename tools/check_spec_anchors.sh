@@ -37,9 +37,11 @@ ANCHOR_OPS = ("adds", "modifies", "removes")
 NOOP = {"-", "- none", "none", "- n/a", "n/a"}
 
 def slugify(title):
-    """GitHub-style heading anchor: lowercase, non-alnum -> '-'."""
-    s = re.sub(r"[^a-z0-9]+", "-", title.lower())
-    return s.strip("-")
+    """GitHub's heading anchor rule: lowercase, drop punctuation
+    (anything not letter/number/space/hyphen/underscore), spaces ->
+    hyphens. Hyphen and underscore runs are preserved as-is."""
+    s = re.sub(r"[^\w\- ]", "", title.lower())
+    return s.replace(" ", "-")
 
 def requirement_anchors(path):
     """All requirement anchors present in a spec file."""
@@ -80,7 +82,7 @@ def parse_impact(path):
         if m:
             entries.append((m.group(1).lower(), m.group(2)))
         elif s in NOOP:
-            continue
+            entries.append(("noop", s))
         else:
             entries.append(("malformed", s))
     return entries
@@ -100,7 +102,12 @@ for name in files:
     if entries is None:
         problems.append(f"{name}: missing '## Spec impact' section")
         continue
+    if not entries:
+        problems.append(f"{name}: empty '## Spec impact' section - use '-' when no behavior changes")
+        continue
     for op, ref in entries:
+        if op == "noop":
+            continue
         if op == "malformed":
             problems.append(f"{name}: unparsable Spec impact line: {ref!r}")
             continue
@@ -111,7 +118,8 @@ for name in files:
         if not anchor or not spec_rel.endswith(".md") or "/" not in spec_rel:
             problems.append(f"{name}: bad anchor ref '{ref}' - expected docs/specs/<domain>.md#<anchor>")
             continue
-        if not spec_rel.startswith("docs/specs/"):
+        norm = os.path.normpath(spec_rel)
+        if norm != spec_rel or not norm.startswith("docs/specs/"):
             problems.append(f"{name}: Spec impact must target docs/specs/, got '{spec_rel}'")
             continue
         spec_abs = os.path.join(top, spec_rel)
@@ -119,6 +127,8 @@ for name in files:
             anchor_cache[spec_rel] = requirement_anchors(spec_abs)
         anchors = anchor_cache[spec_rel]
         if anchors is None:
+            if op == "removes":
+                continue  # the whole file is gone - the anchor with it
             problems.append(f"{name}: '{spec_rel}' does not exist (needed by {op}: {anchor})")
             continue
         if op in ("adds", "modifies") and anchor not in anchors:

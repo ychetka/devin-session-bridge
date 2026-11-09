@@ -34,9 +34,10 @@ lines of the form `docs/specs/<domain>.md#<requirement-anchor>`, or a
 bare `-` when the change touches no documented behavior. The PR
 applies its own spec delta in the same commit, so at merge time
 `adds:`/`modifies:` anchors resolve in `docs/specs/` and `removes:`
-anchors are gone; `tools/check_spec_anchors.sh` (run by
-`verify_constraints.sh`) enforces it. Release notes and the spec
-delta come from the same file - no double bookkeeping.
+anchors are gone; `tools/check_spec_anchors.sh` enforces it in the
+CI lint job (and in the orchestration layer's verify gate). Release
+notes and the spec delta come from the same file - no double
+bookkeeping.
 
 At release time `tools/release_notes.sh --apply` folds all pending
 entries into `CHANGELOG.md` and deletes the consumed files, so this

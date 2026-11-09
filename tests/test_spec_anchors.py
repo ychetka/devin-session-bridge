@@ -142,13 +142,13 @@ def test_gwt5_bad_refs_and_ops_rejected(tmp_path):
 
 def test_gwt6_kebab_slug_matches_github_rules(tmp_path):
     """Given a requirement name with punctuation and mixed case, When
-    slugified, Then runs of non-alnum collapse to single hyphens -
-    'A/B: C--d' -> 'a-b-c-d'."""
+    slugified, Then GitHub's rule applies: punctuation drops, spaces
+    become hyphens, hyphen runs keep - 'A/B: C--d!' -> 'ab-c--d'."""
     repo = _scratch(tmp_path)
     (repo / "docs" / "specs" / "domain.md").write_text(
         SPEC.format(req="A/B: C--d!")
     )
-    _frag(repo, impact="- modifies: docs/specs/domain.md#a-b-c-d")
+    _frag(repo, impact="- modifies: docs/specs/domain.md#ab-c--d")
     assert _run(repo).returncode == 0
 
 
@@ -158,3 +158,42 @@ def test_gwt7_empty_changes_dir_passes(tmp_path):
     repo = _scratch(tmp_path)
     out = _run(repo)
     assert out.returncode == 0
+
+
+def test_gwt8_path_traversal_rejected(tmp_path):
+    """Given a Spec impact ref that escapes docs/specs/ via '..', When
+    checked, Then rejected - normpath must still land inside the
+    registry."""
+    repo = _scratch(tmp_path)
+    _frag(repo, impact="- modifies: docs/specs/../OPERATOR.md#x")
+    out = _run(repo)
+    assert out.returncode == 1
+    assert "docs/specs/" in out.stderr
+
+
+def test_gwt9_empty_section_is_error(tmp_path):
+    """Given a '## Spec impact' heading with no entries, When checked,
+    Then fail - the section must carry '-' at minimum."""
+    repo = _scratch(tmp_path)
+    (repo / ".changes" / "0001-a.md").write_text(
+        FRAGMENT.format(impact="").rstrip() + "\n"
+    )
+    out = _run(repo)
+    assert out.returncode == 1
+    assert "empty" in out.stderr
+
+
+def test_gwt10_removes_tolerates_deleted_file(tmp_path):
+    """Given a removes anchor whose whole spec file was deleted in the
+    same PR, When checked, Then pass - the anchor is gone with it."""
+    repo = _scratch(tmp_path)
+    _frag(
+        repo,
+        impact="- removes: docs/specs/domain.md#park-on-explicit-limit",
+    )
+    (repo / "docs" / "specs" / "domain.md").unlink()
+    out = _run(repo)
+    assert out.returncode == 0
+    # but adds on a missing file still fails
+    _frag(repo, impact="- adds: docs/specs/domain.md#x")
+    assert _run(repo).returncode == 1

@@ -30,8 +30,9 @@ registry half in this repository.
 - `tools/check_spec_anchors.sh` validates the post-change invariant:
   `adds:`/`modifies:` anchors must exist in the referenced file,
   `removes:` anchors must not; a missing `## Spec impact` section is
-  an error. `verify_constraints.sh` runs it whenever pending entries
-  exist; the PR template gained a Spec impact checklist line.
+  an error. The CI lint job runs it on every PR, the orchestration
+  layer's verify gate runs it locally, and the PR template gained a
+  Spec impact checklist line.
 - Release notes and spec deltas come from one file - no double
   bookkeeping. `docs/specs/` describes only what already ships:
   backlog/roadmap candidates never enter it.

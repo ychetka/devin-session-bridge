@@ -25,7 +25,7 @@ refs: issue #N
 # removes anchors must be gone. Use a bare "-" when the change touches
 # no documented behavior. Anchors are kebab-case slugs of
 # "### Requirement: <name>" headings; tools/check_spec_anchors.sh
-# validates them (verify_constraints.sh runs it).
+# validates them (the CI lint job runs it).
 - adds: docs/specs/<domain>.md#<requirement-anchor>
 - modifies: docs/specs/<domain>.md#<requirement-anchor>
 - removes: docs/specs/<domain>.md#<requirement-anchor>
