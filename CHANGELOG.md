@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.5.2] - 2026-11-09
+
+### User-facing
+
+#### fix
+- The host-side ingress timer no longer attempts (and fails) to reconcile ns-* forwarders; it owns tcp: rows only, while each project's userns-context loop owns its namespace specs. `ingress` (issue #99, PR #100)
+
+### Codebase
+
+#### ingress
+- [fix] Added SESSIONS_BRIDGE_INGRESS_KINDS env filter to `bridge ingress sync` - a pass skips foreign-kind desired specs and leaves their tracked forwarders untouched (unparseable stored specs are treated as foreign); env values are case-normalized and validated against the known spec kinds. Why: The host timer lacks CAP_SYS_ADMIN over a project-owned user namespace, so setns() into ns-* targets always failed; restricting each reconcile context to the kinds it can actually act on removes the noise and prevents a filtered pass from killing foreign forwarders. (issue #99, PR #100)
+
+#### tooling
+- [feat] Establishes the .changes/ per-PR entry convention, tools/release_notes.sh aggregation (User-facing + Codebase sections), the PR-template ADR checkbox, docs/adr/ rules and the fleet-adoption spec. Why: Hand-assembled changelogs drifted from what each PR actually shipped; a machine-readable entry per PR makes release notes generated, reviewable and identical across orchestrated repos. (issue #96, directive 444, ADR-0001)
+
 ## [0.4.0] - 2026-11-08
 
 Neutral host ingress layer (issue #92, task #209): port forwards
