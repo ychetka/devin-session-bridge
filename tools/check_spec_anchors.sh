@@ -15,9 +15,9 @@
 # PR applies its own spec delta - the check reads the working tree,
 # which already carries the delta).
 #
-# Anchors are kebab-case slugs of "### Requirement: <name>" headings:
-# lowercase, non-alphanumeric runs collapse to single hyphens, edges
-# stripped - the same rule GitHub applies to markdown headings.
+# Anchors follow GitHub's markdown rule for "### Requirement: <name>"
+# headings: lowercase, punctuation dropped, spaces -> hyphens,
+# hyphen/underscore runs kept; duplicate headings get -1/-2 suffixes.
 #
 # Usage: tools/check_spec_anchors.sh   (exit 0 = clean, 1 = violations)
 set -euo pipefail
@@ -44,14 +44,21 @@ def slugify(title):
     return s.replace(" ", "-")
 
 def requirement_anchors(path):
-    """All requirement anchors present in a spec file."""
+    """All requirement anchors present in a spec file, including
+    GitHub's -1/-2 dedup suffixes for repeated heading names."""
     anchors = set()
     try:
         with open(path, encoding="utf-8") as fh:
             for line in fh:
                 m = re.match(r"^###\s+Requirement:\s*(.+?)\s*$", line)
-                if m:
-                    anchors.add(slugify(m.group(1)))
+                if not m:
+                    continue
+                base = slugify(m.group(1))
+                anchor, n = base, 0
+                while anchor in anchors:
+                    n += 1
+                    anchor = f"{base}-{n}"
+                anchors.add(anchor)
     except FileNotFoundError:
         return None
     return anchors
@@ -74,6 +81,8 @@ def parse_impact(path):
     entries = []
     for line in body[start + 1:]:
         if re.match(r"^##\s", line):
+            if re.match(r"^##\s+Spec impact\s*$", line):
+                entries.append(("malformed", "duplicate '## Spec impact' section"))
             break
         s = line.strip()
         if not s or s.startswith("#"):

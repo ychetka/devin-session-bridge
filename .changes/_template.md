@@ -23,9 +23,10 @@ refs: issue #N
 # anchor this change touches - the PR applies its own spec delta, so
 # adds/modifies anchors must exist in docs/specs after the change and
 # removes anchors must be gone. Use a bare "-" when the change touches
-# no documented behavior. Anchors are kebab-case slugs of
-# "### Requirement: <name>" headings; tools/check_spec_anchors.sh
-# validates them (the CI lint job runs it).
+# no documented behavior. Anchors follow GitHub's heading rule for
+# "### Requirement: <name>" (lowercase, punctuation dropped, spaces
+# -> hyphens); tools/check_spec_anchors.sh validates them (the CI
+# lint job runs it).
 - adds: docs/specs/<domain>.md#<requirement-anchor>
 - modifies: docs/specs/<domain>.md#<requirement-anchor>
 - removes: docs/specs/<domain>.md#<requirement-anchor>

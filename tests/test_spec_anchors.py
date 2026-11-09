@@ -197,3 +197,27 @@ def test_gwt10_removes_tolerates_deleted_file(tmp_path):
     # but adds on a missing file still fails
     _frag(repo, impact="- adds: docs/specs/domain.md#x")
     assert _run(repo).returncode == 1
+
+
+def test_gwt11_duplicate_headings_get_suffix_anchors(tmp_path):
+    """Given a spec file with two same-named requirements, When
+    checked, Then the second resolves as <slug>-1 like GitHub."""
+    repo = _scratch(tmp_path)
+    (repo / "docs" / "specs" / "domain.md").write_text(
+        SPEC.format(req="same name") + SPEC.format(req="same name")
+    )
+    _frag(repo, impact="- modifies: docs/specs/domain.md#same-name-1")
+    assert _run(repo).returncode == 0
+
+
+def test_gwt12_second_spec_impact_section_flagged(tmp_path):
+    """Given a fragment carrying two '## Spec impact' sections, When
+    checked, Then the duplicate is reported - silently ignoring it
+    would hide anchor mistakes."""
+    repo = _scratch(tmp_path)
+    (repo / ".changes" / "0001-a.md").write_text(
+        FRAGMENT.format(impact="-") + "\n## Spec impact\n-\n"
+    )
+    out = _run(repo)
+    assert out.returncode == 1
+    assert "duplicate" in out.stderr
