@@ -8,6 +8,15 @@ released or its spec/target changes, the stale forwarder is killed.
 Reconciler state lives in ``<state_dir>/ingress.json``; a flock on
 ``ingress.lock`` serializes concurrent syncs (timer + manual calls).
 
+``ns-*`` specs need CAP_SYS_ADMIN over the target netns owner user
+namespace - only a reconciler running inside that user namespace
+(the project supervisor's inner context) can setns() into it. The
+host-side timer therefore restricts itself via
+``SESSIONS_BRIDGE_INGRESS_KINDS`` (comma-separated kinds; unset =
+reconcile everything): with ``=tcp`` it skips ns-* rows entirely -
+never spawning, never killing, never error-reporting - and the
+namespace-aware loop owns their lifecycle.
+
 The reconciler only ever kills processes it spawned: a tracked pid
 must still map to a process whose cmdline contains the forwarder
 marker before SIGTERM is sent.
@@ -23,7 +32,12 @@ import subprocess
 import sys
 import time
 
-from session_bridge.ingress.spec import ForwardSpec, parse_purpose, resolve_target
+from session_bridge.ingress.spec import (
+    ForwardSpec,
+    parse_fwd_spec,
+    parse_purpose,
+    resolve_target,
+)
 
 FORWARDER_MARKER = "session_bridge.ingress.forwarder"
 STATE_FILE = "ingress.json"
@@ -145,11 +159,21 @@ def _spawn(state_dir: str, port: int, spec: ForwardSpec) -> int:
     return proc.pid
 
 
-def desired_forwards(rows) -> tuple[dict, list]:
+def _kinds_filter() -> set | None:
+    """Allowed spec kinds from SESSIONS_BRIDGE_INGRESS_KINDS, or None
+    (reconcile everything) when the var is unset/empty."""
+    raw = os.environ.get("SESSIONS_BRIDGE_INGRESS_KINDS", "")
+    kinds = {k.strip() for k in raw.split(",") if k.strip()}
+    return kinds or None
+
+
+def desired_forwards(rows, kinds: set | None = None) -> tuple[dict, list]:
     """({port: ForwardSpec}, row_errors) for tcp_port rows carrying a
     fwd token. Per-row isolation: a malformed row or a stray fwd=
     substring in free text lands in row_errors - it must never poison
-    the whole reconcile for every other project."""
+    the whole reconcile for every other project. ``kinds`` limits
+    which spec kinds this pass owns; other kinds are invisible to it
+    (a foreign reconciler context owns them)."""
     out, errors = {}, []
     for r in rows:
         if r["resource_type"] != "tcp_port":
@@ -158,6 +182,8 @@ def desired_forwards(rows) -> tuple[dict, list]:
             spec = parse_purpose(r["purpose"])
             port = int(r["resource_id"])
             if spec is not None:
+                if kinds is not None and spec.kind not in kinds:
+                    continue
                 out[port] = spec
         except (ValueError, TypeError) as e:
             errors.append({"row": r["resource_id"], "error": str(e)})
@@ -174,16 +200,28 @@ def sync(state_dir: str, rows) -> dict:
             return {"status": "skipped", "reason": "another sync holds ingress.lock"}
         state = _load_state(state_dir)
         tracked = state["forwards"]
-        desired, row_errors = desired_forwards(rows)
+        desired, row_errors = desired_forwards(rows, _kinds_filter())
         summary = {"started": [], "stopped": [], "kept": [], "errors": row_errors}
         now = int(time.time())
 
-        # stop forwards whose row is gone or lost its fwd declaration
+        # stop forwards whose row is gone or lost its fwd declaration -
+        # but only for ports this pass actually owns: a tracked forwarder
+        # whose kind is filtered out belongs to the other context and is
+        # left alone (tracked record kept, process untouched).
+        kinds = _kinds_filter()
         for port_s in list(tracked):
-            if int(port_s) not in desired:
-                rec = tracked.pop(port_s)
-                _kill(rec["pid"], port_s)
-                summary["stopped"].append(int(port_s))
+            if int(port_s) in desired:
+                continue
+            rec = tracked[port_s]
+            if kinds is not None:
+                try:
+                    if parse_fwd_spec(rec["spec"]).kind not in kinds:
+                        continue
+                except (ValueError, KeyError):
+                    pass
+            tracked.pop(port_s)
+            _kill(rec["pid"], port_s)
+            summary["stopped"].append(int(port_s))
 
         for port, spec in desired.items():
             port_s = str(port)
