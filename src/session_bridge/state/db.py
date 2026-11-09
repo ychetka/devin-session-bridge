@@ -614,7 +614,8 @@ def dispatch_managed(task_id: int, owner: str, *, path=None) -> bool:
                 "  (SELECT queue_paused FROM sessions"
                 "   WHERE session_id=tasks.session_id), 0) = 0"
                 " AND (SELECT halted_at FROM sessions"
-                "  WHERE session_id=tasks.session_id) IS NULL",
+                "  WHERE session_id=tasks.session_id) IS NULL"
+                " AND COALESCE(step_state,'')<>'waiting_quota'",
                 (
                     TaskStatus.DISPATCH_DECIDED.value,
                     owner,
@@ -662,7 +663,8 @@ def claim_managed(task_id: int, session_id: str, owner: str, *, path=None) -> bo
                 "  (SELECT queue_paused FROM sessions"
                 "   WHERE session_id=tasks.session_id), 0) = 0"
                 " AND (SELECT halted_at FROM sessions"
-                "  WHERE session_id=tasks.session_id) IS NULL",
+                "  WHERE session_id=tasks.session_id) IS NULL"
+                " AND COALESCE(step_state,'')<>'waiting_quota'",
                 (
                     TaskStatus.RUNNING.value,
                     owner,
@@ -705,7 +707,8 @@ def claim_queued(task_id: int, owner: str, transport, *, path=None) -> bool:
                 " lease_expires_at=?, lease_renewed_at=?, updated_at=?"
                 " WHERE id=? AND status=? AND COALESCE("
                 "  (SELECT queue_paused FROM sessions"
-                "   WHERE session_id=tasks.session_id), 0) = 0",
+                "   WHERE session_id=tasks.session_id), 0) = 0"
+                " AND COALESCE(step_state,'')<>'waiting_quota'",
                 (
                     TaskStatus.DISPATCH_DECIDED.value,
                     _val(transport),
@@ -748,6 +751,7 @@ def mark_running(task_id: int, owner: str, *, max_running: int | None = None, pa
                 " WHERE id=? AND status=? AND lease_owner=?"
                 " AND lease_expires_at IS NOT NULL"
                 " AND lease_expires_at>?"
+                " AND COALESCE(step_state,'')<>'waiting_quota'"
             )
             args: list = [
                 TaskStatus.RUNNING.value,
@@ -1316,7 +1320,8 @@ def unpark_quota_expired(now: int, *, path=None) -> list:
         try:
             con.execute("BEGIN IMMEDIATE")
             rows = con.execute(
-                f"SELECT t.id, t.session_id FROM tasks t"
+                f"SELECT t.id, t.session_id, t.quota_note, t.quota_model,"
+                f" t.quota_checkpoint FROM tasks t"
                 f" JOIN sessions s ON s.session_id=t.session_id"
                 f" WHERE t.status IN ({_LIVE_SQL})"
                 f" AND t.step_state='waiting_quota'"

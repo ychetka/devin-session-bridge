@@ -1106,27 +1106,82 @@ def _lease_renew_pass(db_path, state_directory, now: int) -> None:
 #: exact failure the park exists to prevent (task #216 review).
 _QUOTA_PROBE_DEFER_SECONDS = 120
 
+#: bound on consecutive probe defers per task episode (task #216
+#: review r2): a session whose probe can never land (dead, host gone)
+#: would otherwise re-park forever - after the limit the park is
+#: released for good and the ordinary lease/recovery lifecycle owns
+#: the outcome, with a durable give-up event for the operator.
+_QUOTA_PROBE_DEFER_LIMIT = 10
 
-def _defer_probe(db_path, state_directory, sid, task_id, now: int, why: str) -> None:
+
+def _defer_probe(db_path, state_directory, sid, task_id, now: int, why: str, row=None) -> None:
     """Re-park a released task when its control probe could not run.
 
     A short fresh window keeps ``waiting_quota`` semantics alive (no
     attempt spent, no wake noise) until the next sweep retries the
     probe - the alternative, leaving the re-armed lease to lapse,
     would fold the task into ``recover_stale`` for a delivery problem,
-    not a worker problem.
+    not a worker problem. ``row`` carries the swept park's metadata so
+    the defer does not NULL the operator's model/checkpoint fields.
+    Bounded: past ``_QUOTA_PROBE_DEFER_LIMIT`` consecutive defers the
+    park is not renewed and a ``quota_probe_gave_up`` event marks the
+    hand-off back to the ordinary lease lifecycle.
     """
+    con = db.connect(db_path)
+    try:
+        defers = con.execute(
+            "SELECT COUNT(*) AS c FROM decision_events"
+            " WHERE session_id=? AND kind='quota_probe_deferred' AND task_id=?",
+            (sid, task_id),
+        ).fetchone()["c"]
+    finally:
+        con.close()
+    if defers >= _QUOTA_PROBE_DEFER_LIMIT:
+        _decision(
+            state_directory,
+            "quota_probe_gave_up",
+            sid,
+            f"task={task_id} why={why} after {defers} defers",
+        )
+        db.record_event(
+            sid,
+            "quota_probe_gave_up",
+            f"task={task_id} probe undeliverable after {defers} defers ({why})"
+            " - released to ordinary lease lifecycle",
+            task_id=task_id,
+            path=db_path,
+        )
+        return
     if db.quota_park(
         task_id,
         sid,
         now + _QUOTA_PROBE_DEFER_SECONDS,
         f"control probe deferred ({why})",
         "probe-defer",
+        model=row["quota_model"] if row is not None else None,
+        checkpoint=row["quota_checkpoint"] if row is not None else None,
         path=db_path,
     ):
         _decision(
             state_directory,
             "quota_probe_deferred",
+            sid,
+            f"task={task_id} why={why}",
+        )
+        db.record_event(
+            sid,
+            "quota_probe_deferred",
+            f"task={task_id} {why}",
+            task_id=task_id,
+            path=db_path,
+        )
+    else:
+        # the task moved on mid-pass (finished/requeued/failed) - the
+        # defer was for a row that no longer exists; journal, do not
+        # resurrect
+        _decision(
+            state_directory,
+            "quota_probe_defer_lost",
             sid,
             f"task={task_id} why={why}",
         )
@@ -1170,11 +1225,11 @@ def _quota_pass(db_path, state_directory, now: int, policy: WakePolicy) -> None:
         # one pass, and a stale key must not poison the breaker.
         lock_data = find_lockfile()
         if lock_data is None:
-            _defer_probe(db_path, state_directory, sid, r["id"], now, "no_lockfile")
+            _defer_probe(db_path, state_directory, sid, r["id"], now, "no_lockfile", r)
             continue
         host_key = lock_data["_path"]
         if policy.check(sid, host_key) is not None:
-            _defer_probe(db_path, state_directory, sid, r["id"], now, "paced")
+            _defer_probe(db_path, state_directory, sid, r["id"], now, "paced", r)
             continue
         policy.record_attempt(sid)
         try:
@@ -1195,7 +1250,7 @@ def _quota_pass(db_path, state_directory, now: int, policy: WakePolicy) -> None:
                 sid,
                 f"task={r['id']} reason={e.reason}",
             )
-            _defer_probe(db_path, state_directory, sid, r["id"], now, f"probe_{e.reason}")
+            _defer_probe(db_path, state_directory, sid, r["id"], now, f"probe_{e.reason}", r)
             continue
         policy.record_result(host_key, True)
         _decision(state_directory, "quota_probe_sent", sid, f"task={r['id']} outcome={outcome}")

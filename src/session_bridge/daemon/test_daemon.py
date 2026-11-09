@@ -2286,3 +2286,44 @@ def test_quota_undelivered_probe_defers_not_spends(env, monkeypatch):
     assert row["quota_source"] == "probe-defer"
     assert row["attempt"] == 0
     assert any(d["event"] == "quota_probe_deferred" for d in _decisions(env))
+
+
+def test_quota_queued_task_cannot_dispatch_while_parked(env, monkeypatch):
+    """GWT-216-16 (review r2): claim guards carry the step predicate -
+    a parked queued task cannot promote to running mid-window."""
+    _managed_fresh(env)
+    tid = db.enqueue(SID, "work", path=env.db)
+    assert db.quota_park(tid, SID, int(time.time()) + 3600, "rate limit", "manual", path=env.db)
+    assert not db.claim_queued(tid, "w1", "acp-push", path=env.db)
+    assert not db.claim_managed(tid, SID, "w1", path=env.db)
+    assert not db.dispatch_managed(tid, "w1", path=env.db)
+    assert db.get_task(tid, path=env.db)["status"] == TaskStatus.QUEUED.value
+
+
+def test_quota_defer_preserves_metadata_and_bounds(env, monkeypatch):
+    """GWT-216-17 (review r2): defer re-parks carry the park's
+    model/checkpoint provenance, and past the defer limit the park is
+    released with a durable give-up event instead of looping forever."""
+    _managed_fresh(env)
+    tid = _parked_task(env, reset_in=-10)
+    monkeypatch.setattr(daemon, "wake_session", lambda sid, *a, **k: "sent")
+    monkeypatch.setattr(daemon, "find_lockfile", lambda *a, **k: None)
+    _exec(
+        env.db,
+        "UPDATE tasks SET quota_model=?, quota_checkpoint=? WHERE id=?",
+        ("opus", "step 3/5", tid),
+    )
+    # seed the counter at the limit minus one: this pass defers once...
+    for _ in range(daemon._QUOTA_PROBE_DEFER_LIMIT - 1):
+        db.record_event(SID, "quota_probe_deferred", "seed", task_id=tid, path=env.db)
+    assert daemon.run(env.db, env.qdir, once=True, notify_send=env.notifier) == daemon.RUN_OK
+    row = db.get_task(tid, path=env.db)
+    assert row["step_state"] == "waiting_quota"
+    assert row["quota_model"] == "opus"
+    assert row["quota_checkpoint"] == "step 3/5"
+    # ...and the next expired sweep hits the limit - no re-park
+    _exec(env.db, "UPDATE tasks SET quota_reset_at=? WHERE id=?", (int(time.time()) - 1, tid))
+    assert daemon.run(env.db, env.qdir, once=True, notify_send=env.notifier) == daemon.RUN_OK
+    row = db.get_task(tid, path=env.db)
+    assert row["step_state"] is None
+    assert any(d["event"] == "quota_probe_gave_up" for d in _decisions(env))
