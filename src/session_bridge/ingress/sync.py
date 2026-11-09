@@ -14,8 +14,10 @@ namespace - only a reconciler running inside that user namespace
 host-side timer therefore restricts itself via
 ``SESSIONS_BRIDGE_INGRESS_KINDS`` (comma-separated kinds; unset =
 reconcile everything): with ``=tcp`` it skips ns-* rows entirely -
-never spawning, never killing, never error-reporting - and the
-namespace-aware loop owns their lifecycle.
+never spawning, never killing - and the namespace-aware loop owns
+their lifecycle. (Genuinely malformed rows still surface in
+``errors`` - the kinds filter cannot classify garbage, so it is
+reported rather than silently assumed foreign.)
 
 The reconciler only ever kills processes it spawned: a tracked pid
 must still map to a process whose cmdline contains the forwarder
@@ -33,6 +35,7 @@ import sys
 import time
 
 from session_bridge.ingress.spec import (
+    _KINDS,
     ForwardSpec,
     parse_fwd_spec,
     parse_purpose,
@@ -161,9 +164,20 @@ def _spawn(state_dir: str, port: int, spec: ForwardSpec) -> int:
 
 def _kinds_filter() -> set | None:
     """Allowed spec kinds from SESSIONS_BRIDGE_INGRESS_KINDS, or None
-    (reconcile everything) when the var is unset/empty."""
+    (reconcile everything) when the var is unset/empty. Values are
+    case-normalized and validated against the known spec kinds -
+    unknown entries are dropped with a stderr warning so a typo
+    degrades to the unfiltered path instead of silently turning the
+    pass into a no-op (nothing spawned, nothing reaped)."""
     raw = os.environ.get("SESSIONS_BRIDGE_INGRESS_KINDS", "")
-    kinds = {k.strip() for k in raw.split(",") if k.strip()}
+    kinds = {k.strip().lower() for k in raw.split(",") if k.strip()}
+    unknown = kinds - set(_KINDS)
+    if unknown:
+        sys.stderr.write(
+            f"ingress sync: ignoring unknown SESSIONS_BRIDGE_INGRESS_KINDS"
+            f" values {sorted(unknown)} (known kinds: {list(_KINDS)})\n"
+        )
+        kinds -= unknown
     return kinds or None
 
 
@@ -200,15 +214,18 @@ def sync(state_dir: str, rows) -> dict:
             return {"status": "skipped", "reason": "another sync holds ingress.lock"}
         state = _load_state(state_dir)
         tracked = state["forwards"]
-        desired, row_errors = desired_forwards(rows, _kinds_filter())
+        kinds = _kinds_filter()
+        desired, row_errors = desired_forwards(rows, kinds)
         summary = {"started": [], "stopped": [], "kept": [], "errors": row_errors}
         now = int(time.time())
 
         # stop forwards whose row is gone or lost its fwd declaration -
         # but only for ports this pass actually owns: a tracked forwarder
         # whose kind is filtered out belongs to the other context and is
-        # left alone (tracked record kept, process untouched).
-        kinds = _kinds_filter()
+        # left alone (tracked record kept, process untouched). A stored
+        # spec this bridge version cannot parse is likewise treated as
+        # foreign under a filter - better to strand a foreign record
+        # than to kill a forwarder owned by another context.
         for port_s in list(tracked):
             if int(port_s) in desired:
                 continue
@@ -218,7 +235,7 @@ def sync(state_dir: str, rows) -> dict:
                     if parse_fwd_spec(rec["spec"]).kind not in kinds:
                         continue
                 except (ValueError, KeyError):
-                    pass
+                    continue
             tracked.pop(port_s)
             _kill(rec["pid"], port_s)
             summary["stopped"].append(int(port_s))

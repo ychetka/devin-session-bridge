@@ -142,6 +142,18 @@ def test_kinds_filter_env(monkeypatch):
     assert sync_mod._kinds_filter() is None
 
 
+def test_kinds_filter_env_validates(monkeypatch, capsys):
+    """Unknown/typo'd kinds are dropped with a warning - degrading to
+    the unfiltered path rather than silently no-op'ing the pass."""
+    monkeypatch.setenv("SESSIONS_BRIDGE_INGRESS_KINDS", "TCP")
+    assert sync_mod._kinds_filter() == {"tcp"}  # case-normalized
+    monkeypatch.setenv("SESSIONS_BRIDGE_INGRESS_KINDS", "tcp,typo")
+    assert sync_mod._kinds_filter() == {"tcp"}
+    assert "typo" in capsys.readouterr().err
+    monkeypatch.setenv("SESSIONS_BRIDGE_INGRESS_KINDS", "bogus")
+    assert sync_mod._kinds_filter() is None  # nothing valid -> unfiltered
+
+
 def test_sync_kinds_filter_leaves_foreign_tracked(tmp_path, monkeypatch):
     """A tracked forwarder whose kind is filtered out belongs to the
     other reconciler context - this pass must not kill it."""
@@ -168,6 +180,34 @@ def test_sync_kinds_filter_leaves_foreign_tracked(tmp_path, monkeypatch):
     monkeypatch.delenv("SESSIONS_BRIDGE_INGRESS_KINDS")
     sync_mod.sync(state_dir, rows)
     assert "5678" not in sync_mod._load_state(state_dir)["forwards"]
+    sync_mod.sync(state_dir, [])
+
+
+def test_sync_kinds_filter_leaves_unparseable_tracked(tmp_path, monkeypatch):
+    """A tracked record whose stored spec this bridge version cannot
+    parse (e.g. a kind added by a newer bridge and tracked by the
+    project context) is treated as foreign under a filter - the pass
+    must not kill a forwarder it cannot classify."""
+    state_dir = str(tmp_path / "state")
+    tcp_port = _free_port()
+    rows = _rows((tcp_port, "fwd=tcp:127.0.0.1:1"))
+    sync_mod.sync(state_dir, rows)
+    st = sync_mod._load_state(state_dir)
+    st["forwards"]["9999"] = {
+        "pid": 999999,
+        "spec": "future-kind:x:9",  # unknown to this bridge version
+        "bind": "0.0.0.0",
+        "resolved": "1",
+        "started_at": 1,
+    }
+    sync_mod._save_state(state_dir, st)
+    monkeypatch.setenv("SESSIONS_BRIDGE_INGRESS_KINDS", "tcp")
+    out = sync_mod.sync(state_dir, rows)
+    assert out["stopped"] == []
+    assert "9999" in sync_mod._load_state(state_dir)["forwards"]
+    monkeypatch.delenv("SESSIONS_BRIDGE_INGRESS_KINDS")
+    sync_mod.sync(state_dir, rows)
+    assert "9999" not in sync_mod._load_state(state_dir)["forwards"]
     sync_mod.sync(state_dir, [])
 
 
