@@ -1164,7 +1164,7 @@ def test_item139_gwt3_mail_stall_escalates_once_per_episode(env, monkeypatch):
     assert age >= 7199
     orch_mail = _one(
         env.db,
-        "SELECT body FROM notifications WHERE session_id='orc' AND kind='directive'",
+        "SELECT body FROM notifications WHERE session_id='orc' AND kind='notice'",
     )
     assert orch_mail is not None and SID in orch_mail["body"] and "120m" in orch_mail["body"]
     assert (
@@ -1492,7 +1492,7 @@ def test_item139_gwt17_dead_session_still_escalates_on_disk_mail(env, monkeypatc
     assert daemon._mail_stall_pass(env.db, env.sdir, int(time.time()), env.notifier) >= 7199
     orch_mail = _one(
         env.db,
-        "SELECT body FROM notifications WHERE session_id='orc' AND kind='directive'",
+        "SELECT body FROM notifications WHERE session_id='orc' AND kind='notice'",
     )
     assert orch_mail is not None and SID in orch_mail["body"]
 
@@ -1507,7 +1507,7 @@ def test_item139_gwt17_dead_session_still_escalates_on_disk_mail(env, monkeypatc
         bodies = [
             r["body"]
             for r in con.execute(
-                "SELECT body FROM notifications WHERE session_id='orc' AND kind='directive'"
+                "SELECT body FROM notifications WHERE session_id='orc' AND kind='notice'"
             ).fetchall()
         ]
     finally:
@@ -1535,7 +1535,7 @@ def _stall_verify(env, monkeypatch, statuses):
 def _orch_stall_count(env):
     return _one(
         env.db,
-        "SELECT COUNT(*) c FROM notifications WHERE session_id='orc' AND kind='directive'",
+        "SELECT COUNT(*) c FROM notifications WHERE session_id='orc' AND kind='notice'",
     )["c"]
 
 
@@ -1572,7 +1572,7 @@ def test_item174_gwt2_idle_after_busy_escalates(env, monkeypatch):
     assert _orch_stall_count(env) == 1
     orch_mail = _one(
         env.db,
-        "SELECT body FROM notifications WHERE session_id='orc' AND kind='directive'",
+        "SELECT body FROM notifications WHERE session_id='orc' AND kind='notice'",
     )
     assert SID in orch_mail["body"]
 
@@ -2102,3 +2102,69 @@ def test_item207_gwt4_sweep_sees_no_heartbeat_ghosts(env):
         "",
     )
     assert "ghost" in detail
+
+
+def test_item210_gwt1_stall_escalation_journals_durable_event(env, monkeypatch):
+    """[ITEM-210.GWT-1] a mail-stall escalation now also appends a
+    durable decision_events row (kind mail_stall) carrying the
+    stalled sid, project, mail age and pending counts - the
+    restart-proof copy the orchestrator's tg_escalate forward is
+    sourced from. The notification body names the project."""
+    _managed_stale(env)  # registers SID with cwd /repo/ws
+    res = db.register("orc", "/repo/orc", role="orchestrator", path=env.db)
+    assert res.accepted
+    db.set_session_mode("orc", SessionMode.MANAGED, path=env.db)
+    _undrained_mail(env, SID, NotificationKind.DIRECTIVE, age_seconds=7200)
+    _wake_calls(env, monkeypatch)
+
+    daemon._mail_stall_pass(env.db, env.sdir, int(time.time()), env.notifier)
+
+    ev = db.list_events(session_id=SID, kind="mail_stall", path=env.db)
+    assert len(ev) == 1
+    body = ev[0]["body"]
+    # directive 445 payload: sid, project, unacked count, oldest mail
+    # age, pending questions, last-seen age
+    assert "reason=mail_stall" in body
+    assert "oldest_mail_age_s=72" in body  # 7200s fixture age
+    assert "unacked=1" in body
+    assert "pending_questions=0" in body
+    assert "last_seen_s=" in body
+    assert "project=ws" in body
+    assert "target=orchestrator" in body
+    orch_mail = _one(
+        env.db,
+        "SELECT body FROM notifications WHERE session_id='orc' AND kind='notice'",
+    )
+    assert orch_mail is not None
+    assert "[MAIL_STALL]" in orch_mail["body"] and "(ws)" in orch_mail["body"]
+    assert "unacked=1" in orch_mail["body"] and "oldest_mail_age_s=" in orch_mail["body"]
+
+    # one episode -> one event row while the cadence is not due
+    daemon._mail_stall_pass(env.db, env.sdir, int(time.time()) + 60, env.notifier)
+    assert len(db.list_events(session_id=SID, kind="mail_stall", path=env.db)) == 1
+
+
+def test_item210_gwt2_stall_realerts_on_cadence_inside_episode(env, monkeypatch):
+    """[ITEM-210.GWT-2] directive 445: a stall that never resolves
+    re-alerts after the 3600s cadence inside the SAME episode - the
+    episode stamp re-arms itself rather than silencing a chronically
+    wedged drain forever."""
+    _managed_stale(env)
+    res = db.register("orc", "/repo/orc", role="orchestrator", path=env.db)
+    assert res.accepted
+    db.set_session_mode("orc", SessionMode.MANAGED, path=env.db)
+    _undrained_mail(env, SID, NotificationKind.DIRECTIVE, age_seconds=7200)
+    _wake_calls(env, monkeypatch)
+
+    now = int(time.time())
+    daemon._mail_stall_pass(env.db, env.sdir, now, env.notifier)
+    assert _orch_stall_count(env) == 1
+    # same pass cadence: no re-alert inside the window
+    daemon._mail_stall_pass(env.db, env.sdir, now + 1800, env.notifier)
+    assert _orch_stall_count(env) == 1
+    # past the re-alert cadence: same episode alerts again
+    daemon._mail_stall_pass(
+        env.db, env.sdir, now + daemon._MAIL_STALL_REALERT_SECONDS + 5, env.notifier
+    )
+    assert _orch_stall_count(env) == 2
+    assert len(db.list_events(session_id=SID, kind="mail_stall", path=env.db)) == 2

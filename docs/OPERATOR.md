@@ -419,10 +419,14 @@ human-override items (task #198, v0.3.14):
 - **Remaining real gap - operator force-fail of a running task**:
   `bridge finish` is owner-CAS'd, so a wedged session's running
   task survives until lease recovery (or `lease_auto_renew`'s
-  ceiling while it reports busy). A `bridge kill <task_id>` - CAS
+  ceiling while it reports busy). The delivered `bridge kill
+  <sid>` (v0.5.0) is session-scoped - it detaches the whole
+  session and requeues its task for
+  re-dispatch. A task scoped `bridge kill <task_id>` - CAS
   `running|dispatch_decided > failed` ignoring lease_owner, with
-  the same `requeue_dead_worker` dirty-tree note - would close the
-  "stop THIS task now" piece. Small, deferred as a separate item.
+  the same `requeue_dead_worker` dirty-tree note - would still
+  close the "stop THIS task now" piece. Small, deferred as a
+  separate item.
 
 ## Daemon lifecycle
 
@@ -566,13 +570,15 @@ Each pass (~5s, with up to ~1s startup jitter):
    ref before starting". A silent orchestrator raises one deduped
    `notify-send -u critical`.
 6. Mail stall: any session whose oldest undrained actionable mail is
-   older than `SESSIONS_BRIDGE_MAIL_STALL_SECONDS` (default 1800s)
-   gets one escalation per stall episode - a directive pushed into
-   the active orchestrator's mailbox naming the session and the wait
-   age (`mail_stall_escalated` decision), so the orchestrator can
-   manual-wake it or escalate to the developer. The orchestrator's
+   older than `SB_STALL_THRESHOLD_S` (default 1800s; the legacy
+   `SESSIONS_BRIDGE_MAIL_STALL_SECONDS` alias still works) gets one
+   escalation per stall episode - a `notice` notification carrying
+   the `[MAIL_STALL]` marker pushed into the active orchestrator's
+   mailbox (`mail_stall_escalated` decision), so the orchestrator
+   can manual-wake it, forward to `tg_escalate` or escalate to the
+   developer. The orchestrator's
    own stall (or the absence of an active holder) falls back to
-   `notify-send` - a self-addressed directive would sit undrained
+   `notify-send` - a self-addressed notice would sit undrained
    too. With no delivery target at all the pass logs
    `mail_stall_deferred` and retries next pass without consuming the
    episode. A session verifiably mid-turn (session/list statusEnum
@@ -588,14 +594,24 @@ Each pass (~5s, with up to ~1s startup jitter):
    dedup stamp lives in `wake_state.mail_escalated_at`;
    it is cleared when the mailbox fully drains OR when the oldest
    remaining mail is newer than the stamp (the escalated items were
-   drained - what sits there now is a new stall), so a chronically
-   stalled session is not limited to one escalation ever. Unconsumed
+   drained - what sits there now is a new stall). A stamp older than
+   `SB_STALL_REALERT_S` (default 3600s) re-arms itself: a stall that
+   never resolves re-alerts on the cadence inside the same episode
+   (v0.5.0). Unconsumed
    `msg_*.txt` files count as undrained mail too - their mtime is the
    age evidence for mail the outbox never registered (v0.3.4). The
    pass also writes the maximum undrained age as
    `mail_undrained_max_age=<s>` on the
    second line of `daemon_heartbeat.txt` (line 1 stays the unix
-   timestamp - the watchdog contract is unchanged).
+   timestamp - the watchdog contract is unchanged). Since v0.5.0 each
+   escalation also appends a durable `decision_events` row
+   (`kind=mail_stall`) carrying `reason=mail_stall`, the stalled
+   sid, `project` (cwd basename), `unacked`, `oldest_mail_age_s`,
+   `pending_questions`, `last_seen_s`, `pending_foreign` and the
+   delivery `target` - the restart-proof
+   payload the orchestrator's `tg_escalate` forward is sourced from;
+   the notification body names the same fields inline (`[MAIL_STALL]
+   ... <sid> (<project>)`).
 
 ## Wake transport (acp-host)
 
@@ -730,7 +746,22 @@ flagged risks from the deferred design stay in force:
 refuses (conflict) while the session is mid-turn. Useful to verify
 the transport or to nudge a session on demand.
 
-## Code layering notes (v0.3.15)
+## Code layering notes (v0.5.0)
+
+- `cli/` is a package since v0.5.0 (task #210): `bridge.py` keeps the
+  parser, the `_HANDLERS` dispatch table, `main()` and read-compat
+  re-exports; `cli/common.py` holds shared helpers (queue/state dirs,
+  trigger files, notify-send, tombstone merge, lazy dead-session GC,
+  `JsonResponse` emission); `cli/dispatch.py` owns the pump + `_work`
+  machinery (semaphore, worker logs, ACP cycle); `cli/status.py` the
+  fleet view; `cli/commands/` the `_cmd_*` handlers by domain
+  (tasks / sessions / questions / notices / allocations / ops).
+  `python -m session_bridge.cli.bridge` is unchanged. Patch seams
+  moved with their call sites - tests patch `dispatch._spawn_worker`,
+  `common._notify_send`, `ops._sigterm_daemon`,
+  `commands.sessions.{wake_session,find_lockfile,verify_sessions}`.
+
+### v0.3.15 notes
 
 - `acp/protocol.py` is the single home of the NDJSON framing,
   JSON-RPC envelope, response classification and `initialize`
@@ -945,6 +976,7 @@ Global flags: `--db PATH` (`SESSIONS_BRIDGE_DB`), `--queue-dir DIR`
 | `bridge halt <sid>` / `bridge halt --all [--stop-daemon]` | graceful fleet stop: sets `halted_at`, queues the `halt` semantic and wakes; `--all` reports each target's wake outcome, mailbox depth and live task; `--stop-daemon` SIGTERMs the supervisor after the broadcast (v0.3.11). |
 | `bridge resume <sid>` / `bridge resume --all` | lift a halt: clears `halted_at`, queues the `resume` semantic and wakes the session (v0.3.11). |
 | `bridge unregister <sid> [--force]` | remove a dead/ghost registration and all its state (v0.3.14): refuses when a live task exists, when the heartbeat is fresh, or when the acp-host still lists the session (`--force` skips the two liveness legs; the live-task refusal always applies). Deletes sessions/heartbeat/tasks/notifications/questions/schedules/wake_state rows and the mailbox dir - `audit_events` and the decision journal keep the audit trail. Since v0.3.15 the mailbox is tombstone-renamed before the delete commits: a refusal restores it, a success removes the tombstone, and mail landing in a recreated `queue/<sid>` during the delete is post-delete state that survives (`mailbox_dir_recreated`/`mailbox_tombstoned` in the JSON output). |
+| `bridge kill <sid>` | force-terminate a session's live bridge state without `unregister`'s liveness refusals or row deletion (v0.5.0): the session flips to `dead`, `running`/`awaiting_user` tasks requeue with leases released (a resurrected session re-dispatches them through the normal pump/claim path - `queued` is the only claimable re-entry state), staged `dispatch_decided` rows fold back to `queued`, and the heartbeat row is removed so metronome writes cannot keep the corpse warm. `queued` tasks stay queued. All effects land in one transaction with a `session_killed` `decision_events` row. Idempotent on an already-dead row (a no-op repeat writes no duplicate event); `not_found` on an unregistered sid. Kill detaches bridge state, it is not a ban - a still-alive session self-revives on its next `register` (unmanaged also on `heartbeat`). |
 | `bridge register <sid> [--role worker\|orchestrator] [--workspace DIR] [--force]` | join the bus and stamp the heartbeat; orchestrator is a CAS singleton. |
 | `bridge ask --session SID --task ID "text"` | post a worker question; refused when another question is pending (`pending_exists`), the task hit the 3-question budget (`question_limit`), or no active orchestrator exists (`no_orchestrator`). |
 | `bridge ack --session SID [--up-to N]` | advance the session's mailbox ack watermark. |
@@ -1007,6 +1039,8 @@ the target workspace as `.devin/orchestrator/PLAYBOOK.md`).
 | `SESSIONS_BRIDGE_STOP_TIMEOUT` | 600 | Stop hook timeout written by install_hooks.sh. |
 | `SESSIONS_BRIDGE_CYCLE_SECONDS` | 150 | park cycle length for installed hooks. |
 | `SESSIONS_BRIDGE_CYCLES_MAX` | 5 | park budget for installed hooks. |
-| `SESSIONS_BRIDGE_MAIL_STALL_SECONDS` | 1800 | undrained-mail age before the daemon escalates to the orchestrator. |
+| `SB_STALL_THRESHOLD_S` | 1800 | undrained-mail age before the daemon escalates to the orchestrator. |
+| `SB_STALL_REALERT_S` | 3600 | cadence for re-alerting a still-stalled session inside the same episode. |
+| `SESSIONS_BRIDGE_MAIL_STALL_SECONDS` | 1800 | legacy alias of `SB_STALL_THRESHOLD_S`; the canonical name wins when both are set. |
 | `SESSIONS_BRIDGE_GHOST_TTL` | 86400 | seconds after `sessions.updated_at` before a no-heartbeat-row unmanaged registration (ghost) is swept dead. |
 | `SESSIONS_BRIDGE_BUSY_GRACE_SECONDS` | 7200 (4x stall) | ceiling on mid-turn busy grace - a still-busy session escalates past it; clamped at the stall threshold. |

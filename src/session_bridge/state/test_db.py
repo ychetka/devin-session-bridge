@@ -28,6 +28,8 @@ from session_bridge.state.contract import (
     Transport,
 )
 from session_bridge.state.verdict import (
+    Killed,
+    KillNotFound,
     ReleaseNotFound,
     ReleaseRefusedOwner,
     ReleaseRemoved,
@@ -2411,3 +2413,93 @@ def test_item208_gwt8_renew_keeps_purpose_release_gates(db_path):
         db.release("bogus", "1", "p", path=db_path)
     with pytest.raises(ValueError):
         db.release("tcp_port", "9000", "", path=db_path)
+
+
+def test_item210_gwt15_kill_detaches_live_state(db_path):
+    """[ITEM-210.GWT-15] kill_session: the session flips to dead, a
+    running task requeues with its lease released (queued is the only
+    claimable re-entry state - leaseless dispatch_decided is
+    unclaimable limbo), staged dispatch_decided folds back to queued,
+    the heartbeat row is removed and a session_killed event is
+    journaled - all in one transaction. Unknown sids answer
+    KillNotFound."""
+    assert isinstance(db.kill_session("ghost", path=db_path), KillNotFound)
+
+    res = db.register("w1", "/repo/w", path=db_path)
+    assert res.accepted
+    db.heartbeat("w1", path=db_path)
+    running = db.enqueue("w1", "live work", path=db_path)
+    assert db.claim_queued(running, "bridge-1", Transport.ACP_PUSH, path=db_path)
+    assert db.mark_running(running, "bridge-1", path=db_path)
+
+    v = db.kill_session("w1", path=db_path)
+    assert isinstance(v, Killed)
+    assert v.tasks_requeued == 1 and v.heartbeat_removed and v.status_before == "active"
+
+    t = db.get_task(running, path=db_path)
+    assert t["status"] == TaskStatus.QUEUED.value
+    assert t["lease_owner"] is None and t["lease_expires_at"] is None
+    s = db.get_session("w1", path=db_path)
+    assert s["status"] == SessionStatus.DEAD.value
+    assert _one(db_path, "SELECT COUNT(*) c FROM worker_heartbeats WHERE session_id='w1'")["c"] == 0
+    ev = db.list_events(session_id="w1", kind="session_killed", path=db_path)
+    assert len(ev) == 1 and "tasks_requeued=1" in ev[0]["body"]
+
+    # no limbo: a resurrected session claims the requeued task through
+    # the normal managed path (review finding regression check)
+    db.register("w1", "/repo/w", path=db_path)
+    assert db.claim_managed(running, "w1", "w1-owner", path=db_path)
+    assert db.get_task(running, path=db_path)["status"] == TaskStatus.RUNNING.value
+
+    # a task staged as dispatch_decided folds back to queued with its
+    # claim-window lease released (one live task per session -> own
+    # session for this leg)
+    db.register("w2", "/repo/w2", path=db_path)
+    staged = db.enqueue("w2", "staged", path=db_path)
+    _exec(
+        db_path,
+        "UPDATE tasks SET status=?, lease_owner=?, lease_expires_at=? WHERE id=?",
+        (
+            TaskStatus.DISPATCH_DECIDED.value,
+            "bridge-2",
+            int(time.time()) + 60,
+            staged,
+        ),
+    )
+    v2 = db.kill_session("w2", path=db_path)
+    assert isinstance(v2, Killed) and v2.tasks_requeued == 0 and v2.staged_folded == 1
+    t2 = db.get_task(staged, path=db_path)
+    assert t2["status"] == TaskStatus.QUEUED.value
+    assert t2["lease_owner"] is None
+
+    # a queued task never claimed a lease and stays queued
+    db.register("w3", "/repo/w3", path=db_path)
+    queued = db.enqueue("w3", "next", path=db_path)
+    db.kill_session("w3", path=db_path)
+    assert db.get_task(queued, path=db_path)["status"] == TaskStatus.QUEUED.value
+
+    # a leaseless dispatch_decided row is corruption (unclaimable
+    # limbo) - the fold repairs it to queued too, not just leased
+    # staged rows
+    db.register("w5", "/repo/w5", path=db_path)
+    corrupt = db.enqueue("w5", "corrupt", path=db_path)
+    _exec(
+        db_path,
+        "UPDATE tasks SET status=? WHERE id=?",
+        (TaskStatus.DISPATCH_DECIDED.value, corrupt),
+    )
+    v5 = db.kill_session("w5", path=db_path)
+    assert isinstance(v5, Killed) and v5.staged_folded == 1
+    assert db.get_task(corrupt, path=db_path)["status"] == TaskStatus.QUEUED.value
+
+    # a repeat kill still performs its effects: w1 resurrected above
+    # and re-claimed the task, so the second kill requeues it again
+    v4 = db.kill_session("w1", path=db_path)
+    assert isinstance(v4, Killed) and v4.status_before == "active" and v4.tasks_requeued == 1
+
+    # idempotent on an already-dead row with nothing left to change:
+    # a no-op repeat kill writes no duplicate audit event
+    db.register("w4", "/repo/w4", path=db_path)
+    assert isinstance(db.kill_session("w4", path=db_path), Killed)
+    assert isinstance(db.kill_session("w4", path=db_path), Killed)
+    assert len(db.list_events(session_id="w4", kind="session_killed", path=db_path)) == 1

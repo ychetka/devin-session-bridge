@@ -68,6 +68,9 @@ from .contract import (
     validate_question_transition,
 )
 from .verdict import (
+    Killed,
+    KillNotFound,
+    KillVerdict,
     ReleaseNotFound,
     ReleaseRefusedOwner,
     ReleaseRemoved,
@@ -1733,6 +1736,126 @@ def unregister_session(session_id: str, *, force: bool = False, path=None) -> Un
     return _retry(op)
 
 
+def kill_session(session_id: str, *, path=None) -> KillVerdict:
+    """Force-terminate a session's live bridge state (task #210).
+
+    The kill path for a session that must be detached NOW, without
+    unregister's liveness refusals and row deletion: the session row
+    flips to ``dead``, live tasks (``running``/``awaiting_user``)
+    requeue with their leases released so a resurrected session
+    re-dispatches them through the normal pump/claim path, staged
+    ``dispatch_decided`` rows fold back to ``queued`` the same way
+    (``release_claim`` semantics - deterministic, no wait for the
+    claim-window lease to lapse), and the heartbeat row is removed so
+    metronome writes cannot keep the corpse warm. ``queued`` tasks
+    are left queued - they never claimed a lease.
+
+    ``queued`` - not ``dispatch_decided`` - is the only valid
+    re-entry state (review finding): a leaseless ``dispatch_decided``
+    row is unclaimable (``claim_managed`` binds ``lease_owner``),
+    invisible to recovery (``recover_stale`` needs
+    ``lease_expires_at``) and blocks ``ux_tasks_live_session``
+    forever - a terminal limbo, not a demotion.
+
+    ``KillNotFound`` when the sid is not registered; ``Killed``
+    carrying effect counts otherwise. All effects land inside one
+    ``BEGIN IMMEDIATE`` and a ``session_killed`` row is appended to
+    ``decision_events`` in the same transaction, so the durable audit
+    cannot be lost between commit and a second write. A repeat kill
+    that changes nothing (already dead, no live tasks, no heartbeat)
+    writes no duplicate event and does not bump ``updated_at`` - the
+    command stays idempotent for audit as well as state.
+
+    Kill detaches bridge state; it is not a ban. A session whose
+    process is still alive self-revives on its next ``register``
+    call - or, for UNMANAGED sessions, on its next ``heartbeat``
+    (item_122 revives dead unmanaged rows only; a managed row stays
+    dead until it re-registers) - so cutting that off needs the
+    process or its hooks stopped first, which is the operator's side
+    of the contract.
+    """
+    ts = _now()
+
+    def op():
+        con = connect(path)
+        try:
+            con.execute("BEGIN IMMEDIATE")
+            row = con.execute(
+                "SELECT status, mode FROM sessions WHERE session_id=?",
+                (session_id,),
+            ).fetchone()
+            if row is None:
+                con.rollback()
+                return KillNotFound()
+            cur = con.execute(
+                "UPDATE tasks SET status=?, lease_owner=NULL,"
+                " lease_expires_at=NULL, lease_renewed_at=NULL,"
+                " updated_at=?"
+                " WHERE session_id=? AND status IN (?,?)",
+                (
+                    TaskStatus.QUEUED.value,
+                    ts,
+                    session_id,
+                    TaskStatus.RUNNING.value,
+                    TaskStatus.AWAITING_USER.value,
+                ),
+            )
+            requeued = cur.rowcount
+            # staged dispatches fold back to queued wholesale: leased
+            # rows drop their claim-window lease so nothing waits on a
+            # dead claimant's expiry, and a leaseless dispatch_decided
+            # row (state corruption - unclaimable limbo) gets repaired
+            # by the same fold instead of surviving the kill
+            cur = con.execute(
+                "UPDATE tasks SET status=?, lease_owner=NULL,"
+                " lease_expires_at=NULL, lease_renewed_at=NULL,"
+                " updated_at=?"
+                " WHERE session_id=? AND status=?",
+                (
+                    TaskStatus.QUEUED.value,
+                    ts,
+                    session_id,
+                    TaskStatus.DISPATCH_DECIDED.value,
+                ),
+            )
+            staged = cur.rowcount
+            hb = con.execute(
+                "DELETE FROM worker_heartbeats WHERE session_id=?",
+                (session_id,),
+            ).rowcount
+            flipped = con.execute(
+                "UPDATE sessions SET status=?, updated_at=? WHERE session_id=? AND status<>?",
+                (SessionStatus.DEAD.value, ts, session_id, SessionStatus.DEAD.value),
+            ).rowcount
+            if flipped or requeued or staged or hb:
+                con.execute(
+                    "INSERT INTO decision_events(session_id,kind,body,created_at) VALUES (?,?,?,?)",
+                    (
+                        session_id,
+                        "session_killed",
+                        f"tasks_requeued={requeued} staged_folded={staged}"
+                        f" heartbeat_removed={bool(hb)}"
+                        f" status_before={row['status']} mode={row['mode']}",
+                        ts,
+                    ),
+                )
+            con.commit()
+            return Killed(
+                tasks_requeued=requeued,
+                staged_folded=staged,
+                heartbeat_removed=bool(hb),
+                status_before=row["status"],
+                mode=row["mode"],
+            )
+        except BaseException:
+            con.rollback()
+            raise
+        finally:
+            con.close()
+
+    return _retry(op)
+
+
 def set_session_status(session_id: str, status, *, path=None) -> bool:
     """Set ``sessions.status`` (active|dead); True only on a real flip.
 
@@ -3114,29 +3237,60 @@ def sessions_with_undrained_mail(*, path=None) -> dict:
     return _retry(op)
 
 
-def mark_mail_escalated(session_id: str, *, path=None) -> bool:
+def mark_mail_escalated(
+    session_id: str,
+    *,
+    rearm_after: int | None = None,
+    now: int | None = None,
+    event_body: str | None = None,
+    path=None,
+) -> bool:
     """Stamp ``wake_state.mail_escalated_at`` once per stall episode.
 
     Returns True only for the caller that actually set the stamp - the
     upsert's NULL guard makes repeated daemon passes no-ops until
     :func:`clear_mail_escalated` opens a fresh episode, so the
-    orchestrator gets one directive per stall, not one per pass.
+    orchestrator gets one alert per stall, not one per pass.
+    ``rearm_after`` (seconds, task #210 directive 445) additionally
+    lets a stamp older than that window re-set itself: a chronically
+    stalled session re-alerts on the cadence instead of being
+    silenced by its own episode stamp forever.
+
+    ``event_body`` appends a ``mail_stall`` ``decision_events`` row
+    inside the same transaction as the stamp (review fix): the
+    durable restart-proof payload and the dedup stamp commit or roll
+    back together, so a crash can neither lose the journal nor
+    double-stamp an episode the journal missed.
     """
-    ts = _now()
+    ts = now if now is not None else _now()
+    guard = "wake_state.mail_escalated_at IS NULL"
+    if rearm_after is not None:
+        guard += f" OR wake_state.mail_escalated_at<={ts - int(rearm_after)}"
 
     def op():
         con = connect(path)
         try:
+            con.execute("BEGIN IMMEDIATE")
             cur = con.execute(
                 "INSERT INTO wake_state(session_id,mail_escalated_at,updated_at)"
                 " VALUES(?,?,?)"
                 " ON CONFLICT(session_id) DO UPDATE SET"
                 " mail_escalated_at=excluded.mail_escalated_at,"
                 " updated_at=excluded.updated_at"
-                " WHERE wake_state.mail_escalated_at IS NULL",
+                f" WHERE {guard}",
                 (session_id, ts, ts),
             )
-            return cur.rowcount == 1
+            stamped = cur.rowcount == 1
+            if stamped and event_body:
+                con.execute(
+                    "INSERT INTO decision_events(session_id,kind,body,created_at) VALUES (?,?,?,?)",
+                    (session_id, "mail_stall", event_body, ts),
+                )
+            con.commit()
+            return stamped
+        except BaseException:
+            con.rollback()
+            raise
         finally:
             con.close()
 

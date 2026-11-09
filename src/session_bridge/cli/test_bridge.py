@@ -2,8 +2,8 @@
 
 Boundaries are mocked at their contract edges: ``AcpClient`` (acp
 transport), ``db.is_locked`` + ``db.sessions_db_lookup`` (devin's own
-storage), ``bridge._spawn_worker`` (subprocess boundary) and
-``bridge._notify_send`` (notify-send). state.db itself stays real in a
+storage), ``dispatch._spawn_worker`` (subprocess boundary) and
+``common._notify_send`` (notify-send). state.db itself stays real in a
 tmp_path via ``SESSIONS_BRIDGE_DB``.
 """
 
@@ -21,7 +21,8 @@ from typing import ClassVar
 import pytest
 
 from session_bridge.acp.contract import AcpError, PromptResult
-from session_bridge.cli import bridge
+from session_bridge.cli import bridge, common, dispatch
+from session_bridge.cli.commands import ops, sessions
 from session_bridge.cli.contract import (
     EventKind,
     ExitCode,
@@ -53,7 +54,7 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setenv("SESSIONS_BRIDGE_QUEUE_DIR", str(qdir))
     spawned = []
     monkeypatch.setattr(
-        bridge,
+        dispatch,
         "_spawn_worker",
         lambda tid, owner, args: spawned.append((tid, owner)),
     )
@@ -62,7 +63,7 @@ def env(tmp_path, monkeypatch):
     devin = {}
     monkeypatch.setattr(db, "sessions_db_lookup", lambda sid: devin.get(sid))
     sent = []
-    monkeypatch.setattr(bridge, "_notify_send", lambda title, body: sent.append((title, body)))
+    monkeypatch.setattr(common, "_notify_send", lambda title, body: sent.append((title, body)))
     return SimpleNamespace(
         db=db_path,
         qdir=qdir,
@@ -196,7 +197,7 @@ def test_item07_gwt3_work_session_locked_falls_back_to_hook(env, capsys, monkeyp
     env.locks[SID] = (True, 777)
     tid = _task(env)
     owner = _claim_acp(env, tid)
-    monkeypatch.setattr(bridge, "AcpClient", _LockedClient)
+    monkeypatch.setattr(dispatch, "AcpClient", _LockedClient)
     rc, out = _run(["_work", str(tid), "--owner", owner, "--json"], capsys)
     assert rc == ExitCode.OK
     resp = JsonResponse.model_validate(out)
@@ -217,7 +218,7 @@ def test_item07_gwt3_work_session_locked_from_dispatch_decided(env, capsys, monk
     tid = _task(env)
     owner = "acp-9-7"
     assert db.claim_queued(tid, owner, Transport.ACP_PUSH, path=env.db)
-    monkeypatch.setattr(bridge, "AcpClient", _LockedClient)
+    monkeypatch.setattr(dispatch, "AcpClient", _LockedClient)
     rc, _out = _run(["_work", str(tid), "--owner", owner, "--json"], capsys)
     assert rc == ExitCode.OK
     row = db.get_task(tid, path=env.db)
@@ -235,7 +236,7 @@ def test_item07_gwt4_finished_worker_dispatches_next_queued(env, capsys, monkeyp
     t1 = _task(env, sid="s1")
     owner1 = _claim_acp(env, t1, owner="acp-1-1")
     t2 = _task(env, sid="s2")
-    monkeypatch.setattr(bridge, "AcpClient", _OkClient)
+    monkeypatch.setattr(dispatch, "AcpClient", _OkClient)
     _OkClient.prompts.clear()
     rc, _ = _run(["_work", str(t1), "--owner", owner1], capsys)
     assert rc == ExitCode.OK
@@ -516,7 +517,7 @@ def test_item07_gwt6_work_missing_session_fails_task(env, capsys, monkeypatch):
     # _work cannot resolve a cwd: controlled not_found failure
     tid = _task(env)
     owner = _claim_acp(env, tid)
-    monkeypatch.setattr(bridge, "AcpClient", _OkClient)
+    monkeypatch.setattr(dispatch, "AcpClient", _OkClient)
     rc, out = _run(["_work", str(tid), "--owner", owner, "--json"], capsys)
     assert rc == ExitCode.OK
     resp = JsonResponse.model_validate(out)
@@ -597,7 +598,7 @@ def test_item07_work_failed_turn_finishes_failed_and_notifies(env, capsys, monke
     env.devin[SID] = {"working_directory": "/repo"}
     tid = _task(env)
     owner = _claim_acp(env, tid)
-    monkeypatch.setattr(bridge, "AcpClient", RefusalClient)
+    monkeypatch.setattr(dispatch, "AcpClient", RefusalClient)
     rc, out = _run(["_work", str(tid), "--owner", owner, "--json"], capsys)
     assert rc == ExitCode.OK
     resp = JsonResponse.model_validate(out)
@@ -617,7 +618,7 @@ def test_item07_work_transient_acp_error_waits_for_lease_recovery(env, capsys, m
     env.devin[SID] = {"working_directory": "/repo"}
     tid = _task(env)
     owner = _claim_acp(env, tid)
-    monkeypatch.setattr(bridge, "AcpClient", FlakyClient)
+    monkeypatch.setattr(dispatch, "AcpClient", FlakyClient)
     rc, _out = _run(["_work", str(tid), "--owner", owner, "--json"], capsys)
     assert rc == ExitCode.OK
     row = db.get_task(tid, path=env.db)
@@ -634,7 +635,7 @@ def test_item07_work_prompt_timeout_is_terminal(env, capsys, monkeypatch):
     env.devin[SID] = {"working_directory": "/repo"}
     tid = _task(env)
     owner = _claim_acp(env, tid)
-    monkeypatch.setattr(bridge, "AcpClient", SlowClient)
+    monkeypatch.setattr(dispatch, "AcpClient", SlowClient)
     rc, _out = _run(["_work", str(tid), "--owner", owner, "--json"], capsys)
     assert rc == ExitCode.OK
     row = db.get_task(tid, path=env.db)
@@ -824,7 +825,7 @@ def test_item10_gwt4_detached_worker_stderr_log(tmp_path, monkeypatch):
         queue_dir=str(tmp_path / "queue"),
         timeout=5,
     )
-    proc = bridge._spawn_worker(tid, owner, args)
+    proc = dispatch._spawn_worker(tid, owner, args)
     assert proc.wait(timeout=120) == 0
 
     logs = list((tmp_path / "logs").glob(f"worker_{tid}_*_*.log"))
@@ -2227,7 +2228,7 @@ def _managed(env, sid=SID):
 def _stub_wake(env, monkeypatch, outcomes=None):
     calls = []
     monkeypatch.setattr(
-        bridge,
+        sessions,
         "wake_session",
         lambda sid, *a, **k: calls.append(sid) or (outcomes or {}).get(sid, "sent"),
     )
@@ -2357,7 +2358,7 @@ def test_item180_gwt5_halt_all_stop_daemon(env, monkeypatch, capsys):
     _managed(env)
     _stub_wake(env, monkeypatch)
     seen = []
-    monkeypatch.setattr(bridge, "_sigterm_daemon", lambda sdir: seen.append(sdir) or "stopped")
+    monkeypatch.setattr(ops, "_sigterm_daemon", lambda sdir: seen.append(sdir) or "stopped")
 
     rc, out = _run(["halt", "--all", "--stop-daemon", "--json"], capsys)
     assert rc == ExitCode.OK
@@ -2425,7 +2426,7 @@ def test_item180_gwt10_stop_daemon_relays_halt_files(env, monkeypatch, capsys):
     materializes them as mailbox files."""
     _managed(env)
     _stub_wake(env, monkeypatch)
-    monkeypatch.setattr(bridge, "_sigterm_daemon", lambda sdir: "stopped")
+    monkeypatch.setattr(ops, "_sigterm_daemon", lambda sdir: "stopped")
 
     rc, out = _run(["halt", "--all", "--stop-daemon", "--json"], capsys)
     assert rc == ExitCode.OK
@@ -2566,13 +2567,13 @@ def test_item198_gwt5_host_present_refused(env, monkeypatch, capsys):
     entry (None) is listed too - 'present but unknown state' can
     never read as 'absent' (review: statusless must refuse)."""
     _ghost(env)
-    monkeypatch.setattr(bridge, "find_lockfile", lambda *a, **k: {"_p": 1})
-    monkeypatch.setattr(bridge, "verify_sessions", lambda sids, **k: {SID: "idle"})
+    monkeypatch.setattr(sessions, "find_lockfile", lambda *a, **k: {"_p": 1})
+    monkeypatch.setattr(sessions, "verify_sessions", lambda sids, **k: {SID: "idle"})
     rc, out = _run(["unregister", SID, "--json"], capsys)
     assert rc == ExitCode.CONFLICT and out["status"] == "conflict"
     assert db.get_session(SID, path=env.db) is not None
 
-    monkeypatch.setattr(bridge, "verify_sessions", lambda sids, **k: {SID: None})
+    monkeypatch.setattr(sessions, "verify_sessions", lambda sids, **k: {SID: None})
     rc, out = _run(["unregister", SID, "--json"], capsys)
     assert rc == ExitCode.CONFLICT and out["status"] == "conflict"
     assert db.get_session(SID, path=env.db) is not None
@@ -2584,7 +2585,7 @@ def test_item198_gwt6_force_skips_liveness(env, monkeypatch, capsys):
     about; the live-task refusal still applies (GWT-3)."""
     _ghost(env)
     db.heartbeat(SID, path=env.db)  # fresh - would refuse without force
-    monkeypatch.setattr(bridge, "verify_sessions", lambda sids, **k: {SID: "working"})
+    monkeypatch.setattr(sessions, "verify_sessions", lambda sids, **k: {SID: "working"})
     rc, out = _run(["unregister", SID, "--force", "--json"], capsys)
     assert rc == ExitCode.OK and out["data"]["host_check"] == "force"
     assert db.get_session(SID, path=env.db) is None
@@ -2595,12 +2596,12 @@ def test_item198_gwt7_verify_failure_proceeds(env, monkeypatch, capsys):
     failure proves nothing either way, so removal proceeds and the
     output records which leg ran."""
     _ghost(env)
-    monkeypatch.setattr(bridge, "find_lockfile", lambda *a, **k: {"_p": 1})
+    monkeypatch.setattr(sessions, "find_lockfile", lambda *a, **k: {"_p": 1})
 
     def boom(sids, **k):
         raise bridge.WakeError("attach_failed", "nope")
 
-    monkeypatch.setattr(bridge, "verify_sessions", boom)
+    monkeypatch.setattr(sessions, "verify_sessions", boom)
     rc, out = _run(["unregister", SID, "--json"], capsys)
     assert rc == ExitCode.OK
     assert out["data"]["host_check"] == "verify_failed:attach_failed"
@@ -2961,3 +2962,27 @@ def test_item208_gwt14_wildcard_enforced_release_usage_and_session(env, capsys):
 
     rc, _ = _run(["release", "bogus", "x", "--project", "p", "--json"], capsys)
     assert rc == ExitCode.USAGE
+
+
+def test_item210_gwt16_kill_cli_and_event(env, capsys):
+    """[ITEM-210.GWT-16] `bridge kill <sid>` detaches a session's live
+    state: dead row, requeued task, heartbeat gone, durable
+    session_killed event readable back through `bridge events`."""
+    db.register("w1", "/repo/w", path=env.db)
+    db.heartbeat("w1", path=env.db)
+    tid = db.enqueue("w1", "work", path=env.db)
+    _claim_acp(env, tid)
+
+    rc, out = _run(["kill", "w1", "--json"], capsys)
+    assert rc == ExitCode.OK
+    d = out["data"]
+    assert d["killed"] and d["tasks_requeued"] == 1 and d["heartbeat_removed"]
+    assert d["status_before"] == "active"
+    assert db.get_session("w1", path=env.db)["status"] == "dead"
+    assert db.get_task(tid, path=env.db)["status"] == "queued"
+
+    rc, out = _run(["kill", "ghost", "--json"], capsys)
+    assert rc == ExitCode.NOT_FOUND and out["status"] == "not_found"
+
+    rc, out = _run(["events", "--session", "w1", "--kind", "session_killed", "--json"], capsys)
+    assert rc == ExitCode.OK and out["data"]["events"][0]["kind"] == "session_killed"
