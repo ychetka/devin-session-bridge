@@ -44,6 +44,7 @@ import os
 import re
 import sqlite3
 import time
+import urllib.parse
 from dataclasses import dataclass
 from enum import Enum
 
@@ -370,6 +371,7 @@ _SESSION_COLUMN_MIGRATIONS = (
 _TASK_COLUMN_MIGRATIONS = (
     ("run_after", "INTEGER"),
     ("wait_until", "INTEGER"),
+    ("finished_at", "INTEGER"),
 )
 
 # Columns the item_139 schema adds to wake_state, applied idempotently
@@ -434,6 +436,30 @@ def connect(path=None) -> sqlite3.Connection:
         raise BridgeDBError(f"state.db at {target} is not a readable database: {e}") from e
 
 
+def connect_ro(path=None) -> sqlite3.Connection:
+    """Read-only connection for report-style readers (fleet-metrics).
+
+    ``mode=ro`` makes the no-write claim kernel-enforced: no WAL/journal
+    or header bytes can be written by the queries. Unlike ``connect`` a
+    missing file raises ``sqlite3.OperationalError`` instead of creating
+    an empty database - the caller turns that into a user-facing error.
+    """
+    target = _path(path)
+    # percent-encode so a path carrying '?' or '%' stays inside the
+    # URI's file component
+    uri = f"file:{urllib.parse.quote(target)}?mode=ro"
+    con = sqlite3.connect(uri, uri=True, timeout=5)
+    try:
+        con.row_factory = sqlite3.Row
+        con.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
+        # Probe the header so a corrupt file fails here, not mid-report.
+        con.execute("PRAGMA schema_version").fetchone()
+        return con
+    except BaseException:
+        con.close()
+        raise
+
+
 def init(path=None) -> None:
     """Create the schema (idempotent) and stamp user_version=3.
 
@@ -466,6 +492,7 @@ def init(path=None) -> None:
                     if col not in existing:
                         con.execute(f"ALTER TABLE sessions ADD COLUMN {col} {decl}")
                 existing = {r["name"] for r in con.execute("PRAGMA table_info(tasks)")}
+                task_cols = set(existing)
                 for col, decl in _TASK_COLUMN_MIGRATIONS:
                     if col not in existing:
                         con.execute(f"ALTER TABLE tasks ADD COLUMN {col} {decl}")
@@ -473,6 +500,17 @@ def init(path=None) -> None:
                 for col, decl in _WAKE_COLUMN_MIGRATIONS:
                     if col not in existing:
                         con.execute(f"ALTER TABLE wake_state ADD COLUMN {col} {decl}")
+                # item_98: tasks finished before finished_at existed get
+                # the closest recorded stamp (post-completion writers may
+                # have bumped updated_at, so this is an approximation).
+                # ``task_cols`` is the pre-ALTER column set - a file
+                # too old to carry updated_at skips the backfill.
+                if "updated_at" in task_cols:
+                    con.execute(
+                        "UPDATE tasks SET finished_at=updated_at"
+                        " WHERE finished_at IS NULL AND status IN (?, ?)",
+                        (TaskStatus.DONE.value, TaskStatus.FAILED.value),
+                    )
                 con.execute("PRAGMA user_version=3")
                 con.execute("COMMIT")
             except BaseException:
@@ -957,10 +995,11 @@ def requeue_or_fail(task_id: int, note: str | None = None, *, path=None):
             cur = con.execute(
                 "UPDATE tasks SET status=?, attempt=attempt+1,"
                 " lease_owner=NULL, lease_expires_at=NULL,"
-                " lease_renewed_at=NULL,"
+                " lease_renewed_at=NULL, finished_at=?,"
                 " note=COALESCE(?,note), updated_at=?" + guard + " AND attempt+1>=?",
                 (
                     TaskStatus.FAILED.value,
+                    ts,
                     note,
                     ts,
                     task_id,
@@ -1074,10 +1113,11 @@ def requeue_dead_worker(task_id: int, note: str | None = None, *, path=None):
             cur = con.execute(
                 "UPDATE tasks SET status=?, attempt=attempt+1,"
                 " lease_owner=NULL, lease_expires_at=NULL,"
-                " lease_renewed_at=NULL,"
+                " lease_renewed_at=NULL, finished_at=?,"
                 " note=COALESCE(?,note), updated_at=?" + guard + " AND attempt+1>=?",
                 (
                     TaskStatus.FAILED.value,
+                    ts,
                     note,
                     ts,
                     task_id,
@@ -1117,12 +1157,13 @@ def finish_task(
                 "UPDATE tasks SET status=?,"
                 " last_assistant_message=COALESCE(?,last_assistant_message),"
                 " note=COALESCE(?,note), lease_owner=NULL,"
-                " lease_expires_at=NULL, updated_at=?"
+                " lease_expires_at=NULL, finished_at=?, updated_at=?"
                 " WHERE id=? AND status=? AND lease_owner=?",
                 (
                     target,
                     last_assistant_message,
                     note,
+                    ts,
                     ts,
                     task_id,
                     TaskStatus.RUNNING.value,
@@ -1150,6 +1191,7 @@ def retry(task_id: int, note: str | None = None, *, path=None) -> bool:
             cur = con.execute(
                 "UPDATE tasks SET status=?, attempt=0, lease_owner=NULL,"
                 " lease_expires_at=NULL, lease_renewed_at=NULL,"
+                " finished_at=NULL,"
                 " note=COALESCE(?,note), updated_at=?"
                 " WHERE id=? AND status=?",
                 (
@@ -3645,9 +3687,16 @@ def _block_task(task_id: int, target, note: str | None, *, path=None) -> bool:
             cur = con.execute(
                 f"UPDATE tasks SET status=?, note=COALESCE(?,note),"
                 f" lease_owner=NULL, lease_expires_at=NULL,"
-                f" lease_renewed_at=NULL, updated_at=?"
+                f" lease_renewed_at=NULL, finished_at=COALESCE(?,finished_at),"
+                f" updated_at=?"
                 f" WHERE id=? AND status IN ({_LIVE_SQL})",
-                (_val(target), note, ts, task_id),
+                (
+                    _val(target),
+                    note,
+                    ts if _val(target) == TaskStatus.FAILED.value else None,
+                    ts,
+                    task_id,
+                ),
             )
             return cur.rowcount == 1
         finally:

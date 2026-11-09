@@ -14,6 +14,7 @@ import re
 import sys
 import threading
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import ClassVar
@@ -2986,3 +2987,244 @@ def test_item210_gwt16_kill_cli_and_event(env, capsys):
 
     rc, out = _run(["events", "--session", "w1", "--kind", "session_killed", "--json"], capsys)
     assert rc == ExitCode.OK and out["data"]["events"][0]["kind"] == "session_killed"
+
+
+# --- item_98 / directive 446: fleet-metrics read-only report -------
+
+
+def _cycle_repo(tmp_path, rows):
+    """Scratch repo dir carrying a .devin/cycle_log.jsonl."""
+    repo = tmp_path / "repoA"
+    (repo / ".devin").mkdir(parents=True)
+    lines = "\n".join(json.dumps(r) for r in rows)
+    (repo / ".devin" / "cycle_log.jsonl").write_text(lines + "\n")
+    return repo
+
+
+def test_item98_gwt1_fleet_metrics_report(env, capsys, tmp_path):
+    """[ITEM-98.GWT-1] fleet-metrics aggregates per-session task
+    counters, decision_events, questions and the repo's cycle_log
+    (path from session cwd) into a markdown report - read-only."""
+    repo = _cycle_repo(
+        tmp_path,
+        [
+            {
+                "ts": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()),
+                "item": "i_001",
+                "action": "commit",
+                "verdict": "ok",
+            },
+            {
+                "ts": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()),
+                "item": "i_001",
+                "action": "push",
+                "verdict": "ok",
+            },
+            {
+                "ts": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()),
+                "item": "i_002",
+                "action": "verify_constraints",
+                "verdict": "failure",
+                "failure_class": "gate_blocked",
+                "status": "closed",
+                "result": "1 failure",
+            },
+        ],
+    )
+    db.register("w1", str(repo), path=env.db)
+    tid = _task(env, "w1")
+    _claim_acp(env, tid)
+    assert db.finish_task(tid, "acp-9-1", "done", path=env.db)
+    con = db.connect(env.db)
+    try:
+        con.execute(
+            "INSERT INTO questions(task_id,session_id,text,state,answer,"
+            " asked_at,answered_at) VALUES(?,?,?,?,?,?,?)",
+            (tid, "w1", "q?", "answered", "a", int(time.time()) - 120, int(time.time()) - 60),
+        )
+        con.commit()
+    finally:
+        con.close()
+    db.record_event("w1", "plan_delta", "delta", path=env.db)
+    db.record_event("w1", "mail_stall", "reason=mail_stall", path=env.db)
+
+    rc, out = _run(["fleet-metrics", "--window", "7d", "--json"], capsys)
+    assert rc == ExitCode.OK
+    d = out["data"]
+    s = d["sessions"]["w1"]
+    assert s["done"] == 1 and s["plan_delta"] == 1 and s["stall_episodes"] == 1
+    assert s["questions"] == 1
+    repo_m = d["repos"]["repoA"]
+    assert repo_m["verify_failures"] == 1
+    assert repo_m["rounds_max"] == 2  # i_001 got commit+push
+    assert d["orchestrator"]["ask_answer_mean_s"] == 60
+    assert "| w1 |" in d["report"] and "## Incident log" in d["report"]
+    assert "repoA" in d["report"] and "gate_blocked" in d["report"]
+
+
+def test_item98_gwt2_window_filter_and_no_cycle_log(env, capsys, tmp_path):
+    """[ITEM-98.GWT-2] rows older than the window drop out; a repo
+    without cycle_log yields empty aggregates, not an error."""
+    repo = tmp_path / "repoB"
+    repo.mkdir()
+    db.register("w2", str(repo), path=env.db)
+    tid = _task(env, "w2")
+    # age the task beyond the 24h window
+    con = db.connect(env.db)
+    try:
+        con.execute(
+            "UPDATE tasks SET created_at=?, updated_at=? WHERE id=?",
+            (int(time.time()) - 90000, int(time.time()) - 89000, tid),
+        )
+        con.commit()
+    finally:
+        con.close()
+    rc, out = _run(["fleet-metrics", "--window", "24h", "--json"], capsys)
+    assert rc == ExitCode.OK
+    d = out["data"]
+    assert d["sessions"]["w2"]["done"] == 0 or d["sessions"]["w2"]["inflight"] == 1
+    assert d["repos"]["repoB"]["incidents_by_class"] == {}
+
+
+def test_item98_gwt3_stall_events_collapse_to_episodes(env, capsys):
+    """[ITEM-98.GWT-3] consecutive mail_stall decision events inside
+    one re-alert cadence (plus poll jitter) count as ONE episode; a
+    gap beyond the episode bound opens a new episode - the daemon
+    re-journals every cadence inside a stall, so the raw count would
+    inflate the metric for the worst stalls."""
+    db.register("w1", "/tmp/none", path=env.db)
+    base = int(time.time()) - 20000
+    con = db.connect(env.db)
+    try:
+        # 0 -> +3720 -> +7320: realert cadence with poll jitter stays
+        # ONE episode; +20000 (gap ~12700s) opens a second.
+        for off in (0, 3720, 7320, 20000):
+            con.execute(
+                "INSERT INTO decision_events(session_id,kind,body,created_at) VALUES(?,?,?,?)",
+                ("w1", "mail_stall", "x", base + off),
+            )
+        con.commit()
+    finally:
+        con.close()
+    rc, out = _run(["fleet-metrics", "--window", "7d", "--json"], capsys)
+    assert rc == ExitCode.OK
+    assert out["data"]["sessions"]["w1"]["stall_episodes"] == 2
+
+
+def test_item98_gwt4_cycle_ts_utc_window_boundary(env, capsys, tmp_path):
+    """[ITEM-98.GWT-4] a cycle_log row whose UTC timestamp sits just
+    inside the window must be counted - mktime-style host-local
+    parsing would shift it out of the window by the TZ offset."""
+    edge = datetime.now(timezone.utc) - timedelta(seconds=86400 - 60)
+    repo = _cycle_repo(
+        tmp_path,
+        [
+            {
+                "ts": edge.isoformat(),
+                "item": "i_edge",
+                "action": "commit",
+                "verdict": "ok",
+            }
+        ],
+    )
+    db.register("w1", str(repo), path=env.db)
+    rc, out = _run(["fleet-metrics", "--window", "24h", "--json"], capsys)
+    assert rc == ExitCode.OK
+    assert out["data"]["repos"][repo.name]["rounds_max"] == 1
+
+
+def test_item98_gwt5_repo_basename_collision(env, capsys, tmp_path):
+    """[ITEM-98.GWT-5] two repos sharing a directory basename never
+    silently merge - the repo table falls back to full paths."""
+    a = tmp_path / "a" / "proj"
+    b = tmp_path / "b" / "proj"
+    (a / ".devin").mkdir(parents=True)
+    (b / ".devin").mkdir(parents=True)
+    now_iso = datetime.now(timezone.utc).isoformat()
+    (a / ".devin" / "cycle_log.jsonl").write_text(
+        json.dumps({"ts": now_iso, "item": "i_1", "action": "commit", "verdict": "ok"}) + "\n"
+    )
+    db.register("w1", str(a), path=env.db)
+    db.register("w2", str(b), path=env.db)
+    rc, out = _run(["fleet-metrics", "--window", "7d", "--json"], capsys)
+    assert rc == ExitCode.OK
+    repos = out["data"]["repos"]
+    assert str(a) in repos and str(b) in repos
+    assert repos[str(a)]["rounds_max"] == 1 and repos[str(b)]["rounds_max"] == 0
+
+
+def test_item98_gwt6_finished_at_stable_under_post_writes(env, capsys):
+    """[ITEM-98.GWT-6] finish_task stamps finished_at; post-completion
+    bumps of updated_at (note/notify) must not inflate cycle time nor
+    re-enter old rows into the window."""
+    db.register("w1", "/tmp/none", path=env.db)
+    tid = _task(env, "w1")
+    _claim_acp(env, tid)
+    assert db.finish_task(tid, "acp-9-1", "done", path=env.db)
+    con = db.connect(env.db)
+    try:
+        fin = con.execute("SELECT finished_at FROM tasks WHERE id=?", (tid,)).fetchone()[
+            "finished_at"
+        ]
+        assert fin is not None
+        # simulate a late post-completion write on updated_at
+        con.execute("UPDATE tasks SET updated_at=? WHERE id=?", (fin + 3600, tid))
+        con.commit()
+    finally:
+        con.close()
+    rc, out = _run(["fleet-metrics", "--window", "7d", "--json"], capsys)
+    assert rc == ExitCode.OK
+    s = out["data"]["sessions"]["w1"]
+    assert s["done"] == 1
+    assert s["cycle_median_s"] is not None and s["cycle_median_s"] < 120
+
+
+def test_item98_gwt7_escalated_rows_count_as_incidents(env, capsys, tmp_path):
+    """[ITEM-98.GWT-7] escalated verdicts show in the incident log AND
+    in the class histogram - not silently dropped from counts."""
+    now_iso = datetime.now(timezone.utc).isoformat()
+    repo = _cycle_repo(
+        tmp_path,
+        [
+            {
+                "ts": now_iso,
+                "item": "i_esc",
+                "action": "review",
+                "verdict": "escalated",
+                "status": "open",
+            }
+        ],
+    )
+    db.register("w1", str(repo), path=env.db)
+    rc, out = _run(["fleet-metrics", "--window", "7d", "--json"], capsys)
+    assert rc == ExitCode.OK
+    m = out["data"]["repos"][repo.name]
+    assert m["escalations"] == 1 and m["incidents_by_class"] == {"escalated": 1}
+
+
+def test_item98_gwt8_missing_db_errors_without_creating(tmp_path, capsys, monkeypatch):
+    """[ITEM-98.GWT-8] the report is kernel-enforced read-only: a
+    missing state.db is an error, not an empty file created on disk."""
+    missing = tmp_path / "no.db"
+    monkeypatch.setenv("SESSIONS_BRIDGE_DB", str(missing))
+    rc, out = _run(["fleet-metrics", "--json"], capsys)
+    assert rc == ExitCode.INTERNAL
+    assert out["status"] == "error" and not missing.exists()
+
+
+def test_item98_gwt9_pre_finished_at_db_falls_back(env, capsys, tmp_path):
+    """[ITEM-98.GWT-9] a state.db created before the finished_at
+    column still reports (degraded to updated_at) instead of erroring
+    on the missing column."""
+    repo = tmp_path / "repoC"
+    repo.mkdir()
+    db.register("w1", str(repo), path=env.db)
+    con = db.connect(env.db)
+    try:
+        con.execute("ALTER TABLE tasks DROP COLUMN finished_at")
+        con.commit()
+    finally:
+        con.close()
+    rc, out = _run(["fleet-metrics", "--window", "7d", "--json"], capsys)
+    assert rc == ExitCode.OK
+    assert "w1" in out["data"]["sessions"]

@@ -52,6 +52,7 @@ from session_bridge.cli.commands.allocations import (
     _cmd_release,
     _cmd_reserve,
 )
+from session_bridge.cli.commands.metrics import _cmd_fleet_metrics
 from session_bridge.cli.commands.notices import (
     _cmd_directive,
     _cmd_event,
@@ -590,6 +591,21 @@ def _parse_args(argv) -> argparse.Namespace:
     sp.add_argument("--timeout", type=int, default=None)
     _add_json(sp)
 
+    # directive 446: read-only fleet report for the orchestrator /
+    # operator - bridge state + each repo's cycle_log.jsonl, rendered
+    # as markdown; sessions never consume it
+    sp = sub.add_parser(
+        "fleet-metrics",
+        help="read-only markdown report: per-session/repo/orchestrator metrics",
+    )
+    sp.add_argument(
+        "--window",
+        choices=("24h", "7d"),
+        default="7d",
+        help="report window (default 7d)",
+    )
+    _add_json(sp)
+
     return p.parse_args(argv)
 
 
@@ -627,6 +643,7 @@ _HANDLERS = {
     "questions": _cmd_questions,
     "escalate": _cmd_escalate,
     "schedule": _cmd_schedule,
+    "fleet-metrics": _cmd_fleet_metrics,
     "version": _cmd_version,
 }
 
@@ -638,7 +655,12 @@ def main(argv=None) -> int:
         # block the deployed-version report (PR54 r1 warning)
         return _cmd_version(args)
     try:
-        db.init(args.db)
+        # fleet-metrics is a pure reader (directive 446): init() would
+        # CREATE a missing state.db and run column migrations - both
+        # are writes, so the report opens the file mode=ro instead and
+        # serves pre-migration files via the updated_at fallback.
+        if args.command != "fleet-metrics":
+            db.init(args.db)
     except Exception as e:
         return _emit(
             args,
