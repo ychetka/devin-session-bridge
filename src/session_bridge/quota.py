@@ -52,7 +52,7 @@ def _clock_reset(hh: int, mm: int, now: float) -> float | None:
     or None when the captured time is not a real clock time."""
     if not (0 <= hh <= 23 and 0 <= mm <= 59):
         return None
-    base = datetime.now(timezone.utc)
+    base = datetime.fromtimestamp(now, timezone.utc)
     today = base.replace(hour=hh, minute=mm, second=0, microsecond=0)
     if today.timestamp() <= now:
         today += timedelta(days=1)
