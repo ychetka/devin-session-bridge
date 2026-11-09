@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.8.0] - 2026-11-10
+
+### User-facing
+
+#### feat
+- The claim-lease TTL is now configurable via `SB_LEASE_TTL_S` and defaults to 1h (was a hardcoded 30m) - long worker turns no longer outlive their lease window as easily, and `bridge` picks the override up at startup. `state` (issue #105, directive 526 (task 213 postmortem))
+
+### Codebase
+
+#### state
+- [feat] LEASE_SECONDS resolves once at the state.db layer from `SB_LEASE_TTL_S` (contract default 3600, malformed values degrade to the default, floored at 600s (2x renew margin) so a short override cannot sit inside the renewal window permanently); every lease writer plus the daemon auto-renew ceiling, dispatch renew interval and worker-log retention follow the resolved value. Why: Queue task 213 died on 'lease expired' after ~2.7h of live work when the auto-renew explicit-touch ceiling (6 x 1800s) ran out mid-turn - the lease length itself needed to be an operator tunable with a safer default. (issue #105, directive 526 (task 213 postmortem))
+
 ## [0.7.0] - 2026-11-09
 
 ### User-facing
