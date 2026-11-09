@@ -123,6 +123,94 @@ def test_desired_forwards_row_isolation():
     assert {e["row"] for e in errs} == {"80", "82"}
 
 
+def test_desired_forwards_kinds_filter():
+    """SESSIONS_BRIDGE_INGRESS_KINDS limits which spec kinds a pass
+    owns - the host timer (=tcp) must not even see ns-* rows."""
+    rows = _rows((80, "fwd=tcp:127.0.0.1:9 x"), (81, "fwd=ns-pid:1:9 y"))
+    d, _ = sync_mod.desired_forwards(rows, {"tcp"})
+    assert set(d) == {80}
+    d, _ = sync_mod.desired_forwards(rows, None)
+    assert set(d) == {80, 81}
+
+
+def test_kinds_filter_env(monkeypatch):
+    monkeypatch.setenv("SESSIONS_BRIDGE_INGRESS_KINDS", "tcp, ns-pidfile")
+    assert sync_mod._kinds_filter() == {"tcp", "ns-pidfile"}
+    monkeypatch.delenv("SESSIONS_BRIDGE_INGRESS_KINDS")
+    assert sync_mod._kinds_filter() is None
+    monkeypatch.setenv("SESSIONS_BRIDGE_INGRESS_KINDS", "  ")
+    assert sync_mod._kinds_filter() is None
+
+
+def test_kinds_filter_env_validates(monkeypatch, capsys):
+    """Unknown/typo'd kinds are dropped with a warning - degrading to
+    the unfiltered path rather than silently no-op'ing the pass."""
+    monkeypatch.setenv("SESSIONS_BRIDGE_INGRESS_KINDS", "TCP")
+    assert sync_mod._kinds_filter() == {"tcp"}  # case-normalized
+    monkeypatch.setenv("SESSIONS_BRIDGE_INGRESS_KINDS", "tcp,typo")
+    assert sync_mod._kinds_filter() == {"tcp"}
+    assert "typo" in capsys.readouterr().err
+    monkeypatch.setenv("SESSIONS_BRIDGE_INGRESS_KINDS", "bogus")
+    assert sync_mod._kinds_filter() is None  # nothing valid -> unfiltered
+
+
+def test_sync_kinds_filter_leaves_foreign_tracked(tmp_path, monkeypatch):
+    """A tracked forwarder whose kind is filtered out belongs to the
+    other reconciler context - this pass must not kill it."""
+    state_dir = str(tmp_path / "state")
+    tcp_port = _free_port()
+    rows = _rows((tcp_port, "fwd=tcp:127.0.0.1:1"), (5678, "fwd=ns-pid:999999999:9"))
+    out = sync_mod.sync(state_dir, rows)
+    assert out["started"] == [tcp_port]  # ns-pid:1 unresolvable -> error, not spawn
+    # pretend a foreign context spawned+tracked the ns forwarder
+    st = sync_mod._load_state(state_dir)
+    st["forwards"]["5678"] = {
+        "pid": 999999,
+        "spec": "ns-pid:999999999:9",
+        "bind": "0.0.0.0",
+        "resolved": "1",
+        "started_at": 1,
+    }
+    sync_mod._save_state(state_dir, st)
+    monkeypatch.setenv("SESSIONS_BRIDGE_INGRESS_KINDS", "tcp")
+    out = sync_mod.sync(state_dir, rows)
+    assert out["stopped"] == []
+    assert "5678" in sync_mod._load_state(state_dir)["forwards"]
+    # unfiltered pass reclaims it
+    monkeypatch.delenv("SESSIONS_BRIDGE_INGRESS_KINDS")
+    sync_mod.sync(state_dir, rows)
+    assert "5678" not in sync_mod._load_state(state_dir)["forwards"]
+    sync_mod.sync(state_dir, [])
+
+
+def test_sync_kinds_filter_leaves_unparseable_tracked(tmp_path, monkeypatch):
+    """A tracked record whose stored spec this bridge version cannot
+    parse (e.g. a kind added by a newer bridge and tracked by the
+    project context) is treated as foreign under a filter - the pass
+    must not kill a forwarder it cannot classify."""
+    state_dir = str(tmp_path / "state")
+    tcp_port = _free_port()
+    rows = _rows((tcp_port, "fwd=tcp:127.0.0.1:1"))
+    sync_mod.sync(state_dir, rows)
+    st = sync_mod._load_state(state_dir)
+    st["forwards"]["9999"] = {
+        "pid": 999999,
+        "spec": "future-kind:x:9",  # unknown to this bridge version
+        "bind": "0.0.0.0",
+        "resolved": "1",
+        "started_at": 1,
+    }
+    sync_mod._save_state(state_dir, st)
+    monkeypatch.setenv("SESSIONS_BRIDGE_INGRESS_KINDS", "tcp")
+    out = sync_mod.sync(state_dir, rows)
+    assert out["stopped"] == []
+    assert "9999" in sync_mod._load_state(state_dir)["forwards"]
+    monkeypatch.delenv("SESSIONS_BRIDGE_INGRESS_KINDS")
+    sync_mod.sync(state_dir, rows)
+    assert "9999" not in sync_mod._load_state(state_dir)["forwards"]
+    sync_mod.sync(state_dir, [])
+
+
 def test_sync_bad_row_does_not_block_good_forward(tmp_path):
     state_dir = str(tmp_path / "state")
     good = _free_port()

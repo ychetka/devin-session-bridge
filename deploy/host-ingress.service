@@ -13,3 +13,8 @@ After=default.target
 Type=oneshot
 ExecStart=@BRIDGE_BIN@@GLOBAL_ARGS@ ingress sync
 Environment=PYTHONUNBUFFERED=1
+# Host context has no CAP_SYS_ADMIN over project-owned user
+# namespaces - ns-* specs can only be materialized by a reconciler
+# running inside that userns (see supervisor inner loops). This unit
+# owns tcp: specs only; ns-* rows are skipped, not error-looped.
+Environment=SESSIONS_BRIDGE_INGRESS_KINDS=tcp
