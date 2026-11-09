@@ -2986,3 +2986,100 @@ def test_item210_gwt16_kill_cli_and_event(env, capsys):
 
     rc, out = _run(["events", "--session", "w1", "--kind", "session_killed", "--json"], capsys)
     assert rc == ExitCode.OK and out["data"]["events"][0]["kind"] == "session_killed"
+
+
+# --- item_98 / directive 446: fleet-metrics read-only report -------
+
+
+def _cycle_repo(tmp_path, rows):
+    """Scratch repo dir carrying a .devin/cycle_log.jsonl."""
+    repo = tmp_path / "repoA"
+    (repo / ".devin").mkdir(parents=True)
+    lines = "\n".join(json.dumps(r) for r in rows)
+    (repo / ".devin" / "cycle_log.jsonl").write_text(lines + "\n")
+    return repo
+
+
+def test_item98_gwt1_fleet_metrics_report(env, capsys, tmp_path):
+    """[ITEM-98.GWT-1] fleet-metrics aggregates per-session task
+    counters, decision_events, questions and the repo's cycle_log
+    (path from session cwd) into a markdown report - read-only."""
+    repo = _cycle_repo(
+        tmp_path,
+        [
+            {
+                "ts": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()),
+                "item": "i_001",
+                "action": "commit",
+                "verdict": "ok",
+            },
+            {
+                "ts": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()),
+                "item": "i_001",
+                "action": "push",
+                "verdict": "ok",
+            },
+            {
+                "ts": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()),
+                "item": "i_002",
+                "action": "verify_constraints",
+                "verdict": "failure",
+                "failure_class": "gate_blocked",
+                "status": "closed",
+                "result": "1 failure",
+            },
+        ],
+    )
+    db.register("w1", str(repo), path=env.db)
+    tid = _task(env, "w1")
+    _claim_acp(env, tid)
+    assert db.finish_task(tid, "acp-9-1", "done", path=env.db)
+    con = db.connect(env.db)
+    try:
+        con.execute(
+            "INSERT INTO questions(task_id,session_id,text,state,answer,"
+            " asked_at,answered_at) VALUES(?,?,?,?,?,?,?)",
+            (tid, "w1", "q?", "answered", "a", int(time.time()) - 120, int(time.time()) - 60),
+        )
+        con.commit()
+    finally:
+        con.close()
+    db.record_event("w1", "plan_delta", "delta", path=env.db)
+    db.record_event("w1", "mail_stall", "reason=mail_stall", path=env.db)
+
+    rc, out = _run(["fleet-metrics", "--window", "7d", "--json"], capsys)
+    assert rc == ExitCode.OK
+    d = out["data"]
+    s = d["sessions"]["w1"]
+    assert s["done"] == 1 and s["plan_delta"] == 1 and s["stall_episodes"] == 1
+    assert s["questions"] == 1
+    repo_m = d["repos"]["repoA"]
+    assert repo_m["verify_failures"] == 1
+    assert repo_m["rounds_max"] == 2  # i_001 got commit+push
+    assert d["orchestrator"]["ask_answer_mean_s"] == 60
+    assert "| w1 |" in d["report"] and "## Incident log" in d["report"]
+    assert "repoA" in d["report"] and "gate_blocked" in d["report"]
+
+
+def test_item98_gwt2_window_filter_and_no_cycle_log(env, capsys, tmp_path):
+    """[ITEM-98.GWT-2] rows older than the window drop out; a repo
+    without cycle_log yields empty aggregates, not an error."""
+    repo = tmp_path / "repoB"
+    repo.mkdir()
+    db.register("w2", str(repo), path=env.db)
+    tid = _task(env, "w2")
+    # age the task beyond the 24h window
+    con = db.connect(env.db)
+    try:
+        con.execute(
+            "UPDATE tasks SET created_at=?, updated_at=? WHERE id=?",
+            (int(time.time()) - 90000, int(time.time()) - 89000, tid),
+        )
+        con.commit()
+    finally:
+        con.close()
+    rc, out = _run(["fleet-metrics", "--window", "24h", "--json"], capsys)
+    assert rc == ExitCode.OK
+    d = out["data"]
+    assert d["sessions"]["w2"]["done"] == 0 or d["sessions"]["w2"]["inflight"] == 1
+    assert d["repos"]["repoB"]["incidents_by_class"] == {}
