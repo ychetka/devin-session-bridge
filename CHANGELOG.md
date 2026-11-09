@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.8.1] - 2026-11-10
+
+### User-facing
+
+_No user-visible changes._
+
+### Codebase
+
+#### tooling
+- [feat] Living spec pilot: `.changes` entries now carry a required `## Spec impact` section (adds/modifies/removes anchors into docs/specs), docs/specs/ seeds the requirement registry for mailbox/tasks/wake/sessions/quota in WHEN/THEN form, and tools/check_spec_anchors.sh (run by verify_constraints.sh) fails PRs whose anchors do not resolve post-change. Why: Nothing answered 'how does the system behave now' - roadmap tracks work, docs drift; per the approved spec_lifecycle design each PR carries its own spec delta so behavior and documentation cannot diverge. (task 226, issue #107, ADR-0004)
+
 ## [0.8.0] - 2026-11-10
 
 ### User-facing
