@@ -174,7 +174,9 @@ def _session_metrics(con, sid: str, since: int, fin_expr: str) -> dict:
         f"SELECT COUNT(*) c FROM tasks WHERE session_id=? AND status IN ({live_sql})",
         (sid,),
     ).fetchone()["c"]
-    cycles = [r["fin"] - r["created_at"] for r in done_rows if r["fin"] > r["created_at"]]
+    # ``>=`` keeps zero-duration tasks (claim+finish in one second);
+    # only corrupt negative durations are dropped.
+    cycles = [r["fin"] - r["created_at"] for r in done_rows if r["fin"] >= r["created_at"]]
     plan_delta = con.execute(
         "SELECT COUNT(*) c FROM decision_events WHERE session_id=?"
         " AND kind='plan_delta' AND created_at>=?",
@@ -261,7 +263,7 @@ def _cmd_fleet_metrics(args) -> int:
         ).fetchall()
         task_lat = con.execute(
             f"SELECT {fin_expr} - created_at AS d FROM tasks"
-            f" WHERE status=? AND {fin_expr}>=? AND {fin_expr}>created_at",
+            f" WHERE status=? AND {fin_expr}>=? AND {fin_expr}>=created_at",
             (TaskStatus.DONE.value, since),
         ).fetchall()
     finally:
