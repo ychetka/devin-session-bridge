@@ -145,9 +145,7 @@ def test_gwt6_kebab_slug_matches_github_rules(tmp_path):
     slugified, Then GitHub's rule applies: punctuation drops, spaces
     become hyphens, hyphen runs keep - 'A/B: C--d!' -> 'ab-c--d'."""
     repo = _scratch(tmp_path)
-    (repo / "docs" / "specs" / "domain.md").write_text(
-        SPEC.format(req="A/B: C--d!")
-    )
+    (repo / "docs" / "specs" / "domain.md").write_text(SPEC.format(req="A/B: C--d!"))
     _frag(repo, impact="- modifies: docs/specs/domain.md#ab-c--d")
     assert _run(repo).returncode == 0
 
@@ -175,9 +173,7 @@ def test_gwt9_empty_section_is_error(tmp_path):
     """Given a '## Spec impact' heading with no entries, When checked,
     Then fail - the section must carry '-' at minimum."""
     repo = _scratch(tmp_path)
-    (repo / ".changes" / "0001-a.md").write_text(
-        FRAGMENT.format(impact="").rstrip() + "\n"
-    )
+    (repo / ".changes" / "0001-a.md").write_text(FRAGMENT.format(impact="").rstrip() + "\n")
     out = _run(repo)
     assert out.returncode == 1
     assert "empty" in out.stderr
