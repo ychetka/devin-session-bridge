@@ -2478,6 +2478,20 @@ def test_item210_gwt15_kill_detaches_live_state(db_path):
     db.kill_session("w3", path=db_path)
     assert db.get_task(queued, path=db_path)["status"] == TaskStatus.QUEUED.value
 
+    # a leaseless dispatch_decided row is corruption (unclaimable
+    # limbo) - the fold repairs it to queued too, not just leased
+    # staged rows
+    db.register("w5", "/repo/w5", path=db_path)
+    corrupt = db.enqueue("w5", "corrupt", path=db_path)
+    _exec(
+        db_path,
+        "UPDATE tasks SET status=? WHERE id=?",
+        (TaskStatus.DISPATCH_DECIDED.value, corrupt),
+    )
+    v5 = db.kill_session("w5", path=db_path)
+    assert isinstance(v5, Killed) and v5.staged_folded == 1
+    assert db.get_task(corrupt, path=db_path)["status"] == TaskStatus.QUEUED.value
+
     # a repeat kill still performs its effects: w1 resurrected above
     # and re-claimed the task, so the second kill requeues it again
     v4 = db.kill_session("w1", path=db_path)

@@ -1300,10 +1300,6 @@ def _mail_stall_pass(
                 f"age={age}s count={r['count']} no escalation target",
             )
             continue
-        if not db.mark_mail_escalated(
-            sid, rearm_after=_MAIL_STALL_REALERT_SECONDS, now=now, path=db_path
-        ):
-            continue  # already escalated this episode, cadence not due
         # task #210 item 3 / directive 445: the escalation payload
         # names project, unacked count, oldest mail age, pending
         # questions and last-seen age so the orchestrator's
@@ -1342,18 +1338,22 @@ def _mail_stall_pass(
             " - drain is not reaching it"
             " (manual `bridge wake` or escalate to developer)"
         )
-        # journal BEFORE delivery: the decision_events row is the
-        # restart-proof payload the orchestrator's tg_escalate forward
-        # is sourced from - a crash between delivery and journaling
-        # must not lose it
-        db.record_event(
+        # stamp + journal atomically: the episode dedup guard and the
+        # restart-proof decision_events payload commit together, so a
+        # crash can neither lose the journal nor re-alert an episode
+        # whose event already landed
+        if not db.mark_mail_escalated(
             sid,
-            "mail_stall",
-            f"reason=mail_stall project={project or '-'} {fields}"
-            f" pending_foreign={r.get('foreign', 0)}"
-            f" target={target}",
+            rearm_after=_MAIL_STALL_REALERT_SECONDS,
+            now=now,
+            event_body=(
+                f"reason=mail_stall project={project or '-'} {fields}"
+                f" pending_foreign={r.get('foreign', 0)}"
+                f" target={target}"
+            ),
             path=db_path,
-        )
+        ):
+            continue  # already escalated this episode, cadence not due
         if target == "orchestrator":
             db.notify(orch_sid, NotificationKind.NOTICE, body, path=db_path)
         else:

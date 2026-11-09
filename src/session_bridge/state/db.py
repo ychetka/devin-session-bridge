@@ -1765,6 +1765,12 @@ def kill_session(session_id: str, *, path=None) -> KillVerdict:
     that changes nothing (already dead, no live tasks, no heartbeat)
     writes no duplicate event and does not bump ``updated_at`` - the
     command stays idempotent for audit as well as state.
+
+    Kill detaches bridge state; it is not a ban. A session whose
+    process is still alive self-revives on its next ``register`` /
+    ``heartbeat`` call (both write ``active`` again) - cutting that
+    off needs the process or its hooks stopped first, which is the
+    operator's side of the contract.
     """
     ts = _now()
 
@@ -1793,14 +1799,16 @@ def kill_session(session_id: str, *, path=None) -> KillVerdict:
                 ),
             )
             requeued = cur.rowcount
-            # staged dispatches hold a claim-window lease; fold them
-            # back to queued so the kill leaves zero leased rows and
-            # nothing waits on a dead claimant's expiry
+            # staged dispatches fold back to queued wholesale: leased
+            # rows drop their claim-window lease so nothing waits on a
+            # dead claimant's expiry, and a leaseless dispatch_decided
+            # row (state corruption - unclaimable limbo) gets repaired
+            # by the same fold instead of surviving the kill
             cur = con.execute(
                 "UPDATE tasks SET status=?, lease_owner=NULL,"
                 " lease_expires_at=NULL, lease_renewed_at=NULL,"
                 " updated_at=?"
-                " WHERE session_id=? AND status=? AND lease_owner IS NOT NULL",
+                " WHERE session_id=? AND status=?",
                 (
                     TaskStatus.QUEUED.value,
                     ts,
@@ -3232,6 +3240,7 @@ def mark_mail_escalated(
     *,
     rearm_after: int | None = None,
     now: int | None = None,
+    event_body: str | None = None,
     path=None,
 ) -> bool:
     """Stamp ``wake_state.mail_escalated_at`` once per stall episode.
@@ -3239,11 +3248,17 @@ def mark_mail_escalated(
     Returns True only for the caller that actually set the stamp - the
     upsert's NULL guard makes repeated daemon passes no-ops until
     :func:`clear_mail_escalated` opens a fresh episode, so the
-    orchestrator gets one directive per stall, not one per pass.
+    orchestrator gets one alert per stall, not one per pass.
     ``rearm_after`` (seconds, task #210 directive 445) additionally
     lets a stamp older than that window re-set itself: a chronically
     stalled session re-alerts on the cadence instead of being
     silenced by its own episode stamp forever.
+
+    ``event_body`` appends a ``mail_stall`` ``decision_events`` row
+    inside the same transaction as the stamp (review fix): the
+    durable restart-proof payload and the dedup stamp commit or roll
+    back together, so a crash can neither lose the journal nor
+    double-stamp an episode the journal missed.
     """
     ts = now if now is not None else _now()
     guard = "wake_state.mail_escalated_at IS NULL"
@@ -3253,6 +3268,7 @@ def mark_mail_escalated(
     def op():
         con = connect(path)
         try:
+            con.execute("BEGIN IMMEDIATE")
             cur = con.execute(
                 "INSERT INTO wake_state(session_id,mail_escalated_at,updated_at)"
                 " VALUES(?,?,?)"
@@ -3262,7 +3278,17 @@ def mark_mail_escalated(
                 f" WHERE {guard}",
                 (session_id, ts, ts),
             )
-            return cur.rowcount == 1
+            stamped = cur.rowcount == 1
+            if stamped and event_body is not None:
+                con.execute(
+                    "INSERT INTO decision_events(session_id,kind,body,created_at) VALUES (?,?,?,?)",
+                    (session_id, "mail_stall", event_body, ts),
+                )
+            con.commit()
+            return stamped
+        except BaseException:
+            con.rollback()
+            raise
         finally:
             con.close()
 
