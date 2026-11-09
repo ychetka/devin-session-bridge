@@ -221,3 +221,15 @@ def test_gwt12_second_spec_impact_section_flagged(tmp_path):
     out = _run(repo)
     assert out.returncode == 1
     assert "duplicate" in out.stderr
+
+
+def test_gwt13_noop_mixed_with_anchors_flagged(tmp_path):
+    """Given a fragment listing '-' alongside real anchor entries,
+    When checked, Then it fails - a noop declaration combined with
+    actual impact is a contradiction that must not slip through."""
+    repo = _scratch(tmp_path)
+    _frag(repo, impact="-\n- modifies: docs/specs/domain.md#x")
+    (repo / "docs" / "specs" / "domain.md").write_text(SPEC.format(req="x"))
+    out = _run(repo)
+    assert out.returncode == 1
+    assert "'-' cannot be combined" in out.stderr

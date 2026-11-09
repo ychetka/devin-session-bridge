@@ -114,6 +114,10 @@ for name in files:
     if not entries:
         problems.append(f"{name}: empty '## Spec impact' section - use '-' when no behavior changes")
         continue
+    kinds = {k for k, _ in entries}
+    if "noop" in kinds and kinds - {"noop", "malformed"}:
+        problems.append(f"{name}: '-' cannot be combined with anchor entries")
+        continue
     for op, ref in entries:
         if op == "noop":
             continue
