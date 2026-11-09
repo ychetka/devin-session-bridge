@@ -3228,3 +3228,175 @@ def test_item98_gwt9_pre_finished_at_db_falls_back(env, capsys, tmp_path):
     rc, out = _run(["fleet-metrics", "--window", "7d", "--json"], capsys)
     assert rc == ExitCode.OK
     assert "w1" in out["data"]["sessions"]
+
+
+# --- task #216: quota-park / quota-resume / wake suppression / auto-park -------
+
+
+def _parked(env, tid, sid=SID, reset_in=3600):
+    assert db.quota_park(tid, sid, int(time.time()) + reset_in, "rate limit", "manual", path=env.db)
+
+
+def test_quota_park_command_parks_live_task(env, capsys):
+    """GWT-216-cli-1: bridge quota-park stores the park with an
+    explicit reset; the lifecycle status stays running."""
+    _managed(env)
+    tid = _task(env)
+    _claim_acp(env, tid)
+    reset_iso = "2999-01-01T00:00:00Z"
+    rc, out = _run(
+        [
+            "quota-park",
+            SID,
+            "--task",
+            str(tid),
+            "--reset-at",
+            reset_iso,
+            "--note",
+            "claude rate limit",
+            "--model",
+            "opus",
+            "--json",
+        ],
+        capsys,
+    )
+    assert rc == ExitCode.OK
+    assert out["status"] == "waiting_quota"
+    row = db.get_task(tid, path=env.db)
+    assert row["status"] == "running"
+    assert row["step_state"] == "waiting_quota"
+    assert row["quota_source"] == "manual"
+    assert row["quota_model"] == "opus"
+
+
+def test_quota_park_refusals(env, capsys):
+    """GWT-216-cli-2: wrong session, missing task, bad reset string
+    all refuse cleanly."""
+    _managed(env)
+    tid = _task(env)
+    _claim_acp(env, tid)
+    rc, _out = _run(
+        [
+            "quota-park",
+            "other",
+            "--task",
+            str(tid),
+            "--reset-at",
+            "2999-01-01T00:00:00Z",
+            "--json",
+        ],
+        capsys,
+    )
+    assert rc == ExitCode.NOT_FOUND
+    rc, _out = _run(
+        ["quota-park", SID, "--task", str(tid), "--reset-at", "banana", "--json"],
+        capsys,
+    )
+    assert rc == ExitCode.USAGE
+
+
+def test_quota_resume_command_releases_park(env, capsys):
+    """GWT-216-cli-3: bridge quota-resume clears the park early."""
+    _managed(env)
+    tid = _task(env)
+    _claim_acp(env, tid)
+    _parked(env, tid)
+    rc, _out = _run(["quota-resume", SID, "--task", str(tid), "--json"], capsys)
+    assert rc == ExitCode.OK
+    row = db.get_task(tid, path=env.db)
+    assert row["step_state"] is None
+    # a second resume refuses - nothing parked any more
+    rc, _out = _run(["quota-resume", SID, "--task", str(tid), "--json"], capsys)
+    assert rc == ExitCode.CONFLICT
+
+
+def test_wake_suppressed_before_quota_reset(env, monkeypatch, capsys):
+    """GWT-216-cli-4: bridge wake on a parked session answers
+    'suppressed: waiting_quota until <reset>' and never attaches."""
+    _managed(env)
+    tid = _task(env)
+    _claim_acp(env, tid)
+    _parked(env, tid)
+    calls = _stub_wake(env, monkeypatch)
+    rc, out = _run(["wake", SID, "--json"], capsys)
+    assert rc == ExitCode.OK
+    assert out["status"] == "suppressed"
+    assert calls == []
+    # after the window closes the suppression lifts
+    _parked(env, tid, reset_in=-10)
+    rc, out = _run(["wake", SID, "--json"], capsys)
+    assert calls == [SID]
+
+
+def test_event_quota_text_autoparks(env, capsys):
+    """GWT-216-cli-5: an event carrying rate-limit text + reset parks
+    the reporter's live task - the self-report channel."""
+    _managed(env)
+    tid = _task(env)
+    _claim_acp(env, tid)
+    rc, out = _run(
+        [
+            "event",
+            SID,
+            "worker_note",
+            "model rate limit reached, reset at 23:59 UTC",
+            "--json",
+        ],
+        capsys,
+    )
+    assert rc == ExitCode.OK
+    assert out["data"]["quota"]["parked"] is True
+    row = db.get_task(tid, path=env.db)
+    assert row["step_state"] == "waiting_quota"
+    assert row["quota_source"] == "self-report"
+
+
+def test_notice_quota_text_autoparks(env, capsys):
+    """GWT-216-cli-6: same self-report contract on the notice channel."""
+    _managed(env)
+    tid = _task(env)
+    _claim_acp(env, tid)
+    rc, out = _run(
+        ["notice", SID, "rate limit on the pool, retry after 1800s", "--json"],
+        capsys,
+    )
+    assert rc == ExitCode.OK
+    assert out["data"]["quota"]["parked"] is True
+    row = db.get_task(tid, path=env.db)
+    assert row["step_state"] == "waiting_quota"
+    assert row["quota_reset_at"] > int(time.time()) + 1700
+
+
+def test_non_quota_text_never_autoparks(env, capsys):
+    """GWT-216-cli-7: rpc_error/busy/timeout text is never a park."""
+    _managed(env)
+    tid = _task(env)
+    _claim_acp(env, tid)
+    for text in (
+        "rpc_error: host closed the channel",
+        "session busy mid-turn",
+        "timeout on prompt ack",
+        "lease expired",
+    ):
+        rc, out = _run(["event", SID, "worker_note", text, "--json"], capsys)
+        assert rc == ExitCode.OK
+        assert "quota" not in out["data"]
+    assert db.get_task(tid, path=env.db)["step_state"] is None
+
+
+def test_inspect_and_status_show_quota_fields(env, capsys):
+    """GWT-216-cli-8: inspect exposes step_state + reset; the status
+    fleet table marks the session quota."""
+    _managed(env)
+    tid = _task(env)
+    _claim_acp(env, tid)
+    _parked(env, tid)
+    rc, out = _run(["inspect", str(tid), "--json"], capsys)
+    assert rc == ExitCode.OK
+    assert out["data"]["step_state"] == "waiting_quota"
+    assert out["data"]["quota_reset_at"] is not None
+    rc, snap = _run_status_json(env.db)
+    row = next(r for r in snap["data"]["fleet"] if r["session_id"] == SID)
+    assert row["step_state"] == "waiting_quota"
+    assert row["quota_reset_at"] is not None
+    assert row["state"] == "quota"

@@ -2503,3 +2503,181 @@ def test_item210_gwt15_kill_detaches_live_state(db_path):
     assert isinstance(db.kill_session("w4", path=db_path), Killed)
     assert isinstance(db.kill_session("w4", path=db_path), Killed)
     assert len(db.list_events(session_id="w4", kind="session_killed", path=db_path)) == 1
+
+
+# --- task #216: waiting_quota step state ------------------------------------
+
+
+def _park(path, tid, sid, reset_in=3600, **kw):
+    assert db.quota_park(
+        tid,
+        sid,
+        int(time.time()) + reset_in,
+        kw.pop("note", "rate limit hit"),
+        kw.pop("source", "manual"),
+        path=path,
+        **kw,
+    )
+
+
+def test_quota_park_keeps_live_status_and_metadata(db_path):
+    """GWT-216-1: parking a live task stores step_state orthogonally -
+    the lifecycle status and the claimant's lease stay as they were."""
+    db.register("s1", "/repo/s1", path=db_path)
+    tid = _enqueue_running(db_path, "s1", "w1")
+    _park(db_path, tid, "s1", model="claude-opus", checkpoint="step 3/5")
+    row = db.get_task(tid, path=db_path)
+    assert row["status"] == TaskStatus.RUNNING.value
+    assert row["step_state"] == "waiting_quota"
+    assert row["lease_owner"] == "w1"
+    assert row["quota_source"] == "manual"
+    assert row["quota_model"] == "claude-opus"
+    assert row["quota_checkpoint"] == "step 3/5"
+    assert row["quota_reset_at"] > int(time.time())
+    # parking a non-live task refuses - the CAS carries the live guard
+    tid_done = db.enqueue("s2", "t", path=db_path)
+    _exec(db_path, "UPDATE tasks SET status='done' WHERE id=?", (tid_done,))
+    assert not db.quota_park(tid_done, "s2", 1, "n", "manual", path=db_path)
+
+
+def test_quota_parked_task_survives_lease_expiry(db_path):
+    """GWT-216-2: the park, not the claimant, owns the wait - an expired
+    lease on a waiting_quota row is not folded by recover_stale."""
+    db.register("s1", "/repo/s1", path=db_path)
+    tid = _enqueue_running(db_path, "s1", "w1")
+    _park(db_path, tid, "s1")
+    _expire(db_path, tid)
+    assert db.recover_stale(path=db_path) == []
+    row = db.get_task(tid, path=db_path)
+    assert row["status"] == TaskStatus.RUNNING.value
+    assert row["step_state"] == "waiting_quota"
+    assert row["attempt"] == 0
+
+
+def test_quota_parked_task_resists_second_claimant(db_path):
+    """GWT-216-3: a parked task keeps its owner lease - no second
+    claimant can be issued one, and a dead-worker fold skips it."""
+    db.register("s1", "/repo/s1", path=db_path)
+    tid = _enqueue_running(db_path, "s1", "w1")
+    _park(db_path, tid, "s1")
+    _expire(db_path, tid)
+    # direct claim paths refuse: the task is not queued/dispatch_decided
+    assert not db.claim_queued(tid, "w2", "acp-push", path=db_path)
+    # dead-worker fold treats it as not-live for reclaim purposes
+    assert db.requeue_dead_worker(tid, "owner died", path=db_path) is None
+    row = db.get_task(tid, path=db_path)
+    assert row["status"] == TaskStatus.RUNNING.value
+    assert row["lease_owner"] == "w1"
+    assert row["step_state"] == "waiting_quota"
+
+
+def test_unpark_quota_expired_releases_and_rearms(db_path):
+    """GWT-216-4: the sweep clears only closed windows and re-arms the
+    lease for a full window - the claimant resumes the step."""
+    db.register("s1", "/repo/s1", path=db_path)
+    tid = _enqueue_running(db_path, "s1", "w1")
+    _park(db_path, tid, "s1", reset_in=3600)
+    now = int(time.time())
+    # future reset: nothing to sweep
+    assert db.unpark_quota_expired(now, path=db_path) == []
+    # close the window
+    _exec(db_path, "UPDATE tasks SET quota_reset_at=? WHERE id=?", (now - 1, tid))
+    _expire(db_path, tid)
+    rows = db.unpark_quota_expired(now, path=db_path)
+    assert [r["id"] for r in rows] == [tid]
+    row = db.get_task(tid, path=db_path)
+    assert row["step_state"] is None
+    assert row["quota_reset_at"] is None
+    assert row["quota_note"] is None
+    assert row["status"] == TaskStatus.RUNNING.value
+    assert row["lease_expires_at"] >= now + LEASE_SECONDS - 5
+
+
+def test_quota_repark_extends_reset(db_path):
+    """GWT-216-5: a second quota error on the same task overwrites the
+    window - repeated failures extend the park, not the attempt count."""
+    db.register("s1", "/repo/s1", path=db_path)
+    tid = _enqueue_running(db_path, "s1", "w1")
+    now = int(time.time())
+    _park(db_path, tid, "s1", reset_in=600)
+    _park(db_path, tid, "s1", reset_in=7200, note="still limited")
+    row = db.get_task(tid, path=db_path)
+    assert row["step_state"] == "waiting_quota"
+    assert row["quota_reset_at"] >= now + 7100
+    assert row["quota_note"] == "still limited"
+    assert row["attempt"] == 0
+
+
+def test_quota_unpark_skips_halted(db_path):
+    """GWT-216-6: HALT is senior to a quota reset - a halted session's
+    park is not swept until resume."""
+    db.register("s1", "/repo/s1", path=db_path)
+    tid = _enqueue_running(db_path, "s1", "w1")
+    now = int(time.time())
+    _park(db_path, tid, "s1", reset_in=-10)
+    db.set_session_halted("s1", True, path=db_path)
+    assert db.unpark_quota_expired(now, path=db_path) == []
+    assert db.get_task(tid, path=db_path)["step_state"] == "waiting_quota"
+    # lifting the halt makes the expired park sweepable again
+    db.set_session_halted("s1", False, path=db_path)
+    assert [r["id"] for r in db.unpark_quota_expired(now, path=db_path)] == [tid]
+
+
+def test_quota_resume_releases_early_and_refuses(db_path):
+    """GWT-216-7: quota-resume releases a park before its reset;
+    refuses on non-parked tasks and under HALT."""
+    db.register("s1", "/repo/s1", path=db_path)
+    tid = _enqueue_running(db_path, "s1", "w1")
+    # not parked -> refuse
+    assert not db.quota_resume(tid, "s1", path=db_path)
+    _park(db_path, tid, "s1")
+    # wrong session -> refuse
+    assert not db.quota_resume(tid, "s2", path=db_path)
+    # halted -> refuse
+    db.set_session_halted("s1", True, path=db_path)
+    assert not db.quota_resume(tid, "s1", path=db_path)
+    db.set_session_halted("s1", False, path=db_path)
+    # happy path
+    assert db.quota_resume(tid, "s1", path=db_path)
+    row = db.get_task(tid, path=db_path)
+    assert row["step_state"] is None
+    assert row["quota_reset_at"] is None
+    assert row["status"] == TaskStatus.RUNNING.value
+    assert row["lease_expires_at"] >= int(time.time()) + LEASE_SECONDS - 5
+
+
+def test_waiting_quota_task_lookup_boundary(db_path):
+    """GWT-216-8: the suppression lookup sees only open windows - an
+    expired-but-unswept park does not suppress (the sweep owns it)."""
+    db.register("s1", "/repo/s1", path=db_path)
+    tid = _enqueue_running(db_path, "s1", "w1")
+    now = int(time.time())
+    assert db.waiting_quota_task("s1", now, path=db_path) is None
+    _park(db_path, tid, "s1", reset_in=600)
+    row = db.waiting_quota_task("s1", now, path=db_path)
+    assert row["id"] == tid
+    assert db.waiting_quota_task("s1", now + 601, path=db_path) is None
+
+
+def test_quota_terminal_writers_clear_step_fields(db_path):
+    """GWT-216-9: terminal/parked lifecycle writers reset the step
+    slot - no quota metadata outlives its transition."""
+    db.register("s1", "/repo/s1", path=db_path)
+    tid = _enqueue_running(db_path, "s1", "w1")
+    _park(db_path, tid, "s1")
+    assert db.finish_task(tid, "w1", True, path=db_path)
+    row = db.get_task(tid, path=db_path)
+    assert row["status"] == TaskStatus.DONE.value
+    assert row["step_state"] is None and row["quota_reset_at"] is None
+    # escalation defer parks the task and marks the step itself
+    db.register("s2", "/repo/s2", path=db_path)
+    tid2 = _enqueue_running(db_path, "s2", "w2")
+    _park(db_path, tid2, "s2")
+    assert db.defer_task(tid2, "human parked it", path=db_path)
+    row2 = db.get_task(tid2, path=db_path)
+    assert row2["status"] == TaskStatus.PAUSED.value
+    assert row2["step_state"] == "paused"
+    assert row2["quota_reset_at"] is None
+    # unpark clears the paused step
+    assert db.unpark(tid2, path=db_path)
+    assert db.get_task(tid2, path=db_path)["step_state"] is None

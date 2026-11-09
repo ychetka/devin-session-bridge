@@ -83,7 +83,14 @@ def _session_views(args) -> tuple[list[dict], list[Event], int]:
 
         notify_task = None
         log_path = stderr_tail = None
-        if live is not None and live["status"] == TaskStatus.RUNNING.value:
+        if (
+            live is not None
+            and live["status"] == TaskStatus.RUNNING.value
+            and live["step_state"] == "waiting_quota"
+        ):
+            state = STATE_PARKED
+            action = f"waiting_quota until {_quota_reset_label(live)}"
+        elif live is not None and live["status"] == TaskStatus.RUNNING.value:
             state, action = STATE_RUNNING, "-"
         elif live is not None and live["status"] == TaskStatus.DISPATCH_DECIDED.value:
             # a claimed task mid-dispatch is visible, not a silent wedge
@@ -206,18 +213,31 @@ def _repo_name(row) -> str:
     return row["title"] or "-"
 
 
+def _quota_reset_label(task) -> str:
+    """Compact UTC reset stamp for a ``waiting_quota`` row, or ``?``."""
+    reset = task["quota_reset_at"]
+    if reset is None:
+        return "?"
+    return time.strftime("%H:%MZ", time.gmtime(reset))
+
+
 def _fleet_state(session_status, task) -> str:
     """The one-word state cell for a fleet row.
 
     Dead sessions show ``dead`` (the compact marker - a dead row stays
     visible so the operator sees which sid to reopen); otherwise the
     row inherits its latest task status unless that task is done - a
-    finished task means the session is simply idle.
+    finished task means the session is simply idle. A task parked in
+    ``waiting_quota`` overrides the lifecycle word: the session is
+    deliberately asleep until the provider's reset, which is neither
+    running nor idle.
     """
     if session_status == SessionStatus.DEAD.value:
         return "dead"
     if task is None or task["status"] in _IDLE_TASK_STATUSES:
         return "idle"
+    if task["step_state"] == "waiting_quota":
+        return "quota"
     return _FLEET_STATE_ALIAS.get(task["status"], task["status"])
 
 
@@ -324,6 +344,8 @@ def _status_snapshot(args) -> dict:
             "task_id": t["id"] if t is not None else None,
             "task_label": (t["task_text"] or t["task_file"] or "") if t is not None else None,
             "task_status": t["status"] if t is not None else None,
+            "step_state": t["step_state"] if t is not None else None,
+            "quota_reset_at": t["quota_reset_at"] if t is not None else None,
             "attempt": t["attempt"] if t is not None else None,
             "questions": qcounts.get(t["id"], 0) if t is not None else None,
             "heartbeat_age_seconds": _age(now, r["seen"]),
@@ -350,6 +372,8 @@ def _status_snapshot(args) -> dict:
             "task_id": t["id"],
             "task_label": t["task_text"] or t["task_file"] or "",
             "task_status": t["status"],
+            "step_state": t["step_state"],
+            "quota_reset_at": t["quota_reset_at"],
             "attempt": t["attempt"],
             "questions": qcounts.get(t["id"], 0),
             "heartbeat_age_seconds": None,
@@ -483,10 +507,17 @@ def _wake_cell(r) -> str:
 
 
 def _task_state_cell(r) -> str:
-    """Compact lifecycle of the latest task for TSTAT (item_23)."""
+    """Compact lifecycle of the latest task for TSTAT (item_23).
+
+    A ``waiting_quota`` park overrides the lifecycle word - "the step
+    is asleep until reset" is the answer the column must give, and the
+    raw status stays one ``inspect`` away.
+    """
     st = r.get("task_status")
     if not st:
         return "-"
+    if r.get("step_state") == "waiting_quota":
+        return "quota"
     return _TASK_STATE_CELL.get(st, _cut(st, 6))
 
 

@@ -372,6 +372,15 @@ _TASK_COLUMN_MIGRATIONS = (
     ("run_after", "INTEGER"),
     ("wait_until", "INTEGER"),
     ("finished_at", "INTEGER"),
+    # task #216 step/quota columns: step_state carries the harness
+    # step vocabulary (NULL = no parked step, the common live case);
+    # quota_* record a rate-limit park's reset window and provenance.
+    ("step_state", "TEXT"),
+    ("quota_reset_at", "INTEGER"),
+    ("quota_note", "TEXT"),
+    ("quota_source", "TEXT"),
+    ("quota_model", "TEXT"),
+    ("quota_checkpoint", "TEXT"),
 )
 
 # Columns the item_139 schema adds to wake_state, applied idempotently
@@ -380,6 +389,15 @@ _TASK_COLUMN_MIGRATIONS = (
 _WAKE_COLUMN_MIGRATIONS = (("mail_escalated_at", "INTEGER"),)
 
 _SESSION_FIELDS = frozenset({"cwd", "title", "queue_paused", "park_cycles_left", "note"})
+
+#: SQL fragments clearing the step/quota slot - appended to lifecycle
+#: writers that leave ``waiting_quota`` semantics behind (terminal
+#: finishes, requeues, retries, manual demotes).
+_QUOTA_CLEAR_SQL = (
+    ", quota_reset_at=NULL, quota_note=NULL, quota_source=NULL,"
+    " quota_model=NULL, quota_checkpoint=NULL"
+)
+_STEP_CLEAR_SQL = ", step_state=NULL" + _QUOTA_CLEAR_SQL
 
 
 def _now() -> int:
@@ -980,7 +998,10 @@ def requeue_or_fail(task_id: int, note: str | None = None, *, path=None):
                 "UPDATE tasks SET status=?, attempt=attempt+1,"
                 " lease_owner=NULL, lease_expires_at=NULL,"
                 " lease_renewed_at=NULL,"
-                " note=COALESCE(?,note), updated_at=?" + guard + " AND attempt+1<?",
+                " note=COALESCE(?,note), updated_at=?"
+                + _STEP_CLEAR_SQL
+                + guard
+                + " AND attempt+1<?",
                 (
                     TaskStatus.QUEUED.value,
                     note,
@@ -996,7 +1017,10 @@ def requeue_or_fail(task_id: int, note: str | None = None, *, path=None):
                 "UPDATE tasks SET status=?, attempt=attempt+1,"
                 " lease_owner=NULL, lease_expires_at=NULL,"
                 " lease_renewed_at=NULL, finished_at=?,"
-                " note=COALESCE(?,note), updated_at=?" + guard + " AND attempt+1>=?",
+                " note=COALESCE(?,note), updated_at=?"
+                + _STEP_CLEAR_SQL
+                + guard
+                + " AND attempt+1>=?",
                 (
                     TaskStatus.FAILED.value,
                     ts,
@@ -1056,9 +1080,13 @@ def recover_stale(*, path=None) -> list[int]:
                     QuestionState.CLAIMED.value,
                 ),
             )
+            # waiting_quota rows keep an expired lease by design - the
+            # park, not the claimant, owns the wait; recovery must not
+            # requeue/fail them (task #216).
             rows = con.execute(
                 "SELECT id FROM tasks WHERE status IN (?, ?)"
-                " AND lease_expires_at IS NOT NULL AND lease_expires_at<?",
+                " AND lease_expires_at IS NOT NULL AND lease_expires_at<?"
+                " AND COALESCE(step_state,'')<>'waiting_quota'",
                 (
                     TaskStatus.RUNNING.value,
                     TaskStatus.DISPATCH_DECIDED.value,
@@ -1090,7 +1118,10 @@ def requeue_dead_worker(task_id: int, note: str | None = None, *, path=None):
     when the task already left the live set.
     """
     ts = _now()
-    guard = f" WHERE id=? AND status IN ({_LIVE_SQL})"
+    # waiting_quota rows survive a dead session too - the park waits on
+    # the provider's reset, not on the worker; folding them to queued
+    # would hand the saved step to a different claimant (task #216).
+    guard = f" WHERE id=? AND status IN ({_LIVE_SQL}) AND COALESCE(step_state,'')<>'waiting_quota'"
 
     def op():
         con = connect(path)
@@ -1099,7 +1130,10 @@ def requeue_dead_worker(task_id: int, note: str | None = None, *, path=None):
                 "UPDATE tasks SET status=?, attempt=attempt+1,"
                 " lease_owner=NULL, lease_expires_at=NULL,"
                 " lease_renewed_at=NULL,"
-                " note=COALESCE(?,note), updated_at=?" + guard + " AND attempt+1<?",
+                " note=COALESCE(?,note), updated_at=?"
+                + _STEP_CLEAR_SQL
+                + guard
+                + " AND attempt+1<?",
                 (
                     TaskStatus.QUEUED.value,
                     note,
@@ -1114,7 +1148,10 @@ def requeue_dead_worker(task_id: int, note: str | None = None, *, path=None):
                 "UPDATE tasks SET status=?, attempt=attempt+1,"
                 " lease_owner=NULL, lease_expires_at=NULL,"
                 " lease_renewed_at=NULL, finished_at=?,"
-                " note=COALESCE(?,note), updated_at=?" + guard + " AND attempt+1>=?",
+                " note=COALESCE(?,note), updated_at=?"
+                + _STEP_CLEAR_SQL
+                + guard
+                + " AND attempt+1>=?",
                 (
                     TaskStatus.FAILED.value,
                     ts,
@@ -1158,7 +1195,8 @@ def finish_task(
                 " last_assistant_message=COALESCE(?,last_assistant_message),"
                 " note=COALESCE(?,note), lease_owner=NULL,"
                 " lease_expires_at=NULL, finished_at=?, updated_at=?"
-                " WHERE id=? AND status=? AND lease_owner=?",
+                + _STEP_CLEAR_SQL
+                + " WHERE id=? AND status=? AND lease_owner=?",
                 (
                     target,
                     last_assistant_message,
@@ -1169,6 +1207,162 @@ def finish_task(
                     TaskStatus.RUNNING.value,
                     owner,
                 ),
+            )
+            return cur.rowcount == 1
+        finally:
+            con.close()
+
+    return _retry(op)
+
+
+# --- waiting_quota (task #216) ----------------------------------------------
+
+
+def quota_park(
+    task_id: int,
+    session_id: str,
+    reset_at: int,
+    note: str | None,
+    source: str,
+    model: str | None = None,
+    checkpoint: str | None = None,
+    *,
+    path=None,
+) -> bool:
+    """CAS ``live > waiting_quota`` step park for a rate-limited task.
+
+    The task keeps its lifecycle status and its lease - the original
+    claimant still owns the step, no second claimant can be issued a
+    lease, and ``recover_stale``/``requeue_dead_worker`` skip the row
+    while ``step_state='waiting_quota'``. ``source`` records
+    provenance (``manual`` / ``self-report``); ``reset_at`` is the
+    provider's quota-reset epoch the daemon's quota pass waits on.
+    """
+    ts = _now()
+
+    def op():
+        con = connect(path)
+        try:
+            cur = con.execute(
+                f"UPDATE tasks SET step_state='waiting_quota',"
+                f" quota_reset_at=?, quota_note=?, quota_source=?,"
+                f" quota_model=?, quota_checkpoint=?, updated_at=?"
+                f" WHERE id=? AND session_id=? AND status IN ({_LIVE_SQL})",
+                (
+                    reset_at,
+                    note,
+                    source,
+                    model,
+                    checkpoint,
+                    ts,
+                    task_id,
+                    session_id,
+                ),
+            )
+            return cur.rowcount == 1
+        finally:
+            con.close()
+
+    return _retry(op)
+
+
+def waiting_quota_task(session_id: str, now: int, *, path=None):
+    """The session's live task currently parked on quota, or None.
+
+    ``quota_reset_at <= now`` rows are excluded: their window has
+    closed and the quota pass is the one clearing them - callers use
+    this for wake suppression, where an expired-but-not-yet-swept row
+    is still suppressible until the pass runs (the ``>=`` boundary is
+    deliberate: an expired row suppresses nothing).
+    """
+
+    def op():
+        con = connect(path)
+        try:
+            return con.execute(
+                f"SELECT * FROM tasks WHERE session_id=?"
+                f" AND status IN ({_LIVE_SQL})"
+                f" AND step_state='waiting_quota'"
+                f" AND quota_reset_at IS NOT NULL AND quota_reset_at>?",
+                (session_id, now),
+            ).fetchone()
+        finally:
+            con.close()
+
+    return _retry(op)
+
+
+def unpark_quota_expired(now: int, *, path=None) -> list:
+    """Sweep expired ``waiting_quota`` parks back to the free step.
+
+    ``step_state`` resets to NULL, the lease is re-armed for a full
+    window (the claimant resumes the step, not a recovery cycle), and
+    the quota fields clear - the audit trail lives in
+    decision_events. Halted sessions are skipped (HALT wins over a
+    quota reset: parked steps wake only after ``bridge resume`` -
+    they qualify again on the next pass once the halt lifts).
+    Returns the un-parked rows so the caller can send the single
+    control probe each episode gets.
+    """
+    ts = now
+
+    def op():
+        con = connect(path)
+        try:
+            con.execute("BEGIN IMMEDIATE")
+            rows = con.execute(
+                f"SELECT t.id, t.session_id FROM tasks t"
+                f" JOIN sessions s ON s.session_id=t.session_id"
+                f" WHERE t.status IN ({_LIVE_SQL})"
+                f" AND t.step_state='waiting_quota'"
+                f" AND t.quota_reset_at IS NOT NULL AND t.quota_reset_at<=?"
+                f" AND s.halted_at IS NULL",
+                (now,),
+            ).fetchall()
+            for r in rows:
+                con.execute(
+                    "UPDATE tasks SET step_state=NULL,"
+                    " quota_reset_at=NULL, quota_note=NULL,"
+                    " quota_source=NULL, quota_model=NULL,"
+                    " quota_checkpoint=NULL, lease_expires_at=?,"
+                    " lease_renewed_at=?, updated_at=? WHERE id=?",
+                    (ts + LEASE_SECONDS, ts, ts, r["id"]),
+                )
+            con.commit()
+            return rows
+        except BaseException:
+            con.rollback()
+            raise
+        finally:
+            con.close()
+
+    return _retry(op)
+
+
+def quota_resume(task_id: int, session_id: str, *, path=None) -> bool:
+    """Manual early release of a ``waiting_quota`` park.
+
+    Same transition the sweep performs but with no time check - the
+    operator's way to resume a step before ``quota_reset_at`` (e.g.
+    the limit cleared early, or the estimate was wrong). Refuses on
+    non-parked tasks and on halted sessions (HALT stays senior).
+    """
+    ts = _now()
+
+    def op():
+        con = connect(path)
+        try:
+            cur = con.execute(
+                "UPDATE tasks SET step_state=NULL,"
+                " quota_reset_at=NULL, quota_note=NULL,"
+                " quota_source=NULL, quota_model=NULL,"
+                " quota_checkpoint=NULL, lease_expires_at=?,"
+                " lease_renewed_at=?, updated_at=?"
+                " WHERE id=? AND session_id=?"
+                " AND step_state='waiting_quota'"
+                " AND (SELECT halted_at FROM sessions"
+                "      WHERE session_id=tasks.session_id) IS NULL",
+                (ts + LEASE_SECONDS, ts, ts, task_id, session_id),
             )
             return cur.rowcount == 1
         finally:
@@ -1193,7 +1387,8 @@ def retry(task_id: int, note: str | None = None, *, path=None) -> bool:
                 " lease_expires_at=NULL, lease_renewed_at=NULL,"
                 " finished_at=NULL,"
                 " note=COALESCE(?,note), updated_at=?"
-                " WHERE id=? AND status=?",
+                + _STEP_CLEAR_SQL
+                + " WHERE id=? AND status=?",
                 (
                     TaskStatus.QUEUED.value,
                     note,
@@ -1395,7 +1590,8 @@ def unpark(task_id: int, note: str | None = None, *, path=None) -> bool:
                 "UPDATE tasks SET status=?, note=COALESCE(?,note),"
                 " lease_owner=NULL, lease_expires_at=NULL,"
                 " lease_renewed_at=NULL, updated_at=?"
-                " WHERE id=? AND status IN (?, ?)",
+                + _STEP_CLEAR_SQL
+                + " WHERE id=? AND status IN (?, ?)",
                 (
                     TaskStatus.QUEUED.value,
                     note,
@@ -1832,8 +2028,7 @@ def kill_session(session_id: str, *, path=None) -> KillVerdict:
             cur = con.execute(
                 "UPDATE tasks SET status=?, lease_owner=NULL,"
                 " lease_expires_at=NULL, lease_renewed_at=NULL,"
-                " updated_at=?"
-                " WHERE session_id=? AND status IN (?,?)",
+                " updated_at=?" + _STEP_CLEAR_SQL + " WHERE session_id=? AND status IN (?,?)",
                 (
                     TaskStatus.QUEUED.value,
                     ts,
@@ -1851,8 +2046,7 @@ def kill_session(session_id: str, *, path=None) -> KillVerdict:
             cur = con.execute(
                 "UPDATE tasks SET status=?, lease_owner=NULL,"
                 " lease_expires_at=NULL, lease_renewed_at=NULL,"
-                " updated_at=?"
-                " WHERE session_id=? AND status=?",
+                " updated_at=?" + _STEP_CLEAR_SQL + " WHERE session_id=? AND status=?",
                 (
                     TaskStatus.QUEUED.value,
                     ts,
@@ -3685,11 +3879,16 @@ def _block_task(task_id: int, target, note: str | None, *, path=None) -> bool:
         con = connect(path)
         try:
             cur = con.execute(
-                f"UPDATE tasks SET status=?, note=COALESCE(?,note),"
-                f" lease_owner=NULL, lease_expires_at=NULL,"
-                f" lease_renewed_at=NULL, finished_at=COALESCE(?,finished_at),"
-                f" updated_at=?"
-                f" WHERE id=? AND status IN ({_LIVE_SQL})",
+                "UPDATE tasks SET status=?, note=COALESCE(?,note),"
+                " lease_owner=NULL, lease_expires_at=NULL,"
+                " lease_renewed_at=NULL, finished_at=COALESCE(?,finished_at),"
+                " updated_at=?"
+                + (
+                    ", step_state='paused'" + _QUOTA_CLEAR_SQL
+                    if _val(target) == TaskStatus.PAUSED.value
+                    else _STEP_CLEAR_SQL
+                )
+                + f" WHERE id=? AND status IN ({_LIVE_SQL})",
                 (
                     _val(target),
                     note,

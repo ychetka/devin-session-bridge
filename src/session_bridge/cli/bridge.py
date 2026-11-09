@@ -93,6 +93,8 @@ from session_bridge.cli.commands.tasks import (
     _cmd_finish,
     _cmd_inspect,
     _cmd_push,
+    _cmd_quota_park,
+    _cmd_quota_resume,
     _cmd_retry,
     _cmd_unpark,
     _cmd_wait,
@@ -372,6 +374,32 @@ def _parse_args(argv) -> argparse.Namespace:
     )
     _add_json(sp)
 
+    # task #216: manual quota park + early release - the operator-side
+    # of the notice/event self-report auto-park
+    sp = sub.add_parser(
+        "quota-park",
+        help="park a live task into waiting_quota until the provider resets",
+    )
+    sp.add_argument("session_id")
+    sp.add_argument("--task", type=int, required=True, help="task id")
+    sp.add_argument(
+        "--reset-at",
+        required=True,
+        help="quota reset time (ISO-8601 or 'HH:MM UTC')",
+    )
+    sp.add_argument("--note", default=None, help="error text that caused the park")
+    sp.add_argument("--model", default=None, help="model/pool that is limited")
+    sp.add_argument("--checkpoint", default=None, help="where to resume the step")
+    _add_json(sp)
+
+    sp = sub.add_parser(
+        "quota-resume",
+        help="release a waiting_quota park before its reset time",
+    )
+    sp.add_argument("session_id")
+    sp.add_argument("--task", type=int, required=True, help="task id")
+    _add_json(sp)
+
     # item_139 amendment: the registered directive-push path - writes a
     # notification row so the daemon relays it to the fs mailbox AND
     # wakes the session (hand-written msg_*.txt files bypass the
@@ -639,6 +667,8 @@ _HANDLERS = {
     "events": _cmd_events,
     "claim": _cmd_claim,
     "finish": _cmd_finish,
+    "quota-park": _cmd_quota_park,
+    "quota-resume": _cmd_quota_resume,
     "heartbeat": _cmd_heartbeat,
     "questions": _cmd_questions,
     "escalate": _cmd_escalate,

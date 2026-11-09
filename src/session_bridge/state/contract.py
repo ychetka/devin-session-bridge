@@ -67,6 +67,26 @@ LIVE_STATUSES: Final[frozenset] = frozenset(
 TERMINAL_STATUSES: Final[frozenset] = frozenset({TaskStatus.DONE, TaskStatus.FAILED})
 
 
+class StepState(str, Enum):
+    """State of the step a live task is parked on (task #216).
+
+    Orthogonal to ``TaskStatus``: a task keeps its lifecycle status
+    (usually ``running``) while its step state records WHY the step
+    cannot advance. ``waiting_quota`` is the machine-managed one -
+    a rate-limited step parked until ``quota_reset_at``; it keeps the
+    lease, burns no attempts and is invisible to stale-lease recovery
+    and wake nudges. ``interrupted``/``saved``/``paused`` are the
+    harness step labels reserved for the same slot. ``NULL`` means
+    "no step parked" (the common live case and every terminal row).
+    """
+
+    RUNNING = "running"
+    INTERRUPTED = "interrupted"
+    WAITING_QUOTA = "waiting_quota"
+    SAVED = "saved"
+    PAUSED = "paused"
+
+
 class Transport(str, Enum):
     """How a task reaches a session."""
 

@@ -4,6 +4,7 @@ push / inspect / clear / unpark / retry / claim / finish / wait.
 """
 
 import time
+from datetime import datetime, timedelta, timezone
 
 from session_bridge.cli.common import (
     _emit,
@@ -189,6 +190,11 @@ def _cmd_inspect(args) -> int:
         "task_id": task["id"],
         "session_id": task["session_id"],
         "status": task["status"],
+        "step_state": task["step_state"],
+        "quota_reset_at": task["quota_reset_at"],
+        "quota_source": task["quota_source"],
+        "quota_model": task["quota_model"],
+        "quota_checkpoint": task["quota_checkpoint"],
         "transport": task["transport"],
         "attempt": task["attempt"],
         "wait_seconds": wait,
@@ -205,10 +211,20 @@ def _cmd_inspect(args) -> int:
         queue_depth=_queue_depth(args),
         data=data,
     )
+    quota_line = ""
+    if task["step_state"] == "waiting_quota":
+        reset = task["quota_reset_at"]
+        reset_iso = (
+            time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(reset)) if reset is not None else "?"
+        )
+        quota_line = (
+            f"  step:      waiting_quota (reset {reset_iso}, src={task['quota_source'] or '-'})\n"
+        )
     human = (
         f"task {task['id']} (session {task['session_id']})\n"
         f"  status:    {task['status']}\n"
-        f"  transport: {task['transport'] or '-'}\n"
+        + quota_line
+        + f"  transport: {task['transport'] or '-'}\n"
         f"  attempt:   {task['attempt']}\n"
         f"  waited:    {wait}s\n"
         f"  task:      {task['task_text'] or task['task_file']}\n"
@@ -562,4 +578,130 @@ def _cmd_wait(args) -> int:
         resp,
         ExitCode.OK,
         f"task {tid}: lease renewed (waiting)",
+    )
+
+
+def _parse_reset_at(raw: str) -> int | None:
+    """ISO-8601 or ``HH:MM UTC`` -> epoch; None when unparseable."""
+    raw = raw.strip()
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return int(dt.timestamp())
+    except ValueError:
+        pass
+    try:
+        clock = raw.removesuffix(" UTC").removesuffix(" utc").removesuffix("Z")
+        hh, mm = (int(p) for p in clock.split(":"))
+        now = datetime.now(timezone.utc)
+        dt = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+        if dt.timestamp() <= now.timestamp():
+            dt += timedelta(days=1)
+        return int(dt.timestamp())
+    except (ValueError, OverflowError):
+        return None
+
+
+def _cmd_quota_park(args) -> int:
+    """``bridge quota-park <sid> --task N --reset-at <iso> --note T``.
+
+    Manual park of a live task into ``waiting_quota`` (task #216).
+    The operator-side counterpart of the notice/event auto-park: the
+    task keeps its lifecycle status and lease - no attempt is spent,
+    ``recover_stale``/``requeue_dead_worker`` skip it, no second
+    claimant can take the lease, and the daemon unparks it once the
+    provider's reset time passes (one control probe follows). HALT
+    stays senior: a halted session's park does not sweep until
+    ``bridge resume``.
+    """
+    sid = args.session_id
+    task = db.get_task(args.task, path=args.db)
+    if task is None or task["session_id"] != sid:
+        resp = JsonResponse(
+            session=sid,
+            status="not_found",
+            error=f"no task {args.task} for {sid}",
+        )
+        return _emit(args, resp, ExitCode.NOT_FOUND, f"not found: task {args.task} for {sid}")
+    reset_at = _parse_reset_at(args.reset_at)
+    if reset_at is None:
+        resp = JsonResponse(
+            session=sid,
+            status="usage",
+            error=f"--reset-at not parseable: {args.reset_at!r} (ISO-8601 or 'HH:MM UTC')",
+        )
+        return _emit(args, resp, ExitCode.USAGE, f"usage: bad --reset-at {args.reset_at}")
+    if not db.quota_park(
+        task["id"],
+        sid,
+        reset_at,
+        args.note,
+        source="manual",
+        model=args.model,
+        checkpoint=args.checkpoint,
+        path=args.db,
+    ):
+        resp = JsonResponse(
+            session=sid,
+            status=task["status"],
+            error=(
+                f"quota-park refused: task {task['id']} is {task['status']}"
+                " - only live tasks can park"
+            ),
+        )
+        return _emit(args, resp, ExitCode.CONFLICT, f"conflict: task {task['id']} not live")
+    reset_iso = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(reset_at))
+    resp = JsonResponse(
+        session=sid,
+        status="waiting_quota",
+        data={
+            "task_id": task["id"],
+            "quota_reset_at": reset_at,
+            "quota_reset_iso": reset_iso,
+        },
+        agent_instruction=(
+            f"task parked until {reset_iso}; resume happens automatically"
+            " via the daemon quota pass or `bridge quota-resume`"
+        ),
+    )
+    return _emit(
+        args,
+        resp,
+        ExitCode.OK,
+        f"task {task['id']}: waiting_quota until {reset_iso}",
+    )
+
+
+def _cmd_quota_resume(args) -> int:
+    """``bridge quota-resume <sid> --task N``: release a quota park early.
+
+    The operator's override for a reset estimate that turned out
+    pessimistic (or a pool that freed early). Same transition as the
+    daemon sweep: ``step_state`` clears, the lease re-arms for a full
+    window, and the claimant resumes the blocked step - never the
+    already-saved work. Refuses on non-parked tasks and on halted
+    sessions (HALT stays senior to a quota reset).
+    """
+    sid = args.session_id
+    if not db.quota_resume(args.task, sid, path=args.db):
+        task = db.get_task(args.task, path=args.db)
+        detail = (
+            f"task {args.task} is not waiting_quota"
+            if task is not None and task["step_state"] != "waiting_quota"
+            else f"no parked task {args.task} for {sid} (or session halted)"
+        )
+        resp = JsonResponse(session=sid, status="conflict", error=detail)
+        return _emit(args, resp, ExitCode.CONFLICT, f"conflict: {detail}")
+    resp = JsonResponse(
+        session=sid,
+        status="ok",
+        data={"task_id": args.task},
+        agent_instruction="park released; resume the blocked step, saved work stands",
+    )
+    return _emit(
+        args,
+        resp,
+        ExitCode.OK,
+        f"task {args.task}: quota park released - resume the step",
     )

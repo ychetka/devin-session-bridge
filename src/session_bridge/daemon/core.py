@@ -650,11 +650,21 @@ def _wake_candidates(db_path, now: int, queue_dir=None, pending=None):
         result = []
         if pending:
             marks = ",".join("?" * len(pending))
+            # waiting_quota suppression (task #216): a parked session's
+            # mail keeps until the provider's reset - a nudge before
+            # then would spend the very quota that is exhausted. The
+            # quota pass probes once at reset; the mail drains then.
+            # Expired-but-unswept rows do not suppress (quota_reset_at
+            # > now only) - the pass owns their single probe.
             rows = con.execute(
                 "SELECT session_id AS sid, cwd AS cwd FROM sessions"
                 f" WHERE session_id IN ({marks})"
-                " AND mode=? AND status='active'",
-                (*pending, SessionMode.MANAGED.value),
+                " AND mode=? AND status='active'"
+                " AND NOT EXISTS (SELECT 1 FROM tasks t"
+                "                 WHERE t.session_id=sessions.session_id"
+                "                   AND t.step_state='waiting_quota'"
+                "                   AND t.quota_reset_at>?)",
+                (*pending, SessionMode.MANAGED.value, now),
             ).fetchall()
             result = [{"sid": r["sid"], "cwd": r["cwd"], "probe_only": False} for r in rows]
         # liveness probe rows (item_162): stale-heartbeat sessions with
@@ -680,6 +690,7 @@ def _wake_candidates(db_path, now: int, queue_dir=None, pending=None):
             " AND (wh.last_seen_at IS NULL OR wh.last_seen_at<=?)"
             " AND EXISTS (SELECT 1 FROM tasks t"
             "             WHERE t.session_id=s.session_id"
+            "               AND COALESCE(t.step_state,'')<>'waiting_quota'"
             "               AND (t.status IN ('queued','dispatch_decided')"
             "                    OR (t.status='running'"
             "                        AND (t.wait_until IS NULL"
@@ -1048,6 +1059,7 @@ def _lease_renew_pass(db_path, state_directory, now: int) -> None:
             " FROM tasks t JOIN sessions s ON s.session_id=t.session_id"
             " WHERE t.status IN (?,?)"
             " AND s.mode=? AND s.status=?"
+            " AND COALESCE(t.step_state,'')<>'waiting_quota'"
             " AND t.lease_expires_at IS NOT NULL AND t.lease_expires_at<=?"
             " AND t.lease_renewed_at IS NOT NULL"
             " AND t.lease_renewed_at+?>=?",
@@ -1085,6 +1097,67 @@ def _lease_renew_pass(db_path, state_directory, now: int) -> None:
                 r["session_id"],
                 f"task={r['id']}",
             )
+
+
+def _quota_pass(db_path, state_directory, now: int, policy: WakePolicy) -> None:
+    """Lift expired ``waiting_quota`` parks and fire the control probe.
+
+    ``db.unpark_quota_expired`` clears the step state and re-arms the
+    lease for every park whose ``quota_reset_at`` has passed (halted
+    sessions stay parked - HALT is senior to a quota reset). Each
+    released task then gets exactly one nudge - the control probe that
+    tells the claimant to resume the blocked step. A provider that is
+    still limited answers with another rate-limit error; the worker's
+    self-report parks the task again with the new reset, so repeated
+    failures extend the park instead of burning attempts or spamming
+    wakes. The ordinary wake cooldown applies so a reset storm cannot
+    burst probes past the pacing policy.
+    """
+    rows = db.unpark_quota_expired(now, path=db_path)
+    if not rows:
+        return
+    lock_data = find_lockfile()
+    for r in rows:
+        sid = r["session_id"]
+        _decision(state_directory, "quota_unparked", sid, f"task={r['id']}")
+        db.record_event(
+            sid,
+            "quota_unparked",
+            f"task={r['id']} reset reached - control probe",
+            task_id=r["id"],
+            path=db_path,
+        )
+        if lock_data is None:
+            continue
+        host_key = lock_data["_path"]
+        if policy.check(sid, host_key) is not None:
+            # cooldown/breaker pacing may absorb the probe - it is
+            # already spent by the sweep, so no retry queue exists;
+            # the session resumes on its next organic wake
+            _decision(state_directory, "quota_probe_paced", sid, f"task={r['id']}")
+            continue
+        policy.record_attempt(sid)
+        try:
+            outcome = wake_session(
+                sid,
+                None,
+                lock_data=lock_data,
+                nudge=(
+                    f"quota reset reached - resume task {r['id']} "
+                    "(the step was parked as waiting_quota; saved work stands)"
+                ),
+            )
+        except WakeError as e:
+            policy.record_result(host_key, e.reason in _SESSION_LEVEL_REASONS)
+            _decision(
+                state_directory,
+                "quota_probe_failed",
+                sid,
+                f"task={r['id']} reason={e.reason}",
+            )
+            continue
+        policy.record_result(host_key, True)
+        _decision(state_directory, "quota_probe_sent", sid, f"task={r['id']} outcome={outcome}")
 
 
 def _recovery_pass(db_path, state_directory, notify_send) -> None:
@@ -1618,6 +1691,11 @@ def run(
                     pending,
                 )
                 _timed("lease_renew", _lease_renew_pass, db_path, state_directory, now)
+                # quota sweep (task #216): expired parks release here
+                # and get their single control probe; still-open
+                # windows suppress the wake leg by reset_at > now, so
+                # the pass order vs wake is not load-bearing
+                _timed("quota", _quota_pass, db_path, state_directory, now, wake_policy)
                 # recovery runs AFTER lease_renew: verifiably-busy
                 # tasks renew first, only genuinely lapsed leases
                 # fold into recover_stale here (task #207 item b)
