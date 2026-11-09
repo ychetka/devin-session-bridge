@@ -8,8 +8,9 @@ with a new ADR, never edit history).
 
 - `.changes` entry `type: feat` - a new capability or contract
 - `.changes` entry `breaking: true` - anything a consumer must adapt to
-- A refactor spanning two or more modules (`cli/`, `daemon/`, `state/`,
-  `acp/`, `mailbox/`, `wake/`, `ingress/`)
+- A refactor spanning two or more modules - the `scope` vocabulary
+  in `.changes/README.md` (`cli`, `daemon`, `state`, `acp`,
+  `mailbox`, `wake`, `ingress`, `tooling`, `docs`, `deploy`)
 
 Everything else (`fix`, `docs`, `chore`, single-module work) is covered
 by the `.changes` file itself - that file IS the micro-ADR, so its

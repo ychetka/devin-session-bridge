@@ -32,7 +32,9 @@ def _scratch(tmp_path):
     (tmp_path / ".changes").mkdir()
     shutil.copy(SCRIPT, tmp_path / "tools" / "release_notes.sh")
     os.chmod(tmp_path / "tools" / "release_notes.sh", 0o755)
-    (tmp_path / "CHANGELOG.md").write_text("# Changelog\n")
+    (tmp_path / "CHANGELOG.md").write_text(
+        "# Changelog\n\nPreamble line.\n\n## [0.5.0] - 2026-11-01\n\nprior\n"
+    )
     for cmd in (
         ["git", "init", "-q"],
         ["git", "config", "user.email", "t@t"],
@@ -97,8 +99,9 @@ def test_gwt1_groups_sections_by_type_and_scope(tmp_path):
 
 def test_gwt2_apply_folds_into_changelog_and_cleans(tmp_path):
     """Given pending entries, When --apply runs, Then the generated
-    section lands under the CHANGELOG title and consumed entry files
-    are deleted while _template/README survive."""
+    section lands above the first release section (title and
+    preamble stay on top) and consumed entry files are deleted while
+    _template/README survive."""
     repo = _scratch(tmp_path)
     _entry(repo, "0001-a.md")
     (repo / ".changes" / "_template.md").write_text("tpl")
@@ -109,7 +112,13 @@ def test_gwt2_apply_folds_into_changelog_and_cleans(tmp_path):
     assert res.returncode == 0, res.stderr
     log = (repo / "CHANGELOG.md").read_text()
     assert "## [0.5.1]" in log and "dev summary" in log
-    assert log.index("# Changelog") < log.index("## [0.5.1]")
+    # order: title < preamble < new section < prior release
+    assert (
+        log.index("# Changelog")
+        < log.index("Preamble line.")
+        < log.index("## [0.5.1]")
+        < log.index("## [0.5.0]")
+    )
     left = sorted(p.name for p in (repo / ".changes").iterdir())
     assert left == ["README.md", "_template.md"]
 
@@ -148,3 +157,71 @@ def test_gwt5_apply_requires_version(tmp_path):
 
     assert res.returncode == 2
     assert "--apply requires --version" in res.stderr
+
+
+def test_gwt6_folded_continuation_lines(tmp_path):
+    """Given a field whose value wraps onto indented continuation
+    lines (the dogfood entry itself uses this), When the script
+    runs, Then the folded parts join the value, not become keys."""
+    repo = _scratch(tmp_path)
+    (repo / ".changes" / "0001-a.md").write_text(
+        "---\n"
+        "type: fix\n"
+        "scope: cli\n"
+        "user_visible: false\n"
+        "breaking: false\n"
+        'user_summary: "-"\n'
+        "dev_summary: first part\n"
+        "  second part\n"
+        "why: motive\n"
+        "refs: issue #9\n"
+        "---\n"
+    )
+
+    res = _run(repo)
+
+    assert res.returncode == 0, res.stderr
+    assert "first part second part" in res.stdout
+
+
+def test_gwt7_mid_value_fence_does_not_truncate(tmp_path):
+    """Given a value containing '---' mid-line, When the script
+    parses it, Then only a whole-line fence terminates frontmatter -
+    the value is not silently truncated."""
+    repo = _scratch(tmp_path)
+    (repo / ".changes" / "0001-a.md").write_text(
+        "---\n"
+        "type: fix\n"
+        "scope: cli\n"
+        "user_visible: false\n"
+        "breaking: false\n"
+        'user_summary: "-"\n'
+        "dev_summary: keeps tail\n"
+        "why: refs issue #5 --- see ADR-0001\n"
+        "refs: task #7\n"
+        "---\n"
+    )
+
+    res = _run(repo)
+
+    assert res.returncode == 0, res.stderr
+    assert "see ADR-0001" in res.stdout
+
+
+def test_gwt8_validation_branches(tmp_path):
+    """Given entries violating each field rule, When the script
+    runs, Then each fails loud: bad type, bad bool, missing
+    user_summary on a visible entry."""
+    repo = _scratch(tmp_path)
+    _entry(repo, "0001-badtype.md", type="banana")
+    assert _run(repo).returncode != 0 and "bad type" in _run(repo).stderr
+    (repo / ".changes" / "0001-badtype.md").unlink()
+
+    _entry(repo, "0002-badbool.md", visible="maybe")
+    res = _run(repo)
+    assert res.returncode != 0 and "true|false" in res.stderr
+    (repo / ".changes" / "0002-badbool.md").unlink()
+
+    _entry(repo, "0003-nosummary.md", visible="true", user="-")
+    res = _run(repo)
+    assert res.returncode != 0 and "user_summary" in res.stderr

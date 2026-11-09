@@ -30,6 +30,9 @@ while [ $# -gt 0 ]; do
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
 done
+if [ -n "$VERSION" ] && ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+  echo "--version must be X.Y.Z, got '$VERSION'" >&2; exit 2
+fi
 if [ "$APPLY" = 1 ] && [ -z "$VERSION" ]; then
   echo "--apply requires --version" >&2; exit 2
 fi
@@ -46,12 +49,18 @@ FIELDS = ("type", "scope", "user_visible", "breaking",
 TYPES = ("feat", "fix", "refactor", "docs", "chore")
 
 def parse(path):
-    text = open(path, encoding="utf-8").read()
-    m = re.match(r"^---\s*\n(.*?)\n?---\s*\n?", text, re.S)
-    if not m:
-        raise SystemExit(f"{path}: missing --- frontmatter")
+    name = os.path.basename(path)
+    lines = open(path, encoding="utf-8").read().splitlines()
+    if not lines or lines[0].strip() != "---":
+        raise SystemExit(f"{name}: missing --- frontmatter")
+    end = next(
+        (i for i, l in enumerate(lines[1:], 1) if l.strip() == "---"),
+        None,
+    )
+    if end is None:
+        raise SystemExit(f"{name}: unterminated --- frontmatter")
     fm, last = {}, None
-    for line in m.group(1).splitlines():
+    for line in lines[1:end]:
         s = line.strip()
         if s.startswith("#") or not s:
             continue
@@ -63,15 +72,14 @@ def parse(path):
             fm[last] = (fm[last] + " " + s).strip()
     missing = [f for f in FIELDS if f not in fm]
     if missing:
-        raise SystemExit(f"{path}: missing fields: {', '.join(missing)}")
+        raise SystemExit(f"{name}: missing fields: {', '.join(missing)}")
     if fm["type"] not in TYPES:
-        raise SystemExit(f"{path}: bad type {fm['type']!r}")
+        raise SystemExit(f"{name}: bad type {fm['type']!r}")
     for b in ("user_visible", "breaking"):
         if fm[b] not in ("true", "false"):
-            raise SystemExit(f"{path}: {b} must be true|false")
+            raise SystemExit(f"{name}: {b} must be true|false")
     if fm["user_visible"] == "true" and fm["user_summary"] in ("", "-"):
-        raise SystemExit(f"{path}: user_visible entry needs user_summary")
-    fm["_file"] = os.path.basename(path)
+        raise SystemExit(f"{name}: user_visible entry needs user_summary")
     return fm
 
 files = sorted(
@@ -128,17 +136,25 @@ if [ "$APPLY" = 0 ]; then
   exit 0
 fi
 
-# --apply: fold into CHANGELOG.md after the title, drop consumed files
+# --apply: fold into CHANGELOG.md above the first release section
+# (the title and any preamble stay on top), then drop consumed files.
+# The rewrite goes through a temp file + os.replace so a crash cannot
+# leave a truncated CHANGELOG.
 [ -f "$CHANGELOG" ] || { printf '# Changelog\n' > "$CHANGELOG"; }
 GENERATED="$GENERATED" python3 - "$CHANGELOG" <<'PYEOF'
-import os, sys, re
+import os, sys, re, tempfile
 path = sys.argv[1]
 text = open(path, encoding="utf-8").read()
-new = os.environ["GENERATED"]
-m = re.match(r"^(# [^\n]+\n)(.*)$", text, re.S)
-if not m:
-    raise SystemExit(f"{path}: no '# ' title line")
-open(path, "w", encoding="utf-8").write(m.group(1) + "\n" + new.rstrip() + "\n" + m.group(2))
+new = os.environ["GENERATED"].rstrip() + "\n"
+m = re.search(r"(?m)^## ", text)
+if m:
+    out = text[: m.start()] + new + "\n" + text[m.start():]
+else:
+    out = text.rstrip() + "\n\n" + new
+fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), suffix=".tmp")
+with os.fdopen(fd, "w", encoding="utf-8") as f:
+    f.write(out)
+os.replace(tmp, path)
 PYEOF
 
 for f in "$CHANGES"/*.md; do

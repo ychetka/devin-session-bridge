@@ -94,4 +94,4 @@ else
   gh release create "$TAG" --generate-notes >/dev/null 2>&1
 fi \
   && echo "{\"status\":\"released\",\"tag\":\"$TAG\",\"from\":\"$LATEST\",\"sha\":\"$SHA\"}" \
-  || echo '{"status":"error","failure_class":"upstream_error","message":"release create failed"}'
+  || { echo '{"status":"error","failure_class":"upstream_error","message":"release create failed"}'; exit 1; }
