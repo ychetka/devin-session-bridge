@@ -1,4 +1,4 @@
-"""Task-domain commands (task #210 split).
+"""Task domain commands (task #210 split).
 
 push / inspect / clear / unpark / retry / claim / finish / wait.
 """

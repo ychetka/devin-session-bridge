@@ -422,7 +422,7 @@ human-override items (task #198, v0.3.14):
   ceiling while it reports busy). The delivered `bridge kill
   <sid>` (v0.5.0) is session-scoped - it detaches the whole
   session and demotes its task to `dispatch_decided` for
-  re-dispatch. A task-scoped `bridge kill <task_id>` - CAS
+  re-dispatch. A task scoped `bridge kill <task_id>` - CAS
   `running|dispatch_decided > failed` ignoring lease_owner, with
   the same `requeue_dead_worker` dirty-tree note - would still
   close the "stop THIS task now" piece. Small, deferred as a
