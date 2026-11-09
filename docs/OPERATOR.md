@@ -1075,7 +1075,7 @@ the target workspace as `.devin/orchestrator/PLAYBOOK.md`).
 | `SESSIONS_BRIDGE_CYCLES_MAX` | 5 | park budget for installed hooks. |
 | `SB_STALL_THRESHOLD_S` | 1800 | undrained-mail age before the daemon escalates to the orchestrator. |
 | `SB_STALL_REALERT_S` | 3600 | cadence for re-alerting a still-stalled session inside the same episode. |
-| `SB_LEASE_TTL_S` | 3600 | claim-lease TTL applied at every lease write (v0.8.0); the auto-renew ceiling and worker-log retention scale with it. |
+| `SB_LEASE_TTL_S` | 3600 | claim-lease TTL applied at every lease write (v0.8.0); floored at 300s, malformed values degrade to the default; the auto-renew ceiling and worker-log retention scale with it. |
 | `SESSIONS_BRIDGE_MAIL_STALL_SECONDS` | 1800 | legacy alias of `SB_STALL_THRESHOLD_S`; the canonical name wins when both are set. |
 | `SESSIONS_BRIDGE_GHOST_TTL` | 86400 | seconds after `sessions.updated_at` before a no-heartbeat-row unmanaged registration (ghost) is swept dead. |
 | `SESSIONS_BRIDGE_BUSY_GRACE_SECONDS` | 7200 (4x stall) | ceiling on mid-turn busy grace - a still-busy session escalates past it; clamped at the stall threshold. |

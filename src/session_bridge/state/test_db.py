@@ -2688,16 +2688,24 @@ def test_lease_ttl_env_override(tmp_path):
     import; a malformed value falls back to the contract default
     instead of crashing the CLI import path."""
     code = "from session_bridge.state import db; print(db.LEASE_SECONDS)"
+    src = os.path.join(os.path.dirname(__file__), "..", "..")
     env = {
         **os.environ,
-        "PYTHONPATH": "src",
+        "PYTHONPATH": os.path.abspath(src),
         "SB_LEASE_TTL_S": "7200",
     }
     out = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True)
+    assert out.returncode == 0
     assert out.stdout.strip() == "7200"
     env["SB_LEASE_TTL_S"] = "banana"
     out = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True)
+    assert out.returncode == 0
     assert out.stdout.strip() == "3600"
+    # below the 300s floor the resolved value clamps, never self-defeats
+    env["SB_LEASE_TTL_S"] = "36"
+    out = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True)
+    assert out.returncode == 0
+    assert out.stdout.strip() == "300"
 
 
 def test_lease_ttl_default_is_one_hour():

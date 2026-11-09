@@ -362,7 +362,7 @@ From `src/session_bridge/state/contract.py` and `state/db.py`:
 | `HEARTBEAT_INTERVAL_SECONDS` | 60 | expected heartbeat cadence |
 | `HEARTBEAT_STALE_SECONDS` | 120 | silence past this marks the session dead |
 | `MAX_ATTEMPTS` | 2 | one auto-requeue, then terminal failed |
-| `LEASE_SECONDS` | 1800 | acp-push task lease |
+| `LEASE_SECONDS` | 3600 (env `SB_LEASE_TTL_S`, floor 300) | acp-push task lease |
 
 Task statuses: `queued`, `dispatch_decided`, `running`,
 `awaiting_user` (live set), `paused` (manual/human park), `done`,

@@ -106,7 +106,11 @@ def _env_int(name: str, default: int) -> int:
 #: unless ``SB_LEASE_TTL_S`` overrides it. Resolved once at import;
 #: every lease writer and downstream consumer (daemon auto-renew
 #: limit, dispatch renew interval, worker-log age) reads this value.
-LEASE_SECONDS: Final[int] = _env_int("SB_LEASE_TTL_S", contract.LEASE_SECONDS)
+#: Floored at 300s: a lease shorter than the default renew margin
+#: sits inside the renewal window permanently (and below 60s the
+#: renew cadence outruns the lease itself) - a floor at resolution
+#: is the only clamp possible for a base constant.
+LEASE_SECONDS: Final[int] = max(300, _env_int("SB_LEASE_TTL_S", contract.LEASE_SECONDS))
 
 
 def _default_db_path() -> str:
