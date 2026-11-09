@@ -6,6 +6,7 @@ heartbeat / wake.
 
 import os
 import shutil
+import time
 
 from session_bridge.cli.commands import ops as _ops
 from session_bridge.cli.common import (
@@ -668,8 +669,32 @@ def _cmd_wake(args) -> int:
     into the session - the same path the daemon's ``_wake_pass`` uses.
     Bypasses the daemon cooldown but keeps the busy check: a session
     mid-turn is never prompted. ``--prompt`` overrides the nudge text.
+
+    ``waiting_quota`` suppression (task #216): a session whose live
+    task is parked on a provider rate limit is refused before the
+    attach - poking it would spend the very quota that is exhausted.
+    The daemon's quota pass lifts the park at ``quota_reset_at`` and
+    fires the single control probe; ``bridge quota-resume`` overrides.
     """
     sid = args.session_id
+    parked = db.waiting_quota_task(sid, int(time.time()), path=args.db)
+    if parked is not None:
+        reset = parked["quota_reset_at"]
+        reset_iso = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(reset))
+        resp = JsonResponse(
+            session=sid,
+            status="suppressed",
+            data={"task_id": parked["id"], "quota_reset_at": reset},
+            agent_instruction=(
+                "do not retry before reset; the daemon quota pass probes once after reset_at"
+            ),
+        )
+        return _emit(
+            args,
+            resp,
+            ExitCode.OK,
+            f"wake {sid}: suppressed: waiting_quota until {reset_iso}",
+        )
     try:
         outcome = wake_session(
             sid,

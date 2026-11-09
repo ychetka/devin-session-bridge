@@ -8,10 +8,50 @@ from session_bridge.cli.contract import (
     ExitCode,
     JsonResponse,
 )
+from session_bridge.quota import parse_quota_signal
 from session_bridge.state import db
 from session_bridge.state.contract import (
     NotificationKind,
 )
+
+
+def _quota_autopark(args, sid) -> dict | None:
+    """Self-report quota park (task #216), or None when no park fired.
+
+    A notice/event carrying an explicit provider rate-limit marker AND
+    a parseable reset time parks the reporting session's live task into
+    ``waiting_quota`` so the exhausted pool is not retried before the
+    window closes. Conservative by construction: generic failures
+    (``rpc_error``, ``busy``, ``timeout``, ``lease expired``) carry no
+    quota marker and never park, and a marker without a reset time is
+    only journaled - parking there needs ``bridge quota-park
+    --reset-at``. Returns the park payload for the command response.
+    """
+    if sid is None:
+        return None
+    signal = parse_quota_signal(args.text)
+    if signal is None:
+        return None
+    task = db.get_live_task(sid, path=args.db)
+    if task is None:
+        return None
+    if signal["reset_at"] is None:
+        return {"quota_signal": True, "parked": False}
+    if not db.quota_park(
+        task["id"],
+        sid,
+        signal["reset_at"],
+        args.text[:500],
+        source="self-report",
+        path=args.db,
+    ):
+        return {"quota_signal": True, "parked": False}
+    return {
+        "quota_signal": True,
+        "parked": True,
+        "task_id": task["id"],
+        "quota_reset_at": signal["reset_at"],
+    }
 
 
 def _push_registered(args, kind: NotificationKind) -> int:
@@ -61,10 +101,18 @@ def _push_registered(args, kind: NotificationKind) -> int:
         args.text,
         path=args.db,
     )
+    data = {"notification_id": nid}
+    if kind == NotificationKind.NOTICE:
+        # self-report channel: a rate-limit notice with a reset time
+        # parks the reporter's live task (task #216); directives carry
+        # orders, not the sender's own failure state, so they skip
+        parked = _quota_autopark(args, args.session_id)
+        if parked:
+            data["quota"] = parked
     resp = JsonResponse(
         session=args.session_id,
         status="queued",
-        data={"notification_id": nid},
+        data=data,
     )
     return _emit(
         args,
@@ -107,10 +155,14 @@ def _cmd_event(args) -> int:
     except ValueError as e:
         resp = JsonResponse(session=sid, status="usage", error=str(e))
         return _emit(args, resp, ExitCode.USAGE, f"usage: {e}")
+    data = {"event_id": eid, "kind": args.event_kind.strip().lower()}
+    parked = _quota_autopark(args, sid)
+    if parked:
+        data["quota"] = parked
     resp = JsonResponse(
         session=sid,
         status="ok",
-        data={"event_id": eid, "kind": args.event_kind.strip().lower()},
+        data=data,
     )
     return _emit(
         args,

@@ -650,11 +650,21 @@ def _wake_candidates(db_path, now: int, queue_dir=None, pending=None):
         result = []
         if pending:
             marks = ",".join("?" * len(pending))
+            # waiting_quota suppression (task #216): a parked session's
+            # mail keeps until the provider's reset - a nudge before
+            # then would spend the very quota that is exhausted. The
+            # quota pass probes once at reset; the mail drains then.
+            # Expired-but-unswept rows do not suppress (quota_reset_at
+            # > now only) - the pass owns their single probe.
             rows = con.execute(
                 "SELECT session_id AS sid, cwd AS cwd FROM sessions"
                 f" WHERE session_id IN ({marks})"
-                " AND mode=? AND status='active'",
-                (*pending, SessionMode.MANAGED.value),
+                " AND mode=? AND status='active'"
+                " AND NOT EXISTS (SELECT 1 FROM tasks t"
+                "                 WHERE t.session_id=sessions.session_id"
+                "                   AND t.step_state='waiting_quota'"
+                "                   AND t.quota_reset_at>?)",
+                (*pending, SessionMode.MANAGED.value, now),
             ).fetchall()
             result = [{"sid": r["sid"], "cwd": r["cwd"], "probe_only": False} for r in rows]
         # liveness probe rows (item_162): stale-heartbeat sessions with
@@ -680,6 +690,7 @@ def _wake_candidates(db_path, now: int, queue_dir=None, pending=None):
             " AND (wh.last_seen_at IS NULL OR wh.last_seen_at<=?)"
             " AND EXISTS (SELECT 1 FROM tasks t"
             "             WHERE t.session_id=s.session_id"
+            "               AND COALESCE(t.step_state,'')<>'waiting_quota'"
             "               AND (t.status IN ('queued','dispatch_decided')"
             "                    OR (t.status='running'"
             "                        AND (t.wait_until IS NULL"
@@ -1048,6 +1059,7 @@ def _lease_renew_pass(db_path, state_directory, now: int) -> None:
             " FROM tasks t JOIN sessions s ON s.session_id=t.session_id"
             " WHERE t.status IN (?,?)"
             " AND s.mode=? AND s.status=?"
+            " AND COALESCE(t.step_state,'')<>'waiting_quota'"
             " AND t.lease_expires_at IS NOT NULL AND t.lease_expires_at<=?"
             " AND t.lease_renewed_at IS NOT NULL"
             " AND t.lease_renewed_at+?>=?",
@@ -1085,6 +1097,169 @@ def _lease_renew_pass(db_path, state_directory, now: int) -> None:
                 r["session_id"],
                 f"task={r['id']}",
             )
+
+
+#: how long a released park re-parks when its single control probe
+#: could not be delivered (paced, no lockfile, WakeError) - spending
+#: the episode without delivering the nudge would let the re-armed
+#: lease lapse into recover_stale and burn an attempt, which is the
+#: exact failure the park exists to prevent (task #216 review).
+_QUOTA_PROBE_DEFER_SECONDS = 120
+
+#: bound on consecutive probe defers per task episode (task #216
+#: review r2): a session whose probe can never land (dead, host gone)
+#: would otherwise re-park forever - after the limit the park is
+#: released for good and the ordinary lease/recovery lifecycle owns
+#: the outcome, with a durable give-up event for the operator.
+_QUOTA_PROBE_DEFER_LIMIT = 10
+
+
+def _defer_probe(db_path, state_directory, sid, task_id, now: int, why: str, row=None) -> None:
+    """Re-park a released task when its control probe could not run.
+
+    A short fresh window keeps ``waiting_quota`` semantics alive (no
+    attempt spent, no wake noise) until the next sweep retries the
+    probe - the alternative, leaving the re-armed lease to lapse,
+    would fold the task into ``recover_stale`` for a delivery problem,
+    not a worker problem. ``row`` carries the swept park's metadata so
+    the defer does not NULL the operator's model/checkpoint fields.
+    Bounded per episode: ``quota_defer_count`` increments on each
+    defer and resets on every real park, so past
+    ``_QUOTA_PROBE_DEFER_LIMIT`` consecutive defers the park is not
+    renewed and a ``quota_probe_gave_up`` event marks the hand-off
+    back to the ordinary lease lifecycle. The re-park CASes on
+    ``step_state IS NULL`` - a fresher self-report park landing
+    mid-sweep always wins over a stale defer.
+    """
+    task = db.get_task(task_id, path=db_path)
+    defers = (task["quota_defer_count"] or 0) if task is not None else 0
+    if defers >= _QUOTA_PROBE_DEFER_LIMIT:
+        _decision(
+            state_directory,
+            "quota_probe_gave_up",
+            sid,
+            f"task={task_id} why={why} after {defers} defers",
+        )
+        db.record_event(
+            sid,
+            "quota_probe_gave_up",
+            f"task={task_id} probe undeliverable after {defers} defers ({why})"
+            " - released to ordinary lease lifecycle",
+            task_id=task_id,
+            path=db_path,
+        )
+        return
+    if db.quota_park(
+        task_id,
+        sid,
+        now + _QUOTA_PROBE_DEFER_SECONDS,
+        f"control probe deferred ({why})",
+        "probe-defer",
+        model=row["quota_model"] if row is not None else None,
+        checkpoint=row["quota_checkpoint"] if row is not None else None,
+        defer=True,
+        require_unparked=True,
+        path=db_path,
+    ):
+        _decision(
+            state_directory,
+            "quota_probe_deferred",
+            sid,
+            f"task={task_id} why={why}",
+        )
+        db.record_event(
+            sid,
+            "quota_probe_deferred",
+            f"task={task_id} {why}",
+            task_id=task_id,
+            path=db_path,
+        )
+    else:
+        # the task moved on mid-pass - finished, requeued, or a fresher
+        # park landed first; journal durably, do not resurrect or
+        # overwrite
+        _decision(
+            state_directory,
+            "quota_probe_defer_lost",
+            sid,
+            f"task={task_id} why={why}",
+        )
+        db.record_event(
+            sid,
+            "quota_probe_defer_lost",
+            f"task={task_id} defer lost CAS ({why})",
+            task_id=task_id,
+            path=db_path,
+        )
+
+
+def _quota_pass(db_path, state_directory, now: int, policy: WakePolicy) -> None:
+    """Lift expired ``waiting_quota`` parks and fire the control probe.
+
+    ``db.unpark_quota_expired`` clears the step state and re-arms the
+    lease for every park whose ``quota_reset_at`` has passed (halted
+    sessions stay parked - HALT is senior to a quota reset). Each
+    released task then gets exactly one nudge - the control probe that
+    tells the claimant to resume the blocked step. A provider that is
+    still limited answers with another rate-limit error; the worker's
+    self-report parks the task again with the new reset, so repeated
+    failures extend the park instead of burning attempts or spamming
+    wakes. The ordinary wake cooldown applies so a reset storm cannot
+    burst probes past the pacing policy.
+
+    A probe that never lands (paced, no lockfile, WakeError) is not
+    spent silently: ``_defer_probe`` re-parks the task for a short
+    defer window and the next sweep retries - otherwise the re-armed
+    lease would lapse into ``recover_stale`` and burn the attempt
+    budget the park protects.
+    """
+    rows = db.unpark_quota_expired(now, path=db_path)
+    if not rows:
+        return
+    for r in rows:
+        sid = r["session_id"]
+        _decision(state_directory, "quota_unparked", sid, f"task={r['id']}")
+        db.record_event(
+            sid,
+            "quota_unparked",
+            f"task={r['id']} reset reached - control probe",
+            task_id=r["id"],
+            path=db_path,
+        )
+        # Re-read the lockfile per attempt like _wake_pass: the host
+        # can rotate (restart -> new port/token) between candidates of
+        # one pass, and a stale key must not poison the breaker.
+        lock_data = find_lockfile()
+        if lock_data is None:
+            _defer_probe(db_path, state_directory, sid, r["id"], now, "no_lockfile", r)
+            continue
+        host_key = lock_data["_path"]
+        if policy.check(sid, host_key) is not None:
+            _defer_probe(db_path, state_directory, sid, r["id"], now, "paced", r)
+            continue
+        policy.record_attempt(sid)
+        try:
+            outcome = wake_session(
+                sid,
+                None,
+                lock_data=lock_data,
+                nudge=(
+                    f"quota reset reached - resume task {r['id']} "
+                    "(the step was parked as waiting_quota; saved work stands)"
+                ),
+            )
+        except WakeError as e:
+            policy.record_result(host_key, e.reason in _SESSION_LEVEL_REASONS)
+            _decision(
+                state_directory,
+                "quota_probe_failed",
+                sid,
+                f"task={r['id']} reason={e.reason}",
+            )
+            _defer_probe(db_path, state_directory, sid, r["id"], now, f"probe_{e.reason}", r)
+            continue
+        policy.record_result(host_key, True)
+        _decision(state_directory, "quota_probe_sent", sid, f"task={r['id']} outcome={outcome}")
 
 
 def _recovery_pass(db_path, state_directory, notify_send) -> None:
@@ -1618,6 +1793,11 @@ def run(
                     pending,
                 )
                 _timed("lease_renew", _lease_renew_pass, db_path, state_directory, now)
+                # quota sweep (task #216): expired parks release here
+                # and get their single control probe; still-open
+                # windows suppress the wake leg by reset_at > now, so
+                # the pass order vs wake is not load-bearing
+                _timed("quota", _quota_pass, db_path, state_directory, now, wake_policy)
                 # recovery runs AFTER lease_renew: verifiably-busy
                 # tasks renew first, only genuinely lapsed leases
                 # fold into recover_stale here (task #207 item b)

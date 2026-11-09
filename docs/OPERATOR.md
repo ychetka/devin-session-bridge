@@ -144,6 +144,35 @@ Storage layout (state dir = the directory holding `state.db`, default
    while the wait lasts; `claim` on an owned running task renews the
    same way without a reason.
 
+   Provider rate limits (task #216): a task that hits an explicit
+   model rate limit parks as `waiting_quota` - a durable step state
+   stored orthogonally to the lifecycle status, not a failure. The
+   park keeps the task's live status and the claimant's lease: no
+   attempt is spent, `recover_stale` and the dead-worker fold skip
+   the row, and no second claimant can be issued a lease. While the
+   reset window is open, daemon wakes and `bridge wake` are
+   suppressed (`suppressed: waiting_quota until <reset_at>`); when
+   `quota_reset_at` passes, the daemon's quota pass clears the park,
+   re-arms the lease and sends one control probe; a probe that cannot
+   be delivered (paced, no lockfile, transport error) re-parks for a
+   short defer window instead of burning the attempt budget on a
+   lapsed lease. Defers are bounded per park episode
+   (`quota_defer_count`, reset by every real park) - past the limit
+   the task is released back to the ordinary lease lifecycle with a
+   durable `quota_probe_gave_up` event. A provider still limited
+   re-parks via the self-report channel with the new reset. HALT stays senior - a
+   halted session's park is not swept until `bridge resume`. Channels: manual `bridge quota-park <sid>
+   --task N --reset-at <iso|HH:MM UTC> --note "<error>" [--model M]
+   [--checkpoint "<where>"]`, early release `bridge quota-resume
+   <sid> --task N`, and auto-park when a `bridge event`/`bridge
+   notice` body carries explicit rate-limit text plus a parseable
+   reset time - `rpc_error`, `busy`, `timeout` and `lease expired`
+   never park (there is no structured ACP quota error code today,
+   so the auto channel is a conservative text parser). `bridge
+   inspect` shows `step_state`/`quota_reset_at`/metadata; `bridge
+   status` reads the session `quota` in STATE/TSTAT and exposes the
+   reset in the JSON fleet rows.
+
 6. Declare the repo's protected paths (e.g. `migrations/`, `auth/`,
    `.github/`) to the orchestrator in the task text or repo rules.
    There is no `bridge register` flag for this in the current CLI -
@@ -167,10 +196,12 @@ SID              REPO             TASK                 TSTAT  STATE       Q FAIL
 
 `TSTAT` is the lifecycle of the session's latest task (`queued`,
 `disp` = dispatch_decided, `run`, `wait` = awaiting_user, `done`,
-`fail`, `paus`); `-` when there is no task. `STATE` is the session
-reading: `dead` for a daemon-marked session, `idle` when nothing is
-running (a `done` task still reads `idle` - check `TSTAT` for the
-task's actual end state), otherwise the task status. The two columns
+`fail`, `paus`, `quota` = parked on a provider rate limit until the
+task's `quota_reset_at`); `-` when there is no task. `STATE` is the
+session reading: `dead` for a daemon-marked session, `idle` when
+nothing is running (a `done` task still reads `idle` - check `TSTAT`
+for the task's actual end state), `quota` when the latest task is
+`waiting_quota`, otherwise the task status. The two columns
 together separate "worker idle after finishing" (`done` + `idle`)
 from "task not picked up" (`queued` + `queued`).
 
@@ -971,6 +1002,8 @@ Global flags: `--db PATH` (`SESSIONS_BRIDGE_DB`), `--queue-dir DIR`
 | `bridge clear <sid>` | drop the session's queued task. |
 | `bridge unpark <sid>` | resume a paused/awaiting session (requeues paused tasks, clears the queue pause). |
 | `bridge retry <sid\|task_id>` | requeue a failed task; attempt resets. |
+| `bridge quota-park <sid> --task N --reset-at <iso\|HH:MM UTC> [--note T] [--model M] [--checkpoint T]` | manually park a live task into `waiting_quota` (v0.7.0, task #216): the step state stores orthogonally to the lifecycle - the task stays live, keeps its claimant lease, spends no attempt, is skipped by `recover_stale`/dead-worker fold and cannot be re-claimed; daemon wakes and `bridge wake` suppress until the reset, then the quota pass clears the park and sends one control probe. A `bridge event`/`bridge notice` body with explicit rate-limit text + a parseable reset auto-parks too (self-report channel); `rpc_error`/`busy`/`timeout`/`lease expired` never park. |
+| `bridge quota-resume <sid> --task N` | release a `waiting_quota` park before its reset (operator override; refuses on non-parked tasks and halted sessions - HALT is senior). |
 | `bridge arm <sid>` | enroll the session into managed mode; also clears a leftover `queue_paused` flag so tasks stay claimable. |
 | `bridge disarm <sid>` / `bridge disarm --all` | leave managed mode + send a `disarm` mailbox message. |
 | `bridge halt <sid>` / `bridge halt --all [--stop-daemon]` | graceful fleet stop: sets `halted_at`, queues the `halt` semantic and wakes; `--all` reports each target's wake outcome, mailbox depth and live task; `--stop-daemon` SIGTERMs the supervisor after the broadcast (v0.3.11). |
