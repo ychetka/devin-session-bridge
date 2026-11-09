@@ -654,6 +654,12 @@ def main(argv=None) -> int:
         # pure diagnostic: no state db init - a broken db must never
         # block the deployed-version report (PR54 r1 warning)
         return _cmd_version(args)
+    if args.command == "fleet-metrics":
+        # pure reader (directive 446): init() would CREATE a missing
+        # state.db and run column migrations - both are writes, so the
+        # report skips init and opens the file mode=ro instead; a
+        # pre-migration file is served via the updated_at fallback.
+        return _cmd_fleet_metrics(args)
     try:
         db.init(args.db)
     except Exception as e:
