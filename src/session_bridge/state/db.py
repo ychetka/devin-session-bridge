@@ -1296,9 +1296,9 @@ def waiting_quota_task(session_id: str, now: int, *, path=None):
 
     ``quota_reset_at <= now`` rows are excluded: their window has
     closed and the quota pass is the one clearing them - callers use
-    this for wake suppression, where an expired-but-not-yet-swept row
-    is still suppressible until the pass runs (the ``>`` boundary is
-    deliberate: an expired row suppresses nothing).
+    this for wake suppression, where a row whose reset has already
+    passed must not suppress anything (the ``>`` boundary is
+    deliberate: the pass, not the wake gate, owns expired rows).
     """
 
     def op():

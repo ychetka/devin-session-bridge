@@ -5,7 +5,7 @@
 ### User-facing
 
 #### feat
-- New `waiting_quota` step state parks a rate-limited task until its quota reset instead of letting it die on lease expiry; `bridge quota-park`/`quota-resume` control it manually and wake suppression keeps parked sessions asleep until reset. `state/cli/daemon` (issue #103, task 216) `state` (issue #103, task 216, ADR-0003)
+- New `waiting_quota` step state parks a rate-limited task until its quota reset instead of letting it die on lease expiry; `bridge quota-park`/`quota-resume` control it manually and wake suppression keeps parked sessions asleep until reset. `state/cli/daemon` (issue #103, task 216, ADR-0003)
 
 ### Codebase
 
