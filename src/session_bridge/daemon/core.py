@@ -1280,8 +1280,19 @@ def _mail_stall_pass(
             continue
         if not db.mark_mail_escalated(sid, path=db_path):
             continue  # already escalated this episode
+        # task #210 item 3: the escalation payload names the project so
+        # the orchestrator's tg_escalate forward carries it verbatim;
+        # the durable decision_events row keeps the same fields
+        # restart-proof for audit.
+        sess = db.get_session(sid, path=db_path)
+        project = None
+        if sess is not None:
+            cwd = sess["cwd"]
+            project = (os.path.basename(cwd.rstrip("/")) or cwd) if cwd else sess["title"]
         body = (
-            f"mail undrained {age // 60}m: {sid} has {r['count']} unacked"
+            f"mail undrained {age // 60}m: {sid}"
+            + (f" ({project})" if project else "")
+            + f" has {r['count']} unacked"
             f" notification(s) + {r.get('foreign', 0)} unregistered"
             " mailbox file(s) - drain is not reaching it"
             " (manual `bridge wake` or escalate to developer)"
@@ -1296,6 +1307,15 @@ def _mail_stall_pass(
             sid,
             f"age={age}s count={r['count']} -> {target}"
             + (f" {orch_sid}" if target == "orchestrator" else ""),
+        )
+        db.record_event(
+            sid,
+            "mail_stall",
+            f"reason=mail_stall age_seconds={age}"
+            f" pending_registered={r['count']}"
+            f" pending_foreign={r.get('foreign', 0)}"
+            f" project={project or '-'} target={target}",
+            path=db_path,
         )
     return max_age
 

@@ -20,6 +20,9 @@ from typing import Annotated, Literal
 from pydantic import BaseModel, Field
 
 __all__ = [
+    "KillNotFound",
+    "KillVerdict",
+    "Killed",
     "ReleaseNotFound",
     "ReleaseRefusedOwner",
     "ReleaseRemoved",
@@ -135,5 +138,28 @@ class ReleaseRefusedOwner(_Verdict):
 
 ReleaseVerdict = Annotated[
     ReleaseRemoved | ReleaseNotFound | ReleaseRefusedOwner,
+    Field(discriminator="kind"),
+]
+
+
+class KillNotFound(_Verdict):
+    """The sid is not registered - nothing to detach."""
+
+    kind: Literal["not_found"] = "not_found"
+
+
+class Killed(_Verdict):
+    """Live bridge state detached: session dead, leases released,
+    live tasks demoted, heartbeat row removed."""
+
+    kind: Literal["killed"] = "killed"
+    tasks_demoted: int
+    heartbeat_removed: bool
+    status_before: str
+    mode: str | None
+
+
+KillVerdict = Annotated[
+    KillNotFound | Killed,
     Field(discriminator="kind"),
 ]

@@ -2102,3 +2102,37 @@ def test_item207_gwt4_sweep_sees_no_heartbeat_ghosts(env):
         "",
     )
     assert "ghost" in detail
+
+
+def test_item210_gwt1_stall_escalation_journals_durable_event(env, monkeypatch):
+    """[ITEM-210.GWT-1] a mail-stall escalation now also appends a
+    durable decision_events row (kind mail_stall) carrying the
+    stalled sid, project, mail age and pending counts - the
+    restart-proof copy the orchestrator's tg_escalate forward is
+    sourced from. The notification body names the project."""
+    _managed_stale(env)  # registers SID with cwd /repo/ws
+    res = db.register("orc", "/repo/orc", role="orchestrator", path=env.db)
+    assert res.accepted
+    db.set_session_mode("orc", SessionMode.MANAGED, path=env.db)
+    _undrained_mail(env, SID, NotificationKind.DIRECTIVE, age_seconds=7200)
+    _wake_calls(env, monkeypatch)
+
+    daemon._mail_stall_pass(env.db, env.sdir, int(time.time()), env.notifier)
+
+    ev = db.list_events(session_id=SID, kind="mail_stall", path=env.db)
+    assert len(ev) == 1
+    body = ev[0]["body"]
+    assert "reason=mail_stall" in body
+    assert "age_seconds=72" in body  # 7200s fixture age
+    assert "pending_registered=1" in body
+    assert "project=ws" in body
+    assert "target=orchestrator" in body
+    orch_mail = _one(
+        env.db,
+        "SELECT body FROM notifications WHERE session_id='orc' AND kind='directive'",
+    )
+    assert orch_mail is not None and "(ws)" in orch_mail["body"]
+
+    # one episode -> one event row (the stamp dedups the whole effect)
+    daemon._mail_stall_pass(env.db, env.sdir, int(time.time()) + 60, env.notifier)
+    assert len(db.list_events(session_id=SID, kind="mail_stall", path=env.db)) == 1

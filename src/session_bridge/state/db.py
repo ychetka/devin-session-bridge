@@ -68,6 +68,9 @@ from .contract import (
     validate_question_transition,
 )
 from .verdict import (
+    Killed,
+    KillNotFound,
+    KillVerdict,
     ReleaseNotFound,
     ReleaseRefusedOwner,
     ReleaseRemoved,
@@ -1724,6 +1727,95 @@ def unregister_session(session_id: str, *, force: bool = False, path=None) -> Un
             counts["questions_unclaimed"] = cur.rowcount
             con.commit()
             return UnregisterDeleted(counts=counts)
+        except BaseException:
+            con.rollback()
+            raise
+        finally:
+            con.close()
+
+    return _retry(op)
+
+
+def kill_session(session_id: str, *, path=None) -> KillVerdict:
+    """Force-terminate a session's live bridge state (task #210).
+
+    The kill path for a session that must be detached NOW, without
+    unregister's liveness refusals and row deletion: the session row
+    flips to ``dead``, live tasks (``running``/``awaiting_user``)
+    demote to ``dispatch_decided`` with their leases released so a
+    resurrected session can re-claim them or the orchestrator can
+    reroute, staged ``dispatch_decided`` leases are released too, and
+    the heartbeat row is removed so metronome writes cannot keep the
+    corpse warm. ``queued`` tasks are left queued - they never
+    claimed a lease.
+
+    ``KillNotFound`` when the sid is not registered; ``Killed``
+    carrying effect counts otherwise. All effects land inside one
+    ``BEGIN IMMEDIATE`` and a ``session_killed`` row is appended to
+    ``decision_events`` in the same transaction, so the durable audit
+    cannot be lost between commit and a second write.
+    """
+    ts = _now()
+
+    def op():
+        con = connect(path)
+        try:
+            con.execute("BEGIN IMMEDIATE")
+            row = con.execute(
+                "SELECT status, mode FROM sessions WHERE session_id=?",
+                (session_id,),
+            ).fetchone()
+            if row is None:
+                con.rollback()
+                return KillNotFound()
+            cur = con.execute(
+                "UPDATE tasks SET status=?, lease_owner=NULL,"
+                " lease_expires_at=NULL, lease_renewed_at=NULL,"
+                " updated_at=?"
+                " WHERE session_id=? AND status IN (?,?)",
+                (
+                    TaskStatus.DISPATCH_DECIDED.value,
+                    ts,
+                    session_id,
+                    TaskStatus.RUNNING.value,
+                    TaskStatus.AWAITING_USER.value,
+                ),
+            )
+            demoted = cur.rowcount
+            # staged dispatches hold a claim-window lease; release it
+            # so a reroute elsewhere is never blocked by a dead claim
+            con.execute(
+                "UPDATE tasks SET lease_owner=NULL,"
+                " lease_expires_at=NULL, lease_renewed_at=NULL,"
+                " updated_at=?"
+                " WHERE session_id=? AND status=? AND lease_owner IS NOT NULL",
+                (ts, session_id, TaskStatus.DISPATCH_DECIDED.value),
+            )
+            hb = con.execute(
+                "DELETE FROM worker_heartbeats WHERE session_id=?",
+                (session_id,),
+            ).rowcount
+            con.execute(
+                "UPDATE sessions SET status=?, updated_at=? WHERE session_id=?",
+                (SessionStatus.DEAD.value, ts, session_id),
+            )
+            con.execute(
+                "INSERT INTO decision_events(session_id,kind,body,created_at) VALUES (?,?,?,?)",
+                (
+                    session_id,
+                    "session_killed",
+                    f"tasks_demoted={demoted} heartbeat_removed={bool(hb)}"
+                    f" status_before={row['status']} mode={row['mode']}",
+                    ts,
+                ),
+            )
+            con.commit()
+            return Killed(
+                tasks_demoted=demoted,
+                heartbeat_removed=bool(hb),
+                status_before=row["status"],
+                mode=row["mode"],
+            )
         except BaseException:
             con.rollback()
             raise
