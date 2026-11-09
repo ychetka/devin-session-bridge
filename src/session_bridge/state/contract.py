@@ -39,7 +39,12 @@ WRITER_RETRIES: Final[int] = 5
 
 # --- lease and retry policy ----------------------------------------------
 
-LEASE_SECONDS: Final[int] = 1800
+#: Default claim-lease TTL (issue #105): 1h - the postmortem of queue
+#: task 213 ('lease expired' at ~2.7h of live work) showed 30min is too
+#: tight for long turns even with auto-renew. ``SB_LEASE_TTL_S`` is the
+#: operator override, resolved once at the state.db layer (db.LEASE_SECONDS
+#: is the authoritative value; this constant stays the documented default).
+LEASE_SECONDS: Final[int] = 3600
 MAX_ATTEMPTS: Final[int] = 2  # one auto-requeue, then terminal failed
 
 

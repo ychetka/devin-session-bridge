@@ -40,7 +40,6 @@ from session_bridge.cli.contract import (
 )
 from session_bridge.state import db
 from session_bridge.state.contract import (
-    LEASE_SECONDS,
     NotificationKind,
     SessionMode,
     TaskStatus,
@@ -54,7 +53,7 @@ SEMAPHOR = 3
 WORK_TIMEOUT_DEFAULT = 3600
 
 #: lease renewal cadence inside a running prompt wait.
-LEASE_RENEW_INTERVAL = max(60, LEASE_SECONDS // 3)
+LEASE_RENEW_INTERVAL = max(60, db.LEASE_SECONDS // 3)
 
 #: per-session STATE names shown by ``status``.
 STATE_RUNNING = "RUNNING"
@@ -99,7 +98,7 @@ WORKER_LOG_KEEP = 10  # retention: newest files survive the pump sweep
 
 #: retention never unlinks a log touched inside one lease window: a
 #: file that fresh can still belong to a live, writing worker
-WORKER_LOG_MIN_AGE_SECONDS = LEASE_SECONDS
+WORKER_LOG_MIN_AGE_SECONDS = db.LEASE_SECONDS
 
 _STDERR_TAIL_LINES = 3
 

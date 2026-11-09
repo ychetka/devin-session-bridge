@@ -938,7 +938,7 @@ _LEASE_RENEW_MARGIN = _env_int("SESSIONS_BRIDGE_LEASE_RENEW_MARGIN", 300)
 #: age of the last EXPLICIT lease touch (claim / mark_running / renew
 #: / wait) beyond which auto-renewal stops and expiry recovery takes
 #: over - a wedged turn that keeps reporting busy cannot hold the
-#: task forever. Default = 6 lease lengths (~3h); clamped at one
+#: task forever. Default = 6 lease lengths; clamped at one
 #: lease length so a misconfigured override cannot silently disable
 #: the mechanism.
 _LEASE_AUTO_RENEW_LIMIT = max(
