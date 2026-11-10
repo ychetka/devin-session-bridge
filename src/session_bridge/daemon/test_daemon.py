@@ -2882,3 +2882,130 @@ def test_item119_gwt11_giant_issued_at_header_no_crash(env):
     assert os.path.exists(path)
     assert os.path.exists(fresh)
     assert os.path.exists(uni)
+
+
+# --- task #249: quota-probe hardening (durable journal, dedicated pacing,
+# --- busy-owner hold) ----------------------------------------------------------
+
+
+def test_item249_gwt1_wake_park_journals_marker_durably(env, monkeypatch):
+    """[ITEM-249.GWT-1] the wake-surfaced park lands in decision_events
+    with the original marker - postmortems see WHY the park happened,
+    not just its aftermath."""
+    _managed_with_mail(env)
+    _live_task(env)
+    _limited_wake(env, monkeypatch, _RATE_LIMIT_BODY)
+
+    now = int(time.time())
+    daemon._wake_pass(env.db, env.sdir, now, daemon.WakePolicy(cooldown_seconds=0))
+
+    events = db.list_events(session_id=SID, kind="quota_park", path=env.db)
+    assert len(events) == 1
+    assert "source=wake" in events[0]["body"]
+    assert "rate limit" in events[0]["body"]
+
+
+def test_item249_gwt2_defer_preserves_original_marker(env, monkeypatch):
+    """[ITEM-249.GWT-2] a deferred probe re-park keeps the original
+    quota_note - the marker stays readable on the row for the whole
+    episode instead of being overwritten by the defer reason."""
+    _managed_fresh(env)
+    tid = _parked_task(env, reset_in=-10)
+    monkeypatch.setattr(daemon, "find_lockfile", lambda *a, **k: None)
+
+    assert daemon.run(env.db, env.qdir, once=True, notify_send=env.notifier) == daemon.RUN_OK
+
+    row = db.get_task(tid, path=env.db)
+    assert row["step_state"] == "waiting_quota"
+    assert row["quota_source"] == "probe-defer"
+    assert row["quota_note"] == "rate limit"  # original marker kept
+
+
+def test_item249_gwt3_probe_paces_on_dedicated_policy(env, monkeypatch):
+    """[ITEM-249.GWT-3] the incident shape: a session whose mail-wake
+    armed the shared 300s cooldown in the same pass used to get every
+    probe ``paced`` unattempted - the dedicated probe policy lets the
+    control nudge through."""
+    _managed_with_mail(env)
+    tid = _parked_task(env, reset_in=-10)
+    calls = _wake_calls(env, monkeypatch)
+
+    assert daemon.run(env.db, env.qdir, once=True, notify_send=env.notifier) == daemon.RUN_OK
+
+    # drain-prompt wake + quota control probe - two prompts, one pass
+    assert calls == [SID, SID]
+    assert any(d["event"] == "quota_probe_sent" for d in _decisions(env))
+    assert not any(d["event"] == "quota_probe_deferred" for d in _decisions(env))
+    assert db.get_task(tid, path=env.db)["step_state"] is None
+
+
+def test_item249_gwt4_busy_owner_gave_up_holds_and_escalates(env, monkeypatch):
+    """[ITEM-249.GWT-4] give-up on a verifiably mid-turn owner re-arms a
+    bounded hold and escalates once to the orchestrator - a delivery
+    problem never folds a working task into lease expiry."""
+    _managed_fresh(env)
+    res = db.register("orc", "/repo/ctl", role="orchestrator", path=env.db)
+    assert res.accepted
+    tid = _parked_task(env, reset_in=-10)
+    _exec(
+        env.db,
+        "UPDATE tasks SET quota_defer_count=? WHERE id=?",
+        (daemon._QUOTA_PROBE_DEFER_LIMIT, tid),
+    )
+    monkeypatch.setattr(daemon, "find_lockfile", lambda *a, **k: None)
+    monkeypatch.setattr(daemon, "wake_session", lambda sid, *a, **k: "sent")
+    monkeypatch.setattr(daemon, "_busy_sessions", lambda *a, **k: {SID})
+
+    assert daemon.run(env.db, env.qdir, once=True, notify_send=env.notifier) == daemon.RUN_OK
+
+    row = db.get_task(tid, path=env.db)
+    assert row["step_state"] == "waiting_quota"
+    assert row["quota_source"] == "busy-hold"
+    assert row["quota_defer_count"] == daemon._QUOTA_PROBE_DEFER_LIMIT + 1
+    assert row["quota_note"] == "rate limit"  # original marker kept
+    orch_mail = _one(
+        env.db,
+        "SELECT body FROM notifications WHERE session_id='orc' AND kind='notice'",
+    )
+    assert orch_mail is not None and "[QUOTA_PROBE]" in orch_mail["body"]
+    assert f"task={tid}" in orch_mail["body"]
+    events = [e["kind"] for e in db.list_events(session_id=SID, path=env.db)]
+    assert "quota_probe_escalated" in events
+    assert "quota_probe_held_busy" in events
+    assert "quota_probe_gave_up" not in events
+
+    # a repeat give-up inside the same episode re-holds without
+    # re-alerting (defer count past the limit is the dedup stamp)
+    _exec(env.db, "UPDATE tasks SET quota_reset_at=? WHERE id=?", (int(time.time()) - 1, tid))
+    assert daemon.run(env.db, env.qdir, once=True, notify_send=env.notifier) == daemon.RUN_OK
+    row = db.get_task(tid, path=env.db)
+    assert row["step_state"] == "waiting_quota"
+    assert row["quota_source"] == "busy-hold"
+    c = _one(
+        env.db,
+        "SELECT COUNT(*) AS c FROM notifications WHERE session_id='orc' AND kind='notice'",
+    )["c"]
+    assert c == 1
+
+
+def test_item249_gwt5_unverifiable_owner_still_releases(env, monkeypatch):
+    """[ITEM-249.GWT-5] an owner that cannot be verified busy keeps the
+    pre-fix contract: give-up releases to the lease lifecycle with no
+    hold and no escalation."""
+    _managed_fresh(env)
+    tid = _parked_task(env, reset_in=-10)
+    _exec(
+        env.db,
+        "UPDATE tasks SET quota_defer_count=? WHERE id=?",
+        (daemon._QUOTA_PROBE_DEFER_LIMIT, tid),
+    )
+    monkeypatch.setattr(daemon, "find_lockfile", lambda *a, **k: None)
+    monkeypatch.setattr(daemon, "wake_session", lambda sid, *a, **k: "sent")
+    monkeypatch.setattr(daemon, "_busy_sessions", lambda *a, **k: set())
+
+    assert daemon.run(env.db, env.qdir, once=True, notify_send=env.notifier) == daemon.RUN_OK
+
+    assert db.get_task(tid, path=env.db)["step_state"] is None
+    events = [e["kind"] for e in db.list_events(session_id=SID, path=env.db)]
+    assert "quota_probe_gave_up" in events
+    assert "quota_probe_escalated" not in events

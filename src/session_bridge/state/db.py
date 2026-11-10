@@ -1352,12 +1352,22 @@ def quota_park(
     layer without leaking across episodes. ``require_unparked=True``
     CASes on ``step_state IS NULL`` so a defer can never overwrite a
     fresher park that landed mid-sweep.
+
+    Every successful REAL park (``defer=False``) commits a durable
+    ``decision_events`` row (``kind=quota_park``) carrying the reset
+    window, the source and the original marker text in the same
+    transaction as the CAS - the task #249 postmortem found the park
+    journalled only in the daemon jsonl log, so the durable audit saw
+    unpark/probe events for a park it could never explain. Deferral
+    re-parks already journal ``quota_probe_deferred`` at the daemon
+    layer, so they deliberately write no second row here.
     """
     ts = _now()
 
     def op():
         con = connect(path)
         try:
+            con.execute("BEGIN IMMEDIATE")
             cur = con.execute(
                 f"UPDATE tasks SET step_state='waiting_quota',"
                 f" quota_reset_at=?, quota_note=?, quota_source=?,"
@@ -1379,7 +1389,26 @@ def quota_park(
                     session_id,
                 ),
             )
-            return cur.rowcount == 1
+            ok = cur.rowcount == 1
+            if ok and not defer:
+                con.execute(
+                    "INSERT INTO decision_events"
+                    "(session_id,kind,body,task_id,created_at)"
+                    " VALUES (?,?,?,?,?)",
+                    (
+                        session_id,
+                        "quota_park",
+                        f"task={task_id} reset_at={reset_at} source={source}"
+                        f" note={(note or '')[:400]}",
+                        task_id,
+                        ts,
+                    ),
+                )
+            con.commit()
+            return ok
+        except BaseException:
+            con.rollback()
+            raise
         finally:
             con.close()
 

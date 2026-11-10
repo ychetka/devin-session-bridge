@@ -159,7 +159,17 @@ Storage layout (state dir = the directory holding `state.db`, default
    lapsed lease. Defers are bounded per park episode
    (`quota_defer_count`, reset by every real park) - past the limit
    the task is released back to the ordinary lease lifecycle with a
-   durable `quota_probe_gave_up` event. A provider still limited
+   durable `quota_probe_gave_up` event, UNLESS the owning session is
+   verifiably mid-turn (issue #123): then the park re-arms for a
+   bounded hold (`SESSIONS_BRIDGE_QUOTA_BUSY_HOLD_SECONDS`, default
+   3600s) under `quota_source=busy-hold` and the first give-up
+   escalates once to the orchestrator as a `[QUOTA_PROBE]` notice -
+   a still-working session must not lose its task to a probe-delivery
+   problem; repeat give-ups re-hold silently. Every real park commits
+   a durable `quota_park` decision_events row with the reset window,
+   source and the original marker text, defer re-parks preserve the
+   original `quota_note`, and control probes pace on their own budget
+   - mail-wake cooldowns can no longer starve them. A provider still limited
    re-parks via the self-report channel with the new reset. HALT stays senior - a
    halted session's park is not swept until `bridge resume`. Channels: manual `bridge quota-park <sid>
    --task N --reset-at <iso|HH:MM UTC> --note "<error>" [--model M]

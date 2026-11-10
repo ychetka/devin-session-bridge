@@ -46,6 +46,25 @@ quota pass re-probes at its end.
   burning the retry streak or finishing the task failed
 - **AND** the session drops out of every wake leg until that reset
 
+### Requirement: every real park is durable-journaled with its marker
+
+Every successful real (non-defer) park SHALL commit a `quota_park`
+`decision_events` row in the same transaction as the CAS, carrying
+the reset window, the park source and the original marker text - the
+audit must always be able to explain a later unpark/probe cycle.
+Deferral re-parks write no second row (their own
+`quota_probe_deferred` events carry the cycle) and SHALL preserve the
+original `quota_note` so the marker stays readable on the row for the
+whole episode.
+
+#### Scenario: postmortem sees the park's why
+
+- **WHEN** any path (wake transport, dispatch pump, self-report,
+  manual `bridge quota-park`) parks a live task
+- **THEN** a `quota_park` event row exists naming the task, the reset
+  window, the source and the marker text
+- **AND** a deferred probe re-park leaves `quota_note` untouched
+
 #### Scenario: quota signal without a live task journals only
 
 - **WHEN** a wake error carries a quota marker but the session has
@@ -57,7 +76,10 @@ quota pass re-probes at its end.
 
 When `quota_reset_at` passes, the daemon quota pass SHALL clear the
 park, re-arm the lease for a full window and send exactly one control
-probe to the session.
+probe to the session. Probe delivery paces on a dedicated pacing
+budget independent of the ordinary wake cooldown - a session whose
+undrained mail keeps the wake cooldown armed SHALL still receive its
+control probe.
 
 #### Scenario: undeliverable probe re-parks, bounded
 
@@ -66,6 +88,36 @@ probe to the session.
 - **THEN** the task re-parks for a short defer window
 - **AND** after the per-episode defer limit the park releases to the
   ordinary lease lifecycle with a durable `quota_probe_gave_up` event
+
+#### Scenario: mail-wake cooldown does not starve the probe
+
+- **WHEN** a session is woken for pending mail in the same daemon pass
+  that its expired park sweeps
+- **THEN** the control probe still fires - wake pacing must not
+  consume the probe's delivery budget
+
+### Requirement: give-up on a busy owner holds and escalates
+
+When the defer limit is reached and the owning session is verifiably
+mid-turn per session/list, the task SHALL NOT release to the lease
+lifecycle - releasing there folds a probe-delivery problem into a
+worker failure. The park instead re-arms for a bounded hold
+(`SESSIONS_BRIDGE_QUOTA_BUSY_HOLD_SECONDS`, default 3600s) and the
+first give-up per episode escalates once to the orchestrator as a
+`[QUOTA_PROBE]` notice (notify-send fallback); repeat give-ups
+re-hold without re-alerting. An owner that cannot be verified busy
+keeps the release contract.
+
+#### Scenario: busy owner holds, idle owner releases
+
+- **WHEN** a probe stays undeliverable past the defer limit and the
+  owner reports mid-turn status
+- **THEN** the task re-parks under `quota_source=busy-hold`, the
+  orchestrator gets one `[QUOTA_PROBE]` notice naming task, session
+  and defer count, and `quota_probe_escalated`/`quota_probe_held_busy`
+  events journal durably
+- **AND** when the owner is absent, idle or unverifiable, the park
+  releases with `quota_probe_gave_up` exactly as before
 
 ### Requirement: HALT is senior to a quota reset
 
