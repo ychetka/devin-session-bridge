@@ -38,6 +38,7 @@ from session_bridge.cli.contract import (
     ExitCode,
     JsonResponse,
 )
+from session_bridge.quota import DEFAULT_PARK_SECONDS, parse_quota_signal
 from session_bridge.state import db
 from session_bridge.state.contract import (
     NotificationKind,
@@ -428,6 +429,34 @@ def _acp_failure(
     """
     kind = getattr(exc, "kind", None) or type(exc).__name__
     note = f"acp {phase} failed ({kind}): {exc}"
+    signal = parse_quota_signal(str(exc))
+    if signal is not None:
+        # the transport surfaced a provider rate-limit (task #230):
+        # park the step instead of finishing the task - the exhausted
+        # pool would only fail the retry the same way. The claimant
+        # lease stays with the task (parked rows are invisible to
+        # recover_stale); a marker without a reset parks for the
+        # bounded DEFAULT_PARK_SECONDS window.
+        reset_at = signal["reset_at"]
+        if reset_at is None:
+            reset_at = int(time.time()) + DEFAULT_PARK_SECONDS
+        if db.quota_park(task_id, sid, reset_at, note[:500], source=f"acp-{phase}", path=args.db):
+            return JsonResponse(
+                session=sid,
+                status=TaskStatus.RUNNING.value,
+                data={
+                    "quota": {
+                        "parked": True,
+                        "reset_at": reset_at,
+                        "default_window": signal["reset_at"] is None,
+                    }
+                },
+                agent_instruction=(
+                    "task parked as waiting_quota until the provider reset - do not retry manually"
+                ),
+            )
+        # park CAS lost - the task moved on mid-failure; fall through
+        # to the ordinary by-cause handling
     if bool(getattr(exc, "retryable", False)) and not (phase == "prompt" and kind == "timeout"):
         # the lease is deliberately kept: its expiry is the requeue
         # trigger in recover_stale

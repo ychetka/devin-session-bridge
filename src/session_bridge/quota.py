@@ -26,8 +26,17 @@ _QUOTA_MARKER = re.compile(
 # Reset-time phrasings seen across providers/subagent errors:
 #   "reset at 12:51 UTC" / "resets at 14:00 UTC"
 #   "reset in 18 minutes" / "retry after 3600s" / "try again in 2 hours"
+#   "reset in 58 minutes (at 22:01 UTC)" - provider gives both
 #   ISO stamps: "reset at 2026-11-09T12:51:00Z"
 _RESET_AT_CLOCK = re.compile(r"resets?\s+at\s+(\d{1,2}):(\d{2})\s*(?:utc|z)\b", re.IGNORECASE)
+# "reset in N <unit> (at HH:MM UTC)": the parenthesised absolute time
+# is the provider's canonical reset - it wins over the relative
+# window, which drifts when the text is parsed late (task #230: the
+# live free-tier incident error carries exactly this form).
+_RESET_IN_CLOCK = re.compile(
+    r"resets?\s+in\s+\d+\s*\w+\s*\(\s*at\s+(\d{1,2}):(\d{2})\s*(?:utc|z)\s*\)",
+    re.IGNORECASE,
+)
 _RESET_IN = re.compile(
     r"(?:reset(?:s)?\s+in|retry\s+after|try\s+again\s+in|available\s+in)"
     r"\s+(\d+)\s*(seconds?|secs?|s|minutes?|mins?|m|hours?|hrs?|h)\b",
@@ -45,6 +54,16 @@ _UNIT_SECONDS = {"s": 1, "m": 60, "h": 3600}
 #: text is untrusted input, so an absurd duration degrades to
 #: "signal without a window" instead of overflowing the epoch bind.
 _MAX_RELATIVE_SECONDS = 30 * 86400
+
+#: Park window for a real quota marker that carries NO reset time
+#: (task #230 policy, transport surfaces only): the pool is
+#: demonstrably dry, so the wake pass and the dispatch pump park the
+#: step for this bounded window instead of streaking retries into an
+#: exhausted provider - the quota pass re-probes at the window end
+#: and a still-limited provider re-parks through the same path.
+#: Self-reports (notice/event) keep the stricter contract: no reset,
+#: no park - the reporter can name the window or use quota-park.
+DEFAULT_PARK_SECONDS = 900
 
 
 def _clock_reset(hh: int, mm: int, now: float) -> float | None:
@@ -72,6 +91,11 @@ def parse_reset_at(text: str, now: float | None = None) -> int | None:
             return int(dt.timestamp())
         except ValueError:
             pass
+    m = _RESET_IN_CLOCK.search(text)
+    if m:
+        reset = _clock_reset(int(m.group(1)), int(m.group(2)), now)
+        if reset is not None:
+            return int(reset)
     m = _RESET_AT_CLOCK.search(text)
     if m:
         reset = _clock_reset(int(m.group(1)), int(m.group(2)), now)

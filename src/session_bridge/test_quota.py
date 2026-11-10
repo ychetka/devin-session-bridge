@@ -104,3 +104,24 @@ def test_absurd_relative_duration_no_overflow():
     now = int(time.time())
     sig = parse_quota_signal("rate limited, retry after 48 hours", now)
     assert sig["reset_at"] == now + 172800
+
+
+def test_relative_with_absolute_parenthetical_prefers_clock():
+    """GWT-230-p1: 'reset in 58 minutes (at 22:01 UTC)' - the provider's
+    parenthesised absolute reset wins over the relative window (the
+    exact free-tier incident text, task #230)."""
+    from datetime import datetime, timezone
+
+    now = int(datetime(2026, 11, 9, 21, 3, tzinfo=timezone.utc).timestamp())
+    text = (
+        "Reached free model rate limit. Upgrade to Max for higher "
+        "limits, or switch to a different model. Your limit will "
+        "reset in 58 minutes (at 22:01 UTC)."
+    )
+    reset = parse_reset_at(text, now)
+    assert reset == int(datetime(2026, 11, 9, 22, 1, tzinfo=timezone.utc).timestamp())
+    # past-clock rolls to the next day like the plain clock form
+    now_late = int(datetime(2026, 11, 9, 23, 30, tzinfo=timezone.utc).timestamp())
+    assert parse_reset_at(text, now_late) == int(
+        datetime(2026, 11, 10, 22, 1, tzinfo=timezone.utc).timestamp()
+    )

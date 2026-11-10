@@ -16,6 +16,7 @@ import pytest
 
 from session_bridge.cli import bridge
 from session_bridge.daemon import core as daemon
+from session_bridge.quota import DEFAULT_PARK_SECONDS, parse_quota_signal
 from session_bridge.state import db
 from session_bridge.state.contract import (
     CLAIM_TIMEOUT_SECONDS,
@@ -2391,3 +2392,99 @@ def test_quota_defer_yields_to_fresher_park(env, monkeypatch):
     assert row["quota_note"] == "still limited"
     events = [e["kind"] for e in db.list_events(session_id=SID, path=env.db)]
     assert "quota_probe_defer_lost" in events
+
+
+# --- task #230: transport-surfaced quota parks --------------------------------
+
+_RATE_LIMIT_BODY = (
+    "Reached free model rate limit. Upgrade to Max for higher limits, "
+    "or switch to a different model. Your limit will reset in 58 "
+    "minutes (at 22:01 UTC)."
+)
+
+
+def _live_task(env, sid=SID):
+    """A running (unparked) task for ``sid``."""
+    tid = db.enqueue(sid, "work", path=env.db)
+    assert db.claim_queued(tid, "w1", "acp-push", path=env.db)
+    assert db.mark_running(tid, "w1", path=env.db)
+    return tid
+
+
+def _limited_wake(env, monkeypatch, text):
+    """wake_session stub that fails like the live incident: rpc_error
+    whose body carries the provider's rate-limit text."""
+    monkeypatch.setattr(daemon, "find_lockfile", lambda *a, **k: {"_path": "fake-host"})
+
+    def limited(*a, **k):
+        raise daemon.WakeError("rpc_error", f"session/prompt: {text}")
+
+    monkeypatch.setattr(daemon, "wake_session", limited)
+
+
+def test_quota_wake_rpc_error_with_limit_parks_task(env, monkeypatch):
+    """GWT-230-1: an rpc_error whose body carries a provider rate-limit
+    marker parks the session's live task instead of streaking wake
+    retries into the exhausted pool (live incident 2026-11-09)."""
+    _managed_with_mail(env)
+    tid = _live_task(env)
+    _limited_wake(env, monkeypatch, _RATE_LIMIT_BODY)
+
+    now = int(time.time())
+    daemon._wake_pass(env.db, env.sdir, now, daemon.WakePolicy(cooldown_seconds=0))
+
+    row = db.get_task(tid, path=env.db)
+    assert row["step_state"] == "waiting_quota"
+    assert row["status"] == TaskStatus.RUNNING.value
+    assert row["quota_source"] == "wake"
+    expected = parse_quota_signal(f"session/prompt: {_RATE_LIMIT_BODY}", now)
+    assert row["quota_reset_at"] == expected["reset_at"]
+    assert any(d["event"] == "quota_park" for d in _decisions(env))
+    # the parked session drops out of every wake leg until reset
+    cands = daemon._wake_candidates(env.db, now)
+    assert SID not in {r["sid"] for r in cands}
+
+
+def test_quota_wake_marker_without_reset_parks_default_window(env, monkeypatch):
+    """GWT-230-2: a real marker with no reset still means a dry pool -
+    the transport path parks for the bounded default window (policy:
+    short default park, OPERATOR)."""
+    _managed_with_mail(env)
+    tid = _live_task(env)
+    _limited_wake(env, monkeypatch, "Reached free model rate limit.")
+
+    now = int(time.time())
+    daemon._wake_pass(env.db, env.sdir, now, daemon.WakePolicy(cooldown_seconds=0))
+
+    row = db.get_task(tid, path=env.db)
+    assert row["step_state"] == "waiting_quota"
+    assert row["quota_reset_at"] == now + DEFAULT_PARK_SECONDS
+
+
+def test_quota_wake_plain_rpc_error_does_not_park(env, monkeypatch):
+    """GWT-230-3: an rpc_error without a quota marker keeps the
+    ordinary wake_failed bookkeeping - no park, no quota columns."""
+    _managed_with_mail(env)
+    tid = _live_task(env)
+    _limited_wake(env, monkeypatch, "rejected mid-turn")
+
+    now = int(time.time())
+    daemon._wake_pass(env.db, env.sdir, now, daemon.WakePolicy(cooldown_seconds=0))
+
+    row = db.get_task(tid, path=env.db)
+    assert row["step_state"] is None
+    assert any(d["event"] == "wake_failed" for d in _decisions(env))
+
+
+def test_quota_wake_signal_without_live_task_journals_only(env, monkeypatch):
+    """GWT-230-4: a quota marker with no live task has nothing to park -
+    the signal is journaled and ordinary rpc_error handling applies."""
+    _managed_with_mail(env)  # no task on the session
+    _limited_wake(env, monkeypatch, _RATE_LIMIT_BODY)
+
+    now = int(time.time())
+    daemon._wake_pass(env.db, env.sdir, now, daemon.WakePolicy(cooldown_seconds=0))
+
+    assert _one(env.db, "SELECT count(*) AS c FROM tasks")["c"] == 0
+    assert any(d["event"] == "quota_signal_seen" for d in _decisions(env))
+    assert any(d["event"] == "wake_failed" for d in _decisions(env))

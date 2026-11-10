@@ -644,6 +644,64 @@ def test_item07_work_prompt_timeout_is_terminal(env, capsys, monkeypatch):
     assert "timeout" in row["note"]
 
 
+def test_item230_work_rate_limit_parks_not_fails(env, capsys, monkeypatch):
+    """GWT-230-5: a prompt AcpError carrying a provider rate-limit
+    marker parks the task as waiting_quota instead of hard-failing it
+    (live incident 2026-11-09: rpc_error swallowed the marker)."""
+
+    class LimitedClient(_OkClient):
+        def prompt(self, sid, text, timeout=None):
+            raise AcpError(
+                "session/prompt: Reached free model rate limit. "
+                "Upgrade to Max for higher limits, or switch to a "
+                "different model. Your limit will reset in 10 minutes.",
+                kind="rpc_error",
+            )
+
+    env.devin[SID] = {"working_directory": "/repo"}
+    tid = _task(env)
+    owner = _claim_acp(env, tid)
+    monkeypatch.setattr(dispatch, "AcpClient", LimitedClient)
+    rc, out = _run(["_work", str(tid), "--owner", owner, "--json"], capsys)
+    assert rc == ExitCode.OK
+    resp = JsonResponse.model_validate(out)
+    assert resp.status == TaskStatus.RUNNING.value
+    assert resp.data["quota"]["parked"] is True
+    assert resp.data["quota"]["default_window"] is False
+    row = db.get_task(tid, path=env.db)
+    # parked, not failed: lifecycle + lease stay with the claimant
+    assert row["status"] == TaskStatus.RUNNING.value
+    assert row["step_state"] == "waiting_quota"
+    assert row["quota_source"] == "acp-prompt"
+    assert row["quota_reset_at"] is not None
+    assert row["lease_owner"] == owner
+
+
+def test_item230_work_marker_without_reset_parks_default_window(env, capsys, monkeypatch):
+    """GWT-230-6: a marker without a reset parks for the bounded
+    default window - the pool is dry either way."""
+
+    class BareLimitClient(_OkClient):
+        def prompt(self, sid, text, timeout=None):
+            raise AcpError(
+                "session/prompt: Reached free model rate limit.",
+                kind="rpc_error",
+            )
+
+    env.devin[SID] = {"working_directory": "/repo"}
+    tid = _task(env)
+    owner = _claim_acp(env, tid)
+    monkeypatch.setattr(dispatch, "AcpClient", BareLimitClient)
+    before = int(time.time())
+    rc, out = _run(["_work", str(tid), "--owner", owner, "--json"], capsys)
+    assert rc == ExitCode.OK
+    resp = JsonResponse.model_validate(out)
+    assert resp.data["quota"]["default_window"] is True
+    row = db.get_task(tid, path=env.db)
+    assert row["step_state"] == "waiting_quota"
+    assert before + 900 - 2 <= row["quota_reset_at"] <= before + 900 + 2
+
+
 # --- inspect ----------------------------------------------------------------------
 
 

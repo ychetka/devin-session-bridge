@@ -48,6 +48,7 @@ import threading
 import time
 
 from session_bridge.mailbox import mailbox_dir, write_message
+from session_bridge.quota import DEFAULT_PARK_SECONDS, parse_quota_signal
 from session_bridge.state import db
 from session_bridge.state.contract import (
     WAKE_UNCONFIRMED_ESCALATE_STREAK,
@@ -705,6 +706,48 @@ def _wake_candidates(db_path, now: int, queue_dir=None, pending=None):
         con.close()
 
 
+def _wake_quota_park(db_path, state_directory, sid, exc, now: int) -> bool:
+    """Park ``sid``'s live task when a wake's rpc_error text carries a
+    provider quota signal (task #230).
+
+    The drain prompt hits the same exhausted pool the worker's prompt
+    did - the marker arrives as rpc_error free text ("Reached free
+    model rate limit ... reset in 58 minutes (at 22:01 UTC)"), so the
+    wake pass is the first place that can turn it into a park instead
+    of burning the retry streak on a dead pool. A marker without a
+    reset parks for the bounded ``DEFAULT_PARK_SECONDS`` window - the
+    quota pass re-probes at its end. Returns True only when the park
+    CAS landed; a signal with no live task is journaled as
+    ``quota_signal_seen`` and ordinary rpc_error bookkeeping applies.
+    """
+    signal = parse_quota_signal(str(exc))
+    if signal is None:
+        return False
+    task = db.get_live_task(sid, path=db_path)
+    if task is None:
+        _decision(
+            state_directory,
+            "quota_signal_seen",
+            sid,
+            f"no live task - {str(exc)[:200]}",
+        )
+        return False
+    reset_at = signal["reset_at"]
+    note = str(exc)[:500]
+    if reset_at is None:
+        reset_at = now + DEFAULT_PARK_SECONDS
+        note = f"marker without reset - default window: {note[:460]}"
+    if not db.quota_park(task["id"], sid, reset_at, note, source="wake", path=db_path):
+        return False
+    _decision(
+        state_directory,
+        "quota_park",
+        sid,
+        f"task={task['id']} reset_at={reset_at} source=wake",
+    )
+    return True
+
+
 def _wake_pass(
     db_path,
     state_directory,
@@ -766,6 +809,15 @@ def _wake_pass(
         try:
             outcome = wake_session(sid, row["cwd"], lock_data=lock_data)
         except WakeError as e:
+            if e.reason == "rpc_error" and _wake_quota_park(db_path, state_directory, sid, e, now):
+                # provider quota surfaced through the drain prompt
+                # (task #230): the live task is parked until reset -
+                # the host is fine and the session provably answered
+                # post-list, so both bookkeeping lines mark success
+                policy.record_result(host_key, True)
+                policy.record_session_seen(sid)
+                db.record_wake_outcome(sid, "quota_park", path=db_path)
+                continue
             if e.reason in _SESSION_LEVEL_REASONS:
                 # attach+list worked - the host is healthy even
                 # though this session could not be woken

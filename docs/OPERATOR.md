@@ -168,7 +168,15 @@ Storage layout (state dir = the directory holding `state.db`, default
    notice` body carries explicit rate-limit text plus a parseable
    reset time - `rpc_error`, `busy`, `timeout` and `lease expired`
    never park (there is no structured ACP quota error code today,
-   so the auto channel is a conservative text parser). `bridge
+   so the auto channel is a conservative text parser). Transport
+   surfaces park the same way (task #230): a wake or dispatch-prompt
+   `rpc_error` whose body carries the marker parks the session's
+   live task instead of streaking retries into the exhausted pool or
+   failing the task - sources `wake`/`acp-<phase>`; a transport
+   marker without a reset parks for a bounded default window (900s),
+   unlike a self-report which needs the reset to park at all. A quota
+   signal on a session with no live task journals `quota_signal_seen`
+   and falls through to ordinary `rpc_error` handling. `bridge
    inspect` shows `step_state`/`quota_reset_at`/metadata; `bridge
    status` reads the session `quota` in STATE/TSTAT and exposes the
    reset in the JSON fleet rows.
