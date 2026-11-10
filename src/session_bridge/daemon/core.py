@@ -408,7 +408,7 @@ def _schedule_pass(db_path, state_directory, now: int) -> None:
         )
 
 
-def _control_stale_reason(sid, nid, issued_at, now: int, *, db_path=None) -> str | None:
+def _control_stale_reason(sid, nid, issued_at, now: int, *, db_path=None, con=None) -> str | None:
     """Why a control delivery must be dropped, or ``None``.
 
     Two staleness signals (issue #119): supersession - a newer
@@ -416,11 +416,14 @@ def _control_stale_reason(sid, nid, issued_at, now: int, *, db_path=None) -> str
     moved past this command) - and age - the delivery is older than
     ``_CONTROL_TTL_SECONDS``. ``issued_at`` is the notification's
     ``created_at`` when the row is known, otherwise the file's own
-    timestamp.
+    timestamp. ``nid=None`` skips the supersession leg - an
+    unverifiable file id must not borrow another row's epoch.
+    ``con`` reuses a caller-held connection for the epoch lookup.
     """
-    latest = db.latest_control_notification_id(sid, path=db_path)
-    if latest and nid is not None and nid < latest:
-        return f"superseded_by={latest}"
+    if nid is not None:
+        latest = db.latest_control_notification_id(sid, path=db_path, con=con)
+        if latest and nid < latest:
+            return f"superseded_by={latest}"
     if issued_at is not None and now - issued_at > _CONTROL_TTL_SECONDS:
         return f"stale age={now - issued_at}s ttl={_CONTROL_TTL_SECONDS}"
     return None
@@ -507,6 +510,7 @@ def _stale_control_pass(db_path, queue_dir, state_directory, now: int) -> None:
                     continue
                 nid = _msg_nid(name)
                 sid = dirname  # mailbox dirs are named by sanitized sid
+                verified_nid = None
                 issued_at = None
                 if nid is not None and headers.get("notification_id") == str(nid):
                     row = con.execute(
@@ -516,16 +520,20 @@ def _stale_control_pass(db_path, queue_dir, state_directory, now: int) -> None:
                     if row is not None:
                         sid = row["session_id"]
                         issued_at = row["created_at"]
+                        verified_nid = nid
+                try:
+                    mtime = int(os.path.getmtime(path))
+                except OSError:
+                    continue  # vanished mid-scan - already consumed
                 if issued_at is None:
+                    # unverified file: its self-claimed issued_at header
+                    # cannot push the TTL out past the real file age -
+                    # clamp to the older of the two (review MINOR)
                     iat = headers.get("issued_at", "")
-                    if iat.isdigit():
-                        issued_at = int(iat)
-                if issued_at is None:
-                    try:
-                        issued_at = int(os.path.getmtime(path))
-                    except OSError:
-                        continue  # vanished mid-scan - already consumed
-                reason = _control_stale_reason(sid, nid, issued_at, now, db_path=db_path)
+                    issued_at = min(int(iat), mtime) if iat.isdigit() else mtime
+                reason = _control_stale_reason(
+                    sid, verified_nid, issued_at, now, db_path=db_path, con=con
+                )
                 if reason is None:
                     continue
                 try:

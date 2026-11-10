@@ -981,11 +981,13 @@ def test_item13c_disarm_clears_mode_and_notifies(env, capsys):
     assert out["status"] == SessionMode.UNMANAGED.value
     assert out["data"]["disarmed"] == [SID]
     assert db.get_session(SID, path=env.db)["mode"] == SessionMode.UNMANAGED.value
-    # a DISARM outbox row tells the live watcher to exit
-    rows = db.unrelayed_notifications(SID, path=env.db)
-    assert len(rows) == 1
-    assert rows[0]["kind"] == NotificationKind.DISARM.value
-    assert rows[0]["relayed_at"] is None
+    # no daemon runs in tests: the command relays the DISARM row
+    # synchronously (issue #119) - the mailbox file tells the live
+    # watcher to exit
+    assert db.unrelayed_notifications(SID, path=env.db) == []
+    files = list((Path(env.qdir) / SID).glob("msg_*.txt"))
+    assert len(files) == 1
+    assert "kind: disarm" in files[0].read_text()
 
 
 def test_item13c_gwt3_disarm_all_disarms_every_managed(env, capsys):
@@ -998,10 +1000,14 @@ def test_item13c_gwt3_disarm_all_disarms_every_managed(env, capsys):
     for sid in ("m1", "m2"):
         row = db.get_session(sid, path=env.db)
         assert row["mode"] == SessionMode.UNMANAGED.value
-        rows = db.unrelayed_notifications(sid, path=env.db)
-        assert [r["kind"] for r in rows] == [NotificationKind.DISARM.value]
+        # daemon-down disarm relays synchronously (issue #119)
+        assert db.unrelayed_notifications(sid, path=env.db) == []
+        files = list((Path(env.qdir) / sid).glob("msg_*.txt"))
+        assert len(files) == 1
+        assert "kind: disarm" in files[0].read_text()
     # the unmanaged session got no DISARM notice
     assert db.unrelayed_notifications("w1", path=env.db) == []
+    assert not (Path(env.qdir) / "w1").exists()
 
 
 def test_item13c_disarm_all_empty_fleet(env, capsys):
@@ -3566,3 +3572,45 @@ def test_item230_work_park_cas_lost_falls_through(env, capsys, monkeypatch):
     assert row["status"] == TaskStatus.FAILED.value
     events = [e["kind"] for e in db.list_events(session_id=SID, path=env.db)]
     assert "quota_park_lost" in events
+
+
+def test_issue119_gwt9_resume_daemon_down_relays_and_prunes(env, capsys):
+    """GWT-119-9 (review r1): with no daemon running, `bridge resume`
+    materializes the RESUME file synchronously AND prunes the stale
+    HALT file it supersedes - a drain during the outage must not meet
+    a dead epoch (the daemon-resident janitor cannot run)."""
+    _managed(env)
+    db.set_session_halted(SID, True, path=env.db)
+    halt_nid = db.notify(SID, NotificationKind.HALT, "stop", path=env.db)
+    row = dict(_one(env.db, "SELECT * FROM notifications WHERE id=?", (halt_nid,)))
+    db.mark_relayed(halt_nid, path=env.db)
+    mdir = Path(env.qdir) / SID
+    mdir.mkdir(parents=True)
+    stale = mdir / f"msg_{halt_nid}.txt"
+    stale.write_text(daemon.relay_payload(row))
+
+    rc, out = _run(["resume", SID, "--json"], capsys)
+
+    assert rc == ExitCode.OK
+    assert out["data"].get("relayed") is True
+    assert not stale.exists()
+    files = [f.name for f in mdir.glob("msg_*.txt")]
+    assert len(files) == 1
+    body = (mdir / files[0]).read_text()
+    assert "kind: resume" in body
+
+
+def test_issue119_gwt10_resume_daemon_up_skips_sync(env, capsys, monkeypatch):
+    """GWT-119-10 (review r1): with the daemon alive the command must
+    NOT run the synchronous relay - the loop owns delivery timing."""
+    _managed(env)
+    db.set_session_halted(SID, True, path=env.db)
+    monkeypatch.setattr(daemon, "daemon_running", lambda sdir: True)
+    calls = []
+    monkeypatch.setattr(daemon, "_relay_pass", lambda *a: calls.append(a) or {})
+
+    rc, out = _run(["resume", SID, "--json"], capsys)
+
+    assert rc == ExitCode.OK
+    assert "relayed" not in out["data"]
+    assert calls == []

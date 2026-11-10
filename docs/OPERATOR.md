@@ -445,11 +445,14 @@ Design answers (task #180):
   is dropped - the relay consumes stale outbox rows without writing
   a file and a janitor pass unlinks control files that went stale
   while sitting in the mailbox; every drop is journaled
-  `stale_control_dropped`. The durable `halted_at` flag is
-  unaffected: a dropped HALT file only loses the "stop mid-turn"
-  courtesy - claim refusal still enforces the halt. This closes the
-  incident shape where a HALT consumed ~24h late self-halted a
-  session the operator had already resumed.
+  `stale_control_dropped`. When the daemon is stopped, `halt`/
+  `resume`/`disarm` run the relay and janitor synchronously at
+  command time, so a drain during the outage meets the same mailbox
+  state (no stale file survives to execute). The durable `halted_at`
+  flag is unaffected: a dropped HALT file only loses the
+  "stop mid-turn" courtesy - claim refusal still enforces the halt.
+  This closes the incident shape where a HALT consumed ~24h late
+  self-halted a session the operator had already resumed.
 
 Post-halt assessment of the deferred urgent-interrupt /
 human-override items (task #198, v0.3.14):

@@ -99,11 +99,19 @@ def _cmd_disarm(args) -> int:
         # halted_at would still refuse its claims after a re-arm
         db.set_session_halted(sid, False, path=args.db)
         db.notify(sid, NotificationKind.DISARM, _DISARM_BODY, path=args.db)
+    data: dict = {"disarmed": sids}
+    # daemon-down delivery parity (issue #119): a stale control file
+    # must not outlive the fresh DISARM when no loop can prune it
+    try:
+        if _sync_control_delivery(args, _state_dir(args)):
+            data["relayed"] = True
+    except Exception as e:
+        data["relay_error"] = f"{type(e).__name__}: {e}"
     resp = JsonResponse(
         session=None if args.all else args.session_id,
         status=SessionMode.UNMANAGED.value,
         queue_depth=_queue_depth(args),
-        data={"disarmed": sids},
+        data=data,
     )
     if args.all:
         human = f"disarmed {len(sids)} managed session(s)"
@@ -387,6 +395,24 @@ def _halt_targets(args) -> tuple[list[str], int | None]:
     return [], rc
 
 
+def _sync_control_delivery(args, sdir: str) -> bool:
+    """Materialize control mail + prune stale files when the daemon
+    is down (issue #119 review): the staleness guard lives in the
+    daemon, so during an outage a session draining its mailbox would
+    still meet - and execute - a superseded control file. Running the
+    relay and janitor synchronously at command time keeps delivery
+    semantics identical with or without the loop: the fresh command
+    lands as a file and the stale one is unlinked in the same call.
+    Returns True when the synchronous legs ran (daemon absent).
+    """
+    if daemon.daemon_running(sdir):
+        return False
+    now = int(time.time())
+    daemon._relay_pass(args.db, _queue_dir(args), sdir, now)
+    daemon._stale_control_pass(args.db, _queue_dir(args), sdir, now)
+    return True
+
+
 def _mailbox_file_count(args, sid: str) -> int:
     """Unconsumed ``msg_*.txt`` files in the sid's mailbox - the
     "whose mail is undrained" column of the halt snapshot."""
@@ -481,14 +507,27 @@ def _cmd_halt(args) -> int:
             # write would kill the relay before the HALT rows ever
             # materialize as mailbox files - the woken sessions would
             # drain nothing and skip the save-state step. Relay them
-            # synchronously now that the lock is free.
+            # synchronously now that the lock is free. The janitor
+            # rides along (issue #119): a stale RESUME sitting in a
+            # mailbox must not survive the fresh HALT.
             try:
-                daemon._relay_pass(args.db, _queue_dir(args), sdir, int(time.time()))
+                now = int(time.time())
+                daemon._relay_pass(args.db, _queue_dir(args), sdir, now)
+                daemon._stale_control_pass(args.db, _queue_dir(args), sdir, now)
                 data["relayed"] = True
             except Exception as e:
                 # state is already safe (flag set + outbox rows exist);
                 # report instead of tracebacking past the JSON emit
                 data["relay_error"] = f"{type(e).__name__}: {e}"
+    else:
+        # same delivery guarantee without --stop-daemon (issue #119):
+        # with no loop running, materialize the HALT + drop stale
+        # control files now or a drain meets only the stale epoch
+        try:
+            if _sync_control_delivery(args, _state_dir(args)):
+                data["relayed"] = True
+        except Exception as e:
+            data["relay_error"] = f"{type(e).__name__}: {e}"
     resp = JsonResponse(status="ok", data=data)
     lines = [
         f"halt {r['session_id']}: {r['status']}"
@@ -516,7 +555,16 @@ def _cmd_resume(args) -> int:
     if rc is not None:
         return rc
     rows = [_halt_apply(args, sid, False) for sid in sids]
-    resp = JsonResponse(status="ok", data={"sessions": rows})
+    data: dict = {"sessions": rows}
+    # daemon-down delivery parity (issue #119): without a loop the
+    # RESUME row would sit in the outbox while a stale HALT file
+    # still waits to execute at the next drain - relay + prune now
+    try:
+        if _sync_control_delivery(args, _state_dir(args)):
+            data["relayed"] = True
+    except Exception as e:
+        data["relay_error"] = f"{type(e).__name__}: {e}"
+    resp = JsonResponse(status="ok", data=data)
     lines = [
         f"resume {r['session_id']}: {r['status']}"
         + (f" ({r['reason']})" if r.get("reason") else "")

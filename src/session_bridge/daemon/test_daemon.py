@@ -2811,3 +2811,50 @@ def test_item119_gwt8_foreign_control_file_ttl_only(env):
     os.utime(path, (old, old))
     daemon._stale_control_pass(env.db, env.qdir, env.sdir, int(time.time()))
     assert not os.path.exists(path)  # stale foreign file: dropped
+
+
+def test_item119_gwt9_unverified_file_skips_supersede(env):
+    """[ITEM-119.GWT-9] (review r1): a mailbox file whose
+    notification_id header does not resolve to a control row is
+    judged by age ONLY - a forged small id must not trigger the
+    supersession check against a real newer control row."""
+    # real control rows move the epoch past any small file id
+    n1 = db.notify(SID, NotificationKind.HALT, "stop", path=env.db)
+    n2 = db.notify(SID, NotificationKind.RESUME, "back", path=env.db)
+    db.mark_relayed(n1, path=env.db)
+    db.mark_relayed(n2, path=env.db)
+    # foreign file: small filename id + a header id that resolves to
+    # nothing - identity unverifiable, so supersession must not apply
+    # (the pre-fix code would drop it on basename id alone)
+    path = _foreign_msg(env, SID, nid=1, body="notification_id: 7777\nkind: halt\n\nstop")
+    daemon._stale_control_pass(env.db, env.qdir, env.sdir, int(time.time()))
+    # kept: identity unverifiable -> no epoch check, and the file is
+    # fresh (mtime ~ now); nothing may be journaled
+    assert os.path.exists(path)
+    assert not _one(
+        env.db,
+        "SELECT 1 FROM decision_events WHERE kind=?",
+        ("stale_control_dropped",),
+    )
+
+
+def test_item119_gwt10_unverified_header_future_clamped(env):
+    """[ITEM-119.GWT-10] (review r1): a self-claimed `issued_at` in
+    the future cannot extend the TTL - age is min(header, mtime)."""
+    now = int(time.time())
+    old = now - daemon._CONTROL_TTL_SECONDS - 10
+    path = _foreign_msg(
+        env,
+        SID,
+        nid=888888,
+        body=f"notification_id: 888888\nkind: halt\nissued_at: {now + 999999}\n\nx",
+    )
+    os.utime(path, (old, old))
+    daemon._stale_control_pass(env.db, env.qdir, env.sdir, now)
+    # mtime wins the clamp: stale despite the forged future header
+    assert not os.path.exists(path)
+    assert _one(
+        env.db,
+        "SELECT 1 FROM decision_events WHERE kind=?",
+        ("stale_control_dropped",),
+    )

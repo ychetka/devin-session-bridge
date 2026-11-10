@@ -3603,7 +3603,7 @@ CONTROL_KINDS: Final = (
 )
 
 
-def latest_control_notification_id(session_id: str, *, path=None) -> int:
+def latest_control_notification_id(session_id: str, *, path=None, con=None) -> int:
     """Control-channel epoch: MAX(id) over halt/resume/disarm rows.
 
     Every control command produces exactly one notification, so the
@@ -3612,17 +3612,20 @@ def latest_control_notification_id(session_id: str, *, path=None) -> int:
     id is superseded and must be dropped, not executed (issue #119:
     a HALT consumed 24h late self-halted a session the operator had
     already resumed). Returns 0 when the session has no control rows.
+    ``con`` reuses a caller-held connection (the daemon janitor scans
+    control files against one open handle).
     """
     kinds = ",".join("?" * len(CONTROL_KINDS))
-    con = connect(path)
+    sql = f"SELECT MAX(id) AS m FROM notifications WHERE session_id=? AND kind IN ({kinds})"
+    if con is not None:
+        row = con.execute(sql, (session_id, *CONTROL_KINDS)).fetchone()
+        return row["m"] or 0
+    own = connect(path)
     try:
-        row = con.execute(
-            f"SELECT MAX(id) AS m FROM notifications WHERE session_id=? AND kind IN ({kinds})",
-            (session_id, *CONTROL_KINDS),
-        ).fetchone()
+        row = own.execute(sql, (session_id, *CONTROL_KINDS)).fetchone()
         return row["m"] or 0
     finally:
-        con.close()
+        own.close()
 
 
 def unrelayed_notifications(session_id: str | None = None, *, path=None) -> list:

@@ -57,9 +57,11 @@ session, or older than `SB_CONTROL_TTL_S` (default 21600s). The drop
 applies at both relay (stale outbox row is marked relayed without a
 file) and at a janitor pass that unlinks stale control files already
 sitting in mailboxes; every drop is journaled as
-`stale_control_dropped`. The durable flag the command accompanied is
-unaffected - `halted_at` enforcement lives in the database, the file
-is only a courtesy signal.
+`stale_control_dropped`. When the daemon is not running, `bridge
+halt`/`resume`/`disarm` run the relay and janitor synchronously so a
+drain during the outage meets the same mailbox state. The durable
+flag the command accompanied is unaffected - `halted_at` enforcement
+lives in the database, the file is only a courtesy signal.
 
 #### Scenario: superseded halt never reaches the drain
 
