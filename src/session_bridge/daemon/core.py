@@ -716,9 +716,12 @@ def _wake_quota_park(db_path, state_directory, sid, exc, now: int) -> bool:
     wake pass is the first place that can turn it into a park instead
     of burning the retry streak on a dead pool. A marker without a
     reset parks for the bounded ``DEFAULT_PARK_SECONDS`` window - the
-    quota pass re-probes at its end. Returns True only when the park
-    CAS landed; a signal with no live task is journaled as
-    ``quota_signal_seen`` and ordinary rpc_error bookkeeping applies.
+    quota pass re-probes at its end. Returns True when the task is
+    parked after the call - by this park's CAS or by a fresher one
+    that won the race (``quota_park_yield``); a signal with no live
+    task journals ``quota_signal_seen``, and a CAS lost to a moved
+    task journals ``quota_park_lost`` - both then take the ordinary
+    rpc_error bookkeeping.
     """
     signal = parse_quota_signal(str(exc))
     if signal is None:
@@ -737,15 +740,43 @@ def _wake_quota_park(db_path, state_directory, sid, exc, now: int) -> bool:
     if reset_at is None:
         reset_at = now + DEFAULT_PARK_SECONDS
         note = f"marker without reset - default window: {note[:460]}"
-    if not db.quota_park(task["id"], sid, reset_at, note, source="wake", path=db_path):
-        return False
+    if db.quota_park(
+        task["id"], sid, reset_at, note, source="wake", require_unparked=True, path=db_path
+    ):
+        _decision(
+            state_directory,
+            "quota_park",
+            sid,
+            f"task={task['id']} reset_at={reset_at} source=wake",
+        )
+        return True
+    # CAS lost: a fresher park may have landed mid-wake - that window
+    # is authoritative, so the net effect is still "parked". Anything
+    # else (finished/requeued) journals the lost park and falls back
+    # to ordinary rpc_error bookkeeping.
+    row = db.get_task(task["id"], path=db_path)
+    if row is not None and row["step_state"] == "waiting_quota":
+        _decision(
+            state_directory,
+            "quota_park_yield",
+            sid,
+            f"task={task['id']} fresher park already in place",
+        )
+        return True
     _decision(
         state_directory,
-        "quota_park",
+        "quota_park_lost",
         sid,
-        f"task={task['id']} reset_at={reset_at} source=wake",
+        f"task={task['id']} moved on before the park CAS landed",
     )
-    return True
+    db.record_event(
+        sid,
+        "quota_park_lost",
+        f"task={task['id']} wake-surfaced park lost its CAS",
+        task_id=task["id"],
+        path=db_path,
+    )
+    return False
 
 
 def _wake_pass(

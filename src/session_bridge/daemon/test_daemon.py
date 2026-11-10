@@ -2488,3 +2488,43 @@ def test_quota_wake_signal_without_live_task_journals_only(env, monkeypatch):
     assert _one(env.db, "SELECT count(*) AS c FROM tasks")["c"] == 0
     assert any(d["event"] == "quota_signal_seen" for d in _decisions(env))
     assert any(d["event"] == "wake_failed" for d in _decisions(env))
+
+
+def test_quota_wake_yield_to_fresher_park(env, monkeypatch):
+    """GWT-230-5 (review r1): the wake-surfaced park CASes on
+    ``step_state IS NULL`` - a fresher park (manual/self-report)
+    already in place wins, and the yield is journaled."""
+    _managed_with_mail(env)
+    tid = _parked_task(env, reset_in=7200)  # fresher park owns the window
+
+    exc = daemon.WakeError("rpc_error", f"session/prompt: {_RATE_LIMIT_BODY}")
+    now = int(time.time())
+    assert daemon._wake_quota_park(env.db, env.sdir, SID, exc, now) is True
+
+    row = db.get_task(tid, path=env.db)
+    assert row["step_state"] == "waiting_quota"
+    assert row["quota_source"] == "manual"  # not overwritten to "wake"
+    assert row["quota_reset_at"] > now + 3600  # fresher window kept
+    assert any(d["event"] == "quota_park_yield" for d in _decisions(env))
+
+
+def test_quota_wake_park_lost_journaled(env, monkeypatch):
+    """GWT-230-6 (review r1): a park CAS lost to a moved task is not
+    silent - quota_park_lost lands durably like quota_probe_defer_lost."""
+    _managed_with_mail(env)
+    tid = _live_task(env)
+    # task finishes between the live-task read and the park CAS
+    orig_park = db.quota_park
+
+    def racing_park(*a, **k):
+        _exec(env.db, "UPDATE tasks SET status='done' WHERE id=?", (tid,))
+        return orig_park(*a, **k)
+
+    monkeypatch.setattr(daemon.db, "quota_park", racing_park)
+    exc = daemon.WakeError("rpc_error", f"session/prompt: {_RATE_LIMIT_BODY}")
+    assert daemon._wake_quota_park(env.db, env.sdir, SID, exc, int(time.time())) is False
+
+    assert db.get_task(tid, path=env.db)["step_state"] is None
+    assert any(d["event"] == "quota_park_lost" for d in _decisions(env))
+    events = [e["kind"] for e in db.list_events(session_id=SID, path=env.db)]
+    assert "quota_park_lost" in events

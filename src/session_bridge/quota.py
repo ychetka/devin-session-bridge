@@ -29,12 +29,14 @@ _QUOTA_MARKER = re.compile(
 #   "reset in 58 minutes (at 22:01 UTC)" - provider gives both
 #   ISO stamps: "reset at 2026-11-09T12:51:00Z"
 _RESET_AT_CLOCK = re.compile(r"resets?\s+at\s+(\d{1,2}):(\d{2})\s*(?:utc|z)\b", re.IGNORECASE)
-# "reset in N <unit> (at HH:MM UTC)": the parenthesised absolute time
-# is the provider's canonical reset - it wins over the relative
-# window, which drifts when the text is parsed late (task #230: the
-# live free-tier incident error carries exactly this form).
+# "reset in N <unit> (at HH:MM UTC)" - the provider gives both windows
+# (task #230: the live free-tier incident error carries exactly this
+# form). The earlier bound wins: on fresh text they agree, and on
+# stale text the absolute clock rolling a spent HH:MM to tomorrow
+# would over-park ~23h where the relative window stays bounded.
 _RESET_IN_CLOCK = re.compile(
-    r"resets?\s+in\s+\d+\s*\w+\s*\(\s*at\s+(\d{1,2}):(\d{2})\s*(?:utc|z)\s*\)",
+    r"resets?\s+in\s+(\d+)\s*(seconds?|secs?|s|minutes?|mins?|m|hours?|hrs?|h)\b"
+    r"\s*\(\s*at\s+(\d{1,2}):(\d{2})\s*(?:utc|z)\s*\)",
     re.IGNORECASE,
 )
 _RESET_IN = re.compile(
@@ -93,9 +95,13 @@ def parse_reset_at(text: str, now: float | None = None) -> int | None:
             pass
     m = _RESET_IN_CLOCK.search(text)
     if m:
-        reset = _clock_reset(int(m.group(1)), int(m.group(2)), now)
-        if reset is not None:
-            return int(reset)
+        rel = int(m.group(1)) * _UNIT_SECONDS[m.group(2)[0].lower()]
+        clock = _clock_reset(int(m.group(3)), int(m.group(4)), now)
+        if clock is None:
+            # malformed parenthesised time ("at 25:61 UTC") - the
+            # relative window still gives a real bound
+            return int(now + rel) if rel <= _MAX_RELATIVE_SECONDS else None
+        return int(min(clock, now + rel))
     m = _RESET_AT_CLOCK.search(text)
     if m:
         reset = _clock_reset(int(m.group(1)), int(m.group(2)), now)

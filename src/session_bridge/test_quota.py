@@ -120,8 +120,15 @@ def test_relative_with_absolute_parenthetical_prefers_clock():
     )
     reset = parse_reset_at(text, now)
     assert reset == int(datetime(2026, 11, 9, 22, 1, tzinfo=timezone.utc).timestamp())
-    # past-clock rolls to the next day like the plain clock form
+    # stale text: the absolute clock would roll a spent reset to
+    # tomorrow (~23h over-park) - the earlier bound wins, so the
+    # relative window keeps the park bounded
     now_late = int(datetime(2026, 11, 9, 23, 30, tzinfo=timezone.utc).timestamp())
-    assert parse_reset_at(text, now_late) == int(
-        datetime(2026, 11, 10, 22, 1, tzinfo=timezone.utc).timestamp()
-    )
+    assert parse_reset_at(text, now_late) == now_late + 58 * 60
+
+
+def test_combined_form_malformed_clock_uses_relative():
+    """'reset in 10 minutes (at 25:61 UTC)' - the parenthesised clock
+    is malformed, but the relative window still gives a real bound."""
+    now = int(time.time())
+    assert parse_reset_at("rate limit, reset in 10 minutes (at 25:61 UTC)", now) == now + 600
