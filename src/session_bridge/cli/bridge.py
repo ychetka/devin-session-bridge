@@ -251,10 +251,15 @@ def _parse_args(argv) -> argparse.Namespace:
 
     # task #210: detach a session's live bridge state without
     # unregister's liveness refusals - demote live tasks, release
-    # leases, stop the heartbeat, mark the session dead
+    # leases, stop the heartbeat, mark the session dead.
+    # issue #113: a numeric positional addresses a task instead -
+    # operator force-fail of one live task
     sp = sub.add_parser(
         "kill",
-        help="force-terminate a session's live state (no liveness refusals)",
+        help=(
+            "force-terminate a session's live state, or force-fail one"
+            " live task when the argument is a numeric task id"
+        ),
     )
     sp.add_argument("session_id")
     _add_json(sp)

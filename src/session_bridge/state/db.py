@@ -80,6 +80,10 @@ from .verdict import (
     ReserveConflict,
     ReserveGranted,
     ReserveVerdict,
+    TaskKilled,
+    TaskKillNotFound,
+    TaskKillRefused,
+    TaskKillVerdict,
     UnregisterDeleted,
     UnregisterNotFound,
     UnregisterRefusedFreshHeartbeat,
@@ -2138,6 +2142,113 @@ def kill_session(session_id: str, *, path=None) -> KillVerdict:
         except BaseException:
             con.rollback()
             raise
+        finally:
+            con.close()
+
+    return _retry(op)
+
+
+def kill_task(task_id: int, note: str | None = None, *, path=None) -> TaskKillVerdict:
+    """Operator force-fail of one live task (issue #113).
+
+    The per-task counterpart of ``kill_session``: a wedged
+    ``running`` or ``dispatch_decided`` task folds straight to
+    ``failed`` ignoring ``lease_owner`` - the operator's verdict is
+    senior to the lease, and senior to ``waiting_quota`` too (the
+    step slot clears with the terminal write, like every other
+    terminal/requeue writer). ``queued`` rows never started and are
+    refused - a parked dispatch is cancelled by other means;
+    ``awaiting_user``, ``done`` and ``failed`` are refused the same
+    way (a second kill reports the current status instead of a
+    duplicate event - idempotent for audit as well as state).
+
+    The CAS, the note (``requeue_dead_worker``-style dirty-tree
+    instruction for the owning worker), the durable ``task_killed``
+    ``decision_events`` row AND the NOTICE outbox row for the owning
+    session (when registered and active) all land inside one
+    ``BEGIN IMMEDIATE`` - neither the audit nor the worker's wake-up
+    can separate from the effect (review F2: a notice enqueued
+    post-commit could be lost on a crash with the kill already
+    committed and the retry refused).
+    """
+    ts = _now()
+    kill_note = note or (
+        "operator-kill: stash dirty state "
+        f"(git stash -u -m killed-work-backup-{task_id}) and reset - "
+        "the task was force-failed by the operator"
+    )
+
+    def op():
+        con = connect(path)
+        try:
+            con.execute("BEGIN IMMEDIATE")
+            try:
+                row = con.execute(
+                    "SELECT session_id, status FROM tasks WHERE id=?",
+                    (task_id,),
+                ).fetchone()
+                if row is None:
+                    con.rollback()
+                    return TaskKillNotFound()
+                status_before = row["status"]
+                cur = con.execute(
+                    "UPDATE tasks SET status=?, finished_at=?,"
+                    " lease_owner=NULL, lease_expires_at=NULL,"
+                    " lease_renewed_at=NULL,"
+                    " note=?, updated_at=?" + _STEP_CLEAR_SQL + " WHERE id=? AND status IN (?,?)",
+                    (
+                        TaskStatus.FAILED.value,
+                        ts,
+                        kill_note,
+                        ts,
+                        task_id,
+                        TaskStatus.RUNNING.value,
+                        TaskStatus.DISPATCH_DECIDED.value,
+                    ),
+                )
+                if cur.rowcount != 1:
+                    con.rollback()
+                    return TaskKillRefused(status=status_before)
+                con.execute(
+                    "INSERT INTO decision_events(session_id,kind,body,created_at) VALUES (?,?,?,?)",
+                    (
+                        row["session_id"],
+                        "task_killed",
+                        f"task_id={task_id} status_before={status_before}",
+                        ts,
+                    ),
+                )
+                notice_id = None
+                active = con.execute(
+                    "SELECT 1 FROM sessions WHERE session_id=? AND status='active'",
+                    (row["session_id"],),
+                ).fetchone()
+                if active:
+                    notice_id = con.execute(
+                        "INSERT INTO notifications"
+                        "(session_id,kind,body,task_id,question_id,created_at)"
+                        " VALUES(?,?,?,?,?,?)",
+                        (
+                            row["session_id"],
+                            NotificationKind.NOTICE.value,
+                            f"task {task_id} was force-failed by the operator"
+                            " (bridge kill): stash dirty state, stop working it,"
+                            " and move on - do not retry or finish it",
+                            task_id,
+                            None,
+                            ts,
+                        ),
+                    ).lastrowid
+                con.execute("COMMIT")
+                return TaskKilled(
+                    session_id=row["session_id"],
+                    status_before=status_before,
+                    notice_id=notice_id,
+                )
+            except BaseException:
+                if con.in_transaction:
+                    con.execute("ROLLBACK")
+                raise
         finally:
             con.close()
 
