@@ -453,11 +453,17 @@ def _acp_failure(
             require_unparked=True,
             path=args.db,
         )
+        winner_reset = reset_at
+        winner_default = signal["reset_at"] is None
         if not parked:
             # CAS lost: a fresher park that won the race is
-            # authoritative - the task is parked either way
+            # authoritative - the task is parked either way, but the
+            # winner's own window is what the response must report
             row = db.get_task(task_id, path=args.db)
             parked = row is not None and row["step_state"] == "waiting_quota"
+            if parked:
+                winner_reset = row["quota_reset_at"]
+                winner_default = False
         if parked:
             return JsonResponse(
                 session=sid,
@@ -465,14 +471,21 @@ def _acp_failure(
                 data={
                     "quota": {
                         "parked": True,
-                        "reset_at": reset_at,
-                        "default_window": signal["reset_at"] is None,
+                        "reset_at": winner_reset,
+                        "default_window": winner_default,
                     }
                 },
                 agent_instruction=(
                     "task parked as waiting_quota until the provider reset - do not retry manually"
                 ),
             )
+        db.record_event(
+            sid,
+            "quota_park_lost",
+            f"task={task_id} acp-{phase} park lost its CAS - fell through to by-cause handling",
+            task_id=task_id,
+            path=args.db,
+        )
         # task moved on mid-failure - fall through to the ordinary
         # by-cause handling
     if bool(getattr(exc, "retryable", False)) and not (phase == "prompt" and kind == "timeout"):
