@@ -533,9 +533,12 @@ def _cmd_kill(args) -> int:
     A purely numeric positional addresses a task; anything else is a
     session id (sids are generated word-word names, never numeric).
     ``isascii`` joins ``isdigit`` because unicode digits like '²'
-    pass isdigit yet explode in ``int()`` (review F1).
+    pass isdigit yet explode in ``int()`` (review F1), and values
+    past int64 would raise OverflowError at the SQLite bind, so
+    oversized numerics short-circuit to a session not_found instead
+    of a traceback (review r2 F1).
     """
-    if args.session_id.isascii() and args.session_id.isdigit():
+    if args.session_id.isascii() and args.session_id.isdigit() and int(args.session_id) < 2**63:
         return _cmd_kill_task(args)
     return _cmd_kill_session(args)
 
