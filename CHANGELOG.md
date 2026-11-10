@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.10.3] - 2026-11-10
+
+### User-facing
+
+_No user-visible changes._
+
+### Codebase
+
+#### tooling
+- [chore] Updates the canonical `code_writer` agent profile to v2 with evidence-based gates (PR #132) and bumps the package to 0.10.3 so the merged head can tag. Why: PR #132 merged on version 0.10.2 which repo_release.sh correctly rejects as version_drift; the v2 profile tightens the writer-agent contract to evidence-based gates, so the release carries it as a chore entry. (issue #133, PR #132)
+
 ## [0.10.2] - 2026-11-10
 
 ### User-facing
