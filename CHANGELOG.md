@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.10.2] - 2026-11-10
+
+### User-facing
+
+_No user-visible changes._
+
+### Codebase
+
+#### tooling
+- [chore] Adds the canonical `code_writer` agent profile under `.devin/agents/` (PR #128) and bumps the package to 0.10.2 so the merged head can tag. Why: PR #128 merged on version 0.10.1 which repo_release.sh correctly rejects as version_drift; the profile documents the repo's writer-agent contract, so the release carries it as a chore entry. (issue #129, PR #128)
+
 ## [0.10.1] - 2026-11-10
 
 ### User-facing
