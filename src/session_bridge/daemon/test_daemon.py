@@ -2872,8 +2872,13 @@ def test_item119_gwt11_giant_issued_at_header_no_crash(env):
         body=f"notification_id: 777777\nkind: halt\nissued_at: {'9' * 5000}\n\nx",
     )
     fresh = _foreign_msg(env, SID, nid=666666, body="notification_id: 666666\nkind: halt\n\nx")
+    # non-ascii digit: str.isdigit() accepts '²' but int() rejects it
+    uni = _foreign_msg(
+        env, SID, nid=555555, body="notification_id: 555555\nkind: halt\nissued_at: ²\n\nx"
+    )
     daemon._stale_control_pass(env.db, env.qdir, env.sdir, now)
-    # giant header ignored -> fresh mtime -> kept; scan still ran
-    # (the second file was evaluated too, not skipped by a crash)
+    # forged headers ignored -> fresh mtime -> kept; scan still ran
+    # (the other files were evaluated too, not skipped by a crash)
     assert os.path.exists(path)
     assert os.path.exists(fresh)
+    assert os.path.exists(uni)

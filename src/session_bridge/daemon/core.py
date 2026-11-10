@@ -529,11 +529,15 @@ def _stale_control_pass(db_path, queue_dir, state_directory, now: int) -> None:
                     # unverified file: its self-claimed issued_at header
                     # cannot push the TTL out past the real file age -
                     # clamp to the older of the two (review MINOR).
-                    # digit-length bound before int(): a >4300-digit
-                    # header would raise ValueError under the Python
-                    # 3.11 int limit and kill the whole pass leg
+                    # ascii+digit-length bound before int(): a
+                    # >4300-digit or non-ascii-digit header would
+                    # raise ValueError and kill the whole pass leg
                     iat = headers.get("issued_at", "")
-                    issued_at = min(int(iat), mtime) if iat.isdigit() and len(iat) <= 19 else mtime
+                    issued_at = (
+                        min(int(iat), mtime)
+                        if iat.isascii() and iat.isdigit() and len(iat) <= 19
+                        else mtime
+                    )
                 reason = _control_stale_reason(
                     sid, verified_nid, issued_at, now, db_path=db_path, con=con
                 )
