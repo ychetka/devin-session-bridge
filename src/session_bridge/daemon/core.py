@@ -59,6 +59,7 @@ from session_bridge.state.contract import (
     SessionStatus,
     TaskStatus,
 )
+from session_bridge.state.verdict import SessionRevived
 from session_bridge.wake import (
     SESSION_ABSENT,
     WakeError,
@@ -488,12 +489,9 @@ def mark_dead(row, db_path, state_directory, notify_send, now: int, *, tag: str 
                 "sessions-bridge ORCHESTRATOR DEAD",
                 f"{sid}: heartbeat silent {age}s (limit {limit}s)",
             )
-            _decision(
-                state_directory,
-                "orchestrator_dead",
-                sid,
-                f"{tag}heartbeat_age={age}s{marker} notify-send sent",
-            )
+            detail = f"{tag}heartbeat_age={age}s{marker} notify-send sent"
+            _decision(state_directory, "orchestrator_dead", sid, detail)
+            db.record_event(sid, "orchestrator_dead", detail, path=db_path)
         return
     if not db.set_session_status(sid, SessionStatus.DEAD, path=db_path):
         return  # already dead or raced - handled before
@@ -502,12 +500,9 @@ def mark_dead(row, db_path, state_directory, notify_send, now: int, *, tag: str 
     if task is not None:
         result = db.requeue_dead_worker(task["id"], note=requeue_note(task["id"]), path=db_path)
         outcome = f"task={task['id']} -> {result.value if result is not None else 'unchanged'}"
-    _decision(
-        state_directory,
-        "worker_dead",
-        sid,
-        f"{tag}heartbeat_age={age}s{marker} {outcome}",
-    )
+    detail = f"{tag}heartbeat_age={age}s{marker} {outcome}"
+    _decision(state_directory, "worker_dead", sid, detail)
+    db.record_event(sid, "worker_dead", detail, path=db_path)
 
 
 def _sweep_pass(db_path, state_directory, notify_send, now: int) -> None:
@@ -779,6 +774,112 @@ def _wake_quota_park(db_path, state_directory, sid, exc, now: int) -> bool:
     return False
 
 
+def _dead_pending_sids(db_path, queue_dir) -> list:
+    """Dead managed sessions that still have actionable mail on disk.
+
+    The file-pending leg scans active sessions only - a dead sid is
+    deliberately never a wake candidate. Pending mail for a dead sid
+    is the demand signal that tells the resurrect probe the bus wants
+    that session back (issue #115).
+    """
+    con = db.connect(db_path)
+    try:
+        sids = [
+            r["session_id"]
+            for r in con.execute(
+                "SELECT session_id FROM sessions WHERE COALESCE(mode,?)=? AND status=?",
+                (
+                    SessionMode.UNMANAGED.value,
+                    SessionMode.MANAGED.value,
+                    SessionStatus.DEAD.value,
+                ),
+            ).fetchall()
+        ]
+    finally:
+        con.close()
+    return [s for s in sids if _dir_pending(db_path, queue_dir, s) is not None]
+
+
+def _resurrect_pass(db_path, state_directory, queue_dir, dead_pending, policy, notify=None) -> None:
+    """Presence check -> revive for dead managed sessions with mail.
+
+    The ``orchestrator_dead`` auto-recovery gap (issue #115): a
+    dead-flagged managed session that comes back (tab reopened, agent
+    restarted) used to stay dead until a manual re-register - dead
+    sids are excluded from every wake leg, so nothing ever looked.
+    While files sit in its mailbox the session gets one batched
+    session/list presence check on the same ``verify_sessions``
+    infrastructure the probe leg uses; a sid reported present is
+    CAS-revived with a durable ``session_revived`` row and re-enters
+    ordinary wake candidacy in the same pass (``clear_cooldown`` -
+    the probe attempt must not push its drain prompt a window out).
+
+    Operator intent wins: ``db.dead_revivable_managed`` pre-filters
+    to sids whose latest dead-causing marker is a liveness verdict,
+    and ``revive_dead_managed`` re-checks that marker inside its own
+    transaction - ``bridge kill <sid>`` never undoes itself. Absent
+    sids keep the armed cooldown, which paces the next probe instead
+    of spending an RPC per pass on a gone session's undrainable mail.
+    """
+    if not dead_pending:
+        return []
+    revivable = sorted(db.dead_revivable_managed(dead_pending, path=db_path))
+    if not revivable:
+        return []
+    lock_data = find_lockfile()
+    if lock_data is None:
+        return []
+    host_key = lock_data["_path"]
+    due = [sid for sid in revivable if policy.check(sid, host_key) is None]
+    if not due:
+        return []
+    for sid in due:
+        policy.record_attempt(sid)
+    try:
+        statuses = verify_sessions(due, lock_data=lock_data)
+    except WakeError as e:
+        opened = policy.record_result(host_key, False)
+        _decision(
+            state_directory,
+            "resurrect_probe_failed",
+            detail=f"sessions={len(due)} reason={e.reason} {e}",
+        )
+        if opened:
+            _decision(
+                state_directory,
+                "wake_breaker_open",
+                detail=f"host={host_key} suspended",
+            )
+        return []
+    policy.record_result(host_key, True)
+    revived = []
+    for sid in due:
+        if statuses.get(sid, SESSION_ABSENT) == SESSION_ABSENT:
+            _decision(state_directory, "resurrect_absent", sid)
+            continue
+        policy.record_session_seen(sid)
+        verdict = db.revive_dead_managed(sid, path=db_path)
+        if isinstance(verdict, SessionRevived):
+            policy.clear_cooldown(sid)
+            revived.append(sid)
+            _decision(state_directory, "session_revived", sid, f"marker={verdict.marker}")
+            if notify is not None:
+                row = db.get_session(sid, path=db_path)
+                if row is not None and row["role"] == SessionRole.ORCHESTRATOR.value:
+                    notify(
+                        "sessions-bridge ORCHESTRATOR REVIVED",
+                        f"{sid}: present in session/list again - latch cleared",
+                    )
+        else:
+            _decision(
+                state_directory,
+                "resurrect_refused",
+                sid,
+                f"reason={getattr(verdict, 'reason', verdict.kind)}",
+            )
+    return revived
+
+
 def _wake_pass(
     db_path,
     state_directory,
@@ -812,6 +913,25 @@ def _wake_pass(
     while an empty mailbox provably never wakes.
     """
     deadline = time.monotonic() + _WAKE_PASS_DEADLINE_SECONDS
+    # Resurrect leg (issue #115) runs BEFORE candidate selection so a
+    # revived sid qualifies through the ordinary file-pending leg in
+    # the same pass. The caller's ``pending`` scan is active-only, so
+    # a revived sid's mailbox entry is patched in here - otherwise the
+    # file leg cannot see it until the next pass.
+    revived = _resurrect_pass(
+        db_path,
+        state_directory,
+        queue_dir,
+        _dead_pending_sids(db_path, queue_dir),
+        policy,
+        notify,
+    )
+    if revived and pending is not None:
+        for sid in revived:
+            if sid not in pending:
+                r = _dir_pending(db_path, queue_dir, sid)
+                if r is not None:
+                    pending[sid] = r
     unverified: list[str] = []
     probes: list[str] = []
     for row in _wake_candidates(db_path, now, queue_dir, pending):
@@ -866,7 +986,7 @@ def _wake_pass(
             if e.reason == "no_session":
                 streak = policy.record_no_session(sid)
                 if streak >= _NO_SESSION_DEAD_STREAK:
-                    _mark_dead_no_session(db_path, state_directory, sid, streak)
+                    _mark_dead_no_session(db_path, state_directory, sid, streak, notify)
             _decision(state_directory, "wake_failed", sid, f"reason={e.reason} {e}")
             # a failed wake proves nothing either way - journal it
             # without touching the unconfirmed streak
@@ -899,13 +1019,13 @@ def _wake_pass(
         _decision(state_directory, "wake_sent", sid, f"outcome={outcome}")
 
     if probes:
-        _probe_pass(db_path, state_directory, probes, policy)
+        _probe_pass(db_path, state_directory, probes, policy, notify)
 
     if unverified:
         _verify_unconfirmed_wakes(db_path, state_directory, unverified, policy, notify)
 
 
-def _probe_pass(db_path, state_directory, sids, policy) -> None:
+def _probe_pass(db_path, state_directory, sids, policy, notify=None) -> None:
     """Batched session/list presence check for probe-only candidates.
 
     The liveness probe that the old task wake leg provided by side
@@ -960,7 +1080,7 @@ def _probe_pass(db_path, state_directory, sids, policy) -> None:
                 f"streak={streak}",
             )
             if streak >= _NO_SESSION_DEAD_STREAK:
-                _mark_dead_no_session(db_path, state_directory, sid, streak)
+                _mark_dead_no_session(db_path, state_directory, sid, streak, notify)
         else:
             policy.record_session_seen(sid)
             _decision(
@@ -1626,25 +1746,39 @@ def _mail_stall_pass(
     return max_age
 
 
-def _mark_dead_no_session(db_path, state_directory, sid, streak: int) -> None:
+def _mark_dead_no_session(db_path, state_directory, sid, streak: int, notify=None) -> None:
     """no_session streak reached the dead threshold.
 
     Absent from session/list over enough attempts = really gone
     (closed tab) - the managed dead path; kills its live task like
-    the unmanaged sweep does.
+    the unmanaged sweep does. An orchestrator gets the sweep path's
+    parity instead (issue #115): ``orchestrator_dead`` + notify-send,
+    no task requeue - its live row belongs to the orchestrator role,
+    not a reclaimable worker slot. Both branches dual-journal the
+    durable ``decision_events`` row the resurrect leg's marker check
+    reads (the jsonl decision log is not queryable).
     """
-    if db.set_session_status(sid, SessionStatus.DEAD, path=db_path):
-        task = db.get_live_task(sid, path=db_path)
-        outcome = "no live task"
-        if task is not None:
-            result = db.requeue_dead_worker(task["id"], note=requeue_note(task["id"]), path=db_path)
-            outcome = f"task={task['id']} -> {result.value if result else 'unchanged'}"
-        _decision(
-            state_directory,
-            "worker_dead",
-            sid,
-            f"reason=no_session_streak streak={streak} {outcome}",
-        )
+    if not db.set_session_status(sid, SessionStatus.DEAD, path=db_path):
+        return
+    row = db.get_session(sid, path=db_path)
+    if row is not None and row["role"] == SessionRole.ORCHESTRATOR.value:
+        if notify is not None:
+            notify(
+                "sessions-bridge ORCHESTRATOR DEAD",
+                f"{sid}: absent from session/list in {streak} consecutive probes",
+            )
+        detail = f"reason=no_session_streak streak={streak} notify-send sent"
+        _decision(state_directory, "orchestrator_dead", sid, detail)
+        db.record_event(sid, "orchestrator_dead", detail, path=db_path)
+        return
+    task = db.get_live_task(sid, path=db_path)
+    outcome = "no live task"
+    if task is not None:
+        result = db.requeue_dead_worker(task["id"], note=requeue_note(task["id"]), path=db_path)
+        outcome = f"task={task['id']} -> {result.value if result else 'unchanged'}"
+    detail = f"reason=no_session_streak streak={streak} {outcome}"
+    _decision(state_directory, "worker_dead", sid, detail)
+    db.record_event(sid, "worker_dead", detail, path=db_path)
 
 
 # A fresh-enough ack watermark proves the drain turn ran even when the
@@ -1701,7 +1835,7 @@ def _verify_unconfirmed_wakes(db_path, state_directory, sids, policy, notify) ->
             # dead tab counts toward dead-marking (item_21 review)
             ns_streak = policy.record_no_session(sid)
             if ns_streak >= _NO_SESSION_DEAD_STREAK:
-                _mark_dead_no_session(db_path, state_directory, sid, ns_streak)
+                _mark_dead_no_session(db_path, state_directory, sid, ns_streak, notify)
                 continue  # dead-marked - the unconfirmed bump is moot
         else:
             # listed (possibly statusless), or absent but provably

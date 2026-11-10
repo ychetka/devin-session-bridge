@@ -1074,8 +1074,11 @@ def test_item162_probe_attach_failure_leaves_streak(env, tmp_path, monkeypatch):
 
 
 def test_item17_dead_session_not_a_wake_candidate(env, tmp_path, monkeypatch):
-    """Once marked dead the session leaves the candidate set - no
-    repeated attaches or wake_failed spam while mail sits unacked."""
+    """Once marked dead the session leaves the WAKE candidate set - no
+    drain prompt or wake_failed spam while mail sits unacked. Since
+    issue #115 the resurrect leg may still spend a cooldown-paced
+    session/list presence probe on it (mail pending + liveness
+    marker): absent answers keep it dead, a prompt is never sent."""
     host = FakeAcpHost(sessions=[])
     _lockdir(tmp_path, host, monkeypatch)
     _session(env.db, SID, managed=True)
@@ -1087,10 +1090,13 @@ def test_item17_dead_session_not_a_wake_candidate(env, tmp_path, monkeypatch):
     for _ in range(3):
         daemon._wake_pass(env.db, env.sdir, int(time.time()), policy)
     assert db.get_session(SID, path=env.db)["status"] == "dead"
-    hellos_after_dead = len(host.hellos)
     for _ in range(3):
         daemon._wake_pass(env.db, env.sdir, int(time.time()), policy)
-    assert len(host.hellos) == hellos_after_dead  # no further attempts
+    # presence probes are fine (resurrect_absent journaled); a drain
+    # prompt to a dead session is not
+    assert "session/prompt" not in [m for m, _ in host.calls]
+    assert db.get_session(SID, path=env.db)["status"] == "dead"
+    assert any(d["event"] == "resurrect_absent" for d in _decisions(env))
 
 
 def test_item17_no_cwd_counts_as_seen_not_absent(env, tmp_path, monkeypatch):

@@ -2528,3 +2528,157 @@ def test_quota_wake_park_lost_journaled(env, monkeypatch):
     assert any(d["event"] == "quota_park_lost" for d in _decisions(env))
     events = [e["kind"] for e in db.list_events(session_id=SID, path=env.db)]
     assert "quota_park_lost" in events
+
+
+def _status(env, sid):
+    return _one(env.db, "SELECT status FROM sessions WHERE session_id=?", (sid,))["status"]
+
+
+# --- issue #115: dead managed resurrection leg -------------------------------
+
+
+def _dead_managed(env, sid=SID, marker="worker_dead"):
+    """Dead-flagged managed session with undrained mail on disk and a
+    dead-causing marker in the durable journal."""
+    _managed_stale(env, sid)
+    db.set_session_status(sid, "dead", path=env.db)
+    if marker is not None:
+        db.record_event(sid, marker, "reason=no_session_streak streak=3", path=env.db)
+    _undrained_mail(env, sid, NotificationKind.DIRECTIVE)
+
+
+def test_item115_gwt1_dead_managed_present_revives(env, monkeypatch):
+    """[ITEM-115.GWT-1] dead managed + pending mail + session/list
+    reports it -> CAS revive + session_revived journal + the ordinary
+    mail leg wakes it in the same pass."""
+    _dead_managed(env)
+    calls = _wake_calls(env, monkeypatch)
+    monkeypatch.setattr(daemon, "verify_sessions", lambda sids, **k: dict.fromkeys(sids, "idle"))
+
+    assert daemon.run(env.db, env.qdir, once=True, notify_send=env.notifier) == daemon.RUN_OK
+
+    assert _status(env, SID) == "active"
+    assert calls == [SID]
+    ev = _one(
+        env.db,
+        "SELECT body FROM decision_events WHERE session_id=? AND kind='session_revived'",
+        (SID,),
+    )
+    assert ev is not None and "worker_dead" in ev["body"]
+    assert any(d["event"] == "session_revived" and d["sid"] == SID for d in _decisions(env))
+
+
+def test_item115_gwt2_dead_absent_stays_dead(env, monkeypatch):
+    """[ITEM-115.GWT-2] same but session/list reports absent -> still
+    dead, no session_revived, no drain prompt."""
+    _dead_managed(env)
+    calls = _wake_calls(env, monkeypatch)  # verify_sessions stub -> {} = absent
+    assert daemon.run(env.db, env.qdir, once=True, notify_send=env.notifier) == daemon.RUN_OK
+    assert _status(env, SID) == "dead"
+    assert calls == []
+    assert not _one(
+        env.db,
+        "SELECT 1 FROM decision_events WHERE session_id=? AND kind='session_revived'",
+        (SID,),
+    )
+    assert any(d["event"] == "resurrect_absent" for d in _decisions(env))
+
+
+def test_item115_gwt3_operator_kill_never_probed(env, monkeypatch):
+    """[ITEM-115.GWT-3] session_killed marker + pending mail + present
+    -> stays dead, and the marker pre-filter never even spends a
+    presence probe on it."""
+    _dead_managed(env, marker="session_killed")
+    calls = _wake_calls(env, monkeypatch)
+    probed = []
+    monkeypatch.setattr(daemon, "verify_sessions", lambda sids, **k: probed.extend(sids) or {})
+    assert daemon.run(env.db, env.qdir, once=True, notify_send=env.notifier) == daemon.RUN_OK
+    assert SID not in probed
+    assert calls == []
+    assert _status(env, SID) == "dead"
+
+
+def test_item115_gwt4_unmanaged_dead_not_probed(env, monkeypatch):
+    """[ITEM-115.GWT-4] unmanaged dead sid with mail -> not revivable,
+    never probed (unmanaged revives through heartbeat, not the leg)."""
+    assert db.register(SID, "/repo/ws", path=env.db).accepted
+    db.set_session_status(SID, "dead", path=env.db)
+    db.record_event(SID, "worker_dead", "stale-hb", path=env.db)
+    _undrained_mail(env, SID, NotificationKind.DIRECTIVE)
+    calls = _wake_calls(env, monkeypatch)
+    probed = []
+    monkeypatch.setattr(daemon, "verify_sessions", lambda sids, **k: probed.extend(sids) or {})
+    assert daemon.run(env.db, env.qdir, once=True, notify_send=env.notifier) == daemon.RUN_OK
+    assert SID not in probed
+    assert calls == []
+    assert _status(env, SID) == "dead"
+
+
+def test_item115_absent_probe_is_cooldown_paced(env, monkeypatch):
+    """An absent dead sid keeps the armed cooldown - the undrainable
+    mail must not burn an RPC every pass."""
+    _dead_managed(env)
+    monkeypatch.setattr(daemon, "find_lockfile", lambda *a, **k: {"_path": "fake-host"})
+    probed = []
+    monkeypatch.setattr(daemon, "verify_sessions", lambda sids, **k: probed.extend(sids) or {})
+    policy = daemon.WakePolicy()
+    dead = [SID]
+    daemon._resurrect_pass(env.db, env.sdir, env.qdir, dead, policy)
+    assert probed == [SID]
+    daemon._resurrect_pass(env.db, env.sdir, env.qdir, dead, policy)
+    assert probed == [SID]  # cooldown armed - no second probe
+
+
+def test_item115_gwt5_orchestrator_no_session_parity(env):
+    """[ITEM-115.GWT-5] managed ORCHESTRATOR hits the dead streak ->
+    orchestrator_dead durable row + notify-send, no task requeue -
+    the sweep path's parity on the managed path."""
+    res = db.register("orc", "/repo/orc", role="orchestrator", path=env.db)
+    assert res.accepted
+    db.set_session_mode("orc", SessionMode.MANAGED, path=env.db)
+    tid = db.enqueue("orc", "work", path=env.db)
+    assert db.claim_managed(tid, "orc", "orc", path=env.db)
+
+    daemon._mark_dead_no_session(env.db, env.sdir, "orc", 3, env.notifier)
+
+    assert _one(env.db, "SELECT status FROM sessions WHERE session_id='orc'")["status"] == "dead"
+    assert env.sent and "ORCHESTRATOR DEAD" in env.sent[0][0]
+    assert _one(
+        env.db,
+        "SELECT 1 FROM decision_events WHERE session_id='orc' AND kind='orchestrator_dead'",
+    )
+    # orchestrator rows never requeue through the worker path
+    assert db.get_task(tid, path=env.db)["status"] == "running"
+
+
+def test_item115_worker_dead_dual_journals(env):
+    """The marker check the resurrect leg reads is durable: the
+    no_session dead path journals worker_dead into decision_events,
+    not only the jsonl log."""
+    _managed_stale(env)
+    tid = _running_task(env)
+    daemon._mark_dead_no_session(env.db, env.sdir, SID, 3, env.notifier)
+    assert _status(env, SID) == "dead"
+    ev = _one(
+        env.db,
+        "SELECT kind, body FROM decision_events WHERE session_id=? AND kind='worker_dead'",
+        (SID,),
+    )
+    assert ev is not None and f"task={tid}" in ev["body"]
+    assert db.get_task(tid, path=env.db)["status"] == "queued"  # requeued
+
+
+def test_item115_orchestrator_revive_notifies(env, monkeypatch):
+    """A revived orchestrator rings the OS bell the same way its dead
+    edge did - observability parity."""
+    res = db.register("orc", "/repo/orc", role="orchestrator", path=env.db)
+    assert res.accepted
+    db.set_session_mode("orc", SessionMode.MANAGED, path=env.db)
+    db.set_session_status("orc", "dead", path=env.db)
+    db.record_event("orc", "orchestrator_dead", "streak=3", path=env.db)
+    _undrained_mail(env, "orc", NotificationKind.DIRECTIVE)
+    _wake_calls(env, monkeypatch)
+    monkeypatch.setattr(daemon, "verify_sessions", lambda sids, **k: {"orc": "idle"})
+    assert daemon.run(env.db, env.qdir, once=True, notify_send=env.notifier) == daemon.RUN_OK
+    assert _one(env.db, "SELECT status FROM sessions WHERE session_id='orc'")["status"] == "active"
+    assert any("ORCHESTRATOR REVIVED" in t for t, _b in env.sent)

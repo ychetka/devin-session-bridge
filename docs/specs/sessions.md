@@ -40,6 +40,27 @@ to `queued` for re-claim - work survives the worker.
   `queued`, claimable by the next worker
 - **AND** a second kill of the same session is an idempotent no-op
 
+### Requirement: dead managed sessions revive on proven return
+
+A managed session marked dead SHALL self-recover when two signals
+coincide: pending mail exists in its mailbox (demand) AND a
+session/list presence check reports it back (proof). The revive is
+a CAS `dead > active` gated on the latest dead-causing decision
+marker being a liveness verdict (`worker_dead`/`orchestrator_dead`)
+- an operator `bridge kill <sid>` writes `session_killed` and is
+never auto-revived. Unmanaged rows keep the heartbeat revive path
+and are never probed; halted rows are never probed either.
+
+#### Scenario: resurrect probe revives on demand
+
+- **WHEN** a dead managed session has undrained `msg_*.txt` and
+  session/list reports it present
+- **THEN** the daemon flips it back to `active`, journals
+  `session_revived`, and the ordinary mail leg wakes it in the
+  same pass
+- **AND** a sid whose latest marker is `session_killed` stays dead
+  and is never probed
+
 ### Requirement: stale heartbeats mark sessions dead
 
 A session whose heartbeat falls silent past

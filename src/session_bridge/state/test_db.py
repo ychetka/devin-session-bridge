@@ -35,6 +35,9 @@ from session_bridge.state.verdict import (
     ReleaseRemoved,
     ReserveConflict,
     ReserveGranted,
+    ReviveNotFound,
+    ReviveRefused,
+    SessionRevived,
     TaskKilled,
     TaskKillNotFound,
     TaskKillRefused,
@@ -2819,3 +2822,90 @@ def test_lease_ttl_env_override():
     # and the no-env default is the contract's 1h regardless of the
     # ambient environment this suite was launched under
     assert resolved({}) == "3600"
+
+
+# --- issue #115: dead managed resurrection (revive verdicts) -----------------
+
+
+def _dead_managed(db_path, sid, marker="worker_dead"):
+    assert db.register(sid, "/repo/ws", path=db_path).accepted
+    db.set_session_mode(sid, SessionMode.MANAGED, path=db_path)
+    assert db.set_session_status(sid, SessionStatus.DEAD, path=db_path)
+    if marker is not None:
+        db.record_event(sid, marker, "streak=3", path=db_path)
+
+
+def test_issue115_revive_dead_managed_happy_path(db_path):
+    """dead+managed+liveness marker -> active, session_revived journaled."""
+    _dead_managed(db_path, "s1")
+    v = db.revive_dead_managed("s1", path=db_path)
+    assert isinstance(v, SessionRevived)
+    assert v.marker == "worker_dead"
+    assert db.get_session("s1", path=db_path)["status"] == SessionStatus.ACTIVE.value
+    events = [e["kind"] for e in db.list_events(session_id="s1", path=db_path)]
+    assert events == ["session_revived", "worker_dead"]
+
+
+def test_issue115_revive_refusals(db_path):
+    """not_found / not_dead / not_managed refuse without writes."""
+    assert isinstance(db.revive_dead_managed("ghost", path=db_path), ReviveNotFound)
+    assert db.register("s1", "/repo/ws", path=db_path).accepted
+    db.set_session_mode("s1", SessionMode.MANAGED, path=db_path)
+    v = db.revive_dead_managed("s1", path=db_path)
+    assert isinstance(v, ReviveRefused) and v.reason == "not_dead"
+    assert db.set_session_status("s1", SessionStatus.DEAD, path=db_path)
+    v = db.revive_dead_managed("s1", path=db_path)
+    # managed dead but NO marker -> conservative refuse
+    assert isinstance(v, ReviveRefused) and v.reason == "no_marker"
+    db.set_session_status("s1", SessionStatus.ACTIVE, path=db_path)
+    db.set_session_mode("s1", SessionMode.UNMANAGED, path=db_path)
+    db.set_session_status("s1", SessionStatus.DEAD, path=db_path)
+    db.record_event("s1", "worker_dead", "stale-hb", path=db_path)
+    v = db.revive_dead_managed("s1", path=db_path)
+    assert isinstance(v, ReviveRefused) and v.reason == "not_managed"
+
+
+def test_issue115_operator_kill_marker_wins(db_path):
+    """kill_session's session_killed supersedes an earlier liveness
+    marker - the resurrect leg must leave the row dead."""
+    _dead_managed(db_path, "s1")
+    v = db.kill_session("s1", path=db_path)
+    assert isinstance(v, Killed)
+    v = db.revive_dead_managed("s1", path=db_path)
+    assert isinstance(v, ReviveRefused) and v.reason == "operator_killed"
+    assert v.marker == "session_killed"
+    assert db.get_session("s1", path=db_path)["status"] == SessionStatus.DEAD.value
+    # revive->dead sequence without a fresh marker refuses too:
+    # an unjournaled dead write is operator-class, not liveness
+    _dead_managed(db_path, "s2")
+    assert isinstance(db.revive_dead_managed("s2", path=db_path), SessionRevived)
+    assert db.set_session_status("s2", SessionStatus.DEAD, path=db_path)
+    v = db.revive_dead_managed("s2", path=db_path)
+    assert isinstance(v, ReviveRefused) and v.reason == "unknown_marker"
+    assert v.marker == "session_revived"
+
+
+def test_issue115_revive_after_revive_cycle(db_path):
+    """revived -> dead again by liveness -> revivable once more."""
+    _dead_managed(db_path, "s1")
+    assert isinstance(db.revive_dead_managed("s1", path=db_path), SessionRevived)
+    db.set_session_status("s1", SessionStatus.DEAD, path=db_path)
+    db.record_event("s1", "worker_dead", "streak=3", path=db_path)
+    v = db.revive_dead_managed("s1", path=db_path)
+    assert isinstance(v, SessionRevived)
+
+
+def test_issue115_dead_revivable_managed_filter(db_path):
+    """Only dead+managed+liveness-marker sids pass the pre-filter."""
+    _dead_managed(db_path, "a")  # revivable
+    _dead_managed(db_path, "b", marker="session_killed")  # operator kill
+    _dead_managed(db_path, "c", marker=None)  # no marker
+    assert db.register("d", "/repo/d", path=db_path).accepted  # active
+    db.set_session_mode("d", SessionMode.MANAGED, path=db_path)
+    db.record_event("d", "worker_dead", "streak=3", path=db_path)
+    assert db.register("e", "/repo/e", path=db_path).accepted  # unmanaged dead
+    db.set_session_status("e", SessionStatus.DEAD, path=db_path)
+    db.record_event("e", "worker_dead", "stale-hb", path=db_path)
+    got = db.dead_revivable_managed(["a", "b", "c", "d", "e", "ghost"], path=db_path)
+    assert got == {"a"}
+    assert db.dead_revivable_managed([], path=db_path) == set()

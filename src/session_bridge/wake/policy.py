@@ -71,6 +71,15 @@ class WakePolicy:
         backoff = delay * (2 ** (streak - 1))
         self._next_allowed[session_id] = self._clock() + min(backoff, self._cooldown)
 
+    def clear_cooldown(self, session_id: str) -> None:
+        """Allow the very next wake for a session immediately.
+
+        The resurrect leg uses this after a revive: the presence probe
+        just armed the attempt cooldown, but a revived session should
+        reach its drain prompt in the same pass rather than waiting
+        out a window it never spent."""
+        self._next_allowed.pop(session_id, None)
+
     def record_confirmed(self, session_id: str) -> None:
         """Reset the unconfirmed streak after a fully confirmed wake.
 
