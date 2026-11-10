@@ -536,9 +536,16 @@ def _cmd_kill(args) -> int:
     pass isdigit yet explode in ``int()`` (review F1), and values
     past int64 would raise OverflowError at the SQLite bind, so
     oversized numerics short-circuit to a session not_found instead
-    of a traceback (review r2 F1).
+    of a traceback (review r2 F1). The 19-char bound runs first:
+    ``int()`` itself raises ValueError on digit strings past
+    ``sys.get_int_max_str_digits()`` (Python 3.11+).
     """
-    if args.session_id.isascii() and args.session_id.isdigit() and int(args.session_id) < 2**63:
+    if (
+        len(args.session_id) <= 19
+        and args.session_id.isascii()
+        and args.session_id.isdigit()
+        and int(args.session_id) < 2**63
+    ):
         return _cmd_kill_task(args)
     return _cmd_kill_session(args)
 

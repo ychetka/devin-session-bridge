@@ -2195,7 +2195,7 @@ def kill_task(task_id: int, note: str | None = None, *, path=None) -> TaskKillVe
                     "UPDATE tasks SET status=?, finished_at=?,"
                     " lease_owner=NULL, lease_expires_at=NULL,"
                     " lease_renewed_at=NULL,"
-                    " note=COALESCE(?,note), updated_at=?"
+                    " note=?, updated_at=?"
                     + _STEP_CLEAR_SQL
                     + " WHERE id=? AND status IN (?,?)",
                     (
