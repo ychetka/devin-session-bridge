@@ -2909,3 +2909,65 @@ def test_issue115_dead_revivable_managed_filter(db_path):
     got = db.dead_revivable_managed(["a", "b", "c", "d", "e", "ghost"], path=db_path)
     assert got == {"a"}
     assert db.dead_revivable_managed([], path=db_path) == set()
+
+
+def test_issue115_r1_kill_pins_dead_row_without_effects(db_path):
+    """issue #115 review: a zero-effect kill of an already-dead row
+    still writes session_killed - otherwise the row stays revivable
+    off its stale liveness marker. A second kill adds no duplicate."""
+    _dead_managed(db_path, "s")  # dead + worker_dead marker, revivable
+    assert "s" in db.dead_revivable_managed(["s"], path=db_path)
+
+    v = db.kill_session("s", path=db_path)
+    assert isinstance(v, Killed)
+    assert "s" not in db.dead_revivable_managed(["s"], path=db_path)
+    rv = db.revive_dead_managed("s", path=db_path)
+    assert isinstance(rv, ReviveRefused) and rv.reason == "operator_killed"
+
+    assert isinstance(db.kill_session("s", path=db_path), Killed)
+    evs = db.list_events(session_id="s", kind="session_killed", path=db_path)
+    assert len(evs) == 1
+
+
+def test_issue115_r1_mark_dead_atomic(db_path):
+    """mark_dead: CAS + task fold + liveness marker in one txn; the
+    body returned carries the requeue outcome; already-dead rows and
+    non-liveness kinds are refused."""
+    assert db.register("w", "/repo/w", path=db_path).accepted
+    tid = db.enqueue("w", "x", path=db_path)
+    assert db.claim_managed(tid, "w", "w", path=db_path)
+
+    body = db.mark_dead("w", "worker_dead", "stale-hb", task_id=tid, task_note="n", path=db_path)
+    assert body == f"stale-hb task={tid} -> queued"
+    con = db.connect(db_path)
+    try:
+        assert (
+            con.execute("SELECT status FROM sessions WHERE session_id='w'").fetchone()["status"]
+            == "dead"
+        )
+        ev = con.execute("SELECT kind, body FROM decision_events WHERE session_id='w'").fetchone()
+        assert ev["kind"] == "worker_dead" and "queued" in ev["body"]
+        assert (
+            con.execute("SELECT status FROM tasks WHERE id=?", (tid,)).fetchone()["status"]
+            == "queued"
+        )
+    finally:
+        con.close()
+
+    assert db.mark_dead("w", "worker_dead", "again", path=db_path) is None
+    with pytest.raises(ValueError, match="liveness"):
+        db.mark_dead("w", "session_killed", "no", path=db_path)
+
+
+def test_issue115_r1_kill_racing_flip_keeps_operator_marker(db_path):
+    """The old split-write race: kill commits session_killed between a
+    dead CAS and its marker -> the late worker_dead used to supersede
+    it. mark_dead's single transaction makes the ordering impossible:
+    a kill landing first leaves the CAS failing with no marker."""
+    assert db.register("w", "/repo/w", path=db_path).accepted
+    db.set_session_mode("w", SessionMode.MANAGED, path=db_path)
+    db.kill_session("w", path=db_path)  # kill lands first
+    assert db.mark_dead("w", "worker_dead", "streak=3", path=db_path) is None
+    kinds = [e["kind"] for e in db.list_events(session_id="w", path=db_path)]
+    assert kinds == ["session_killed"]
+    assert "w" not in db.dead_revivable_managed(["w"], path=db_path)

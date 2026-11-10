@@ -484,25 +484,33 @@ def mark_dead(row, db_path, state_directory, notify_send, now: int, *, tag: str 
         # documents the fold that unblocks this registration
         return
     if row["role"] == SessionRole.ORCHESTRATOR.value:
-        if db.set_session_status(sid, SessionStatus.DEAD, path=db_path):
-            notify_send(
-                "sessions-bridge ORCHESTRATOR DEAD",
-                f"{sid}: heartbeat silent {age}s (limit {limit}s)",
-            )
-            detail = f"{tag}heartbeat_age={age}s{marker} notify-send sent"
-            _decision(state_directory, "orchestrator_dead", sid, detail)
-            db.record_event(sid, "orchestrator_dead", detail, path=db_path)
+        body = db.mark_dead(
+            sid,
+            "orchestrator_dead",
+            f"{tag}heartbeat_age={age}s{marker} notify-send sent",
+            path=db_path,
+        )
+        if body is None:
+            return  # already dead or raced - handled before
+        notify_send(
+            "sessions-bridge ORCHESTRATOR DEAD",
+            f"{sid}: heartbeat silent {age}s (limit {limit}s)",
+        )
+        _decision(state_directory, "orchestrator_dead", sid, body)
         return
-    if not db.set_session_status(sid, SessionStatus.DEAD, path=db_path):
-        return  # already dead or raced - handled before
     task = db.get_live_task(sid, path=db_path)
-    outcome = "no live task"
-    if task is not None:
-        result = db.requeue_dead_worker(task["id"], note=requeue_note(task["id"]), path=db_path)
-        outcome = f"task={task['id']} -> {result.value if result is not None else 'unchanged'}"
-    detail = f"{tag}heartbeat_age={age}s{marker} {outcome}"
-    _decision(state_directory, "worker_dead", sid, detail)
-    db.record_event(sid, "worker_dead", detail, path=db_path)
+    head = f"{tag}heartbeat_age={age}s{marker}"
+    body = db.mark_dead(
+        sid,
+        "worker_dead",
+        head if task is not None else f"{head} no live task",
+        task_id=task["id"] if task is not None else None,
+        task_note=requeue_note(task["id"]) if task is not None else None,
+        path=db_path,
+    )
+    if body is None:
+        return  # already dead or raced - handled before
+    _decision(state_directory, "worker_dead", sid, body)
 
 
 def _sweep_pass(db_path, state_directory, notify_send, now: int) -> None:
@@ -800,7 +808,7 @@ def _dead_pending_sids(db_path, queue_dir) -> list:
     return [s for s in sids if _dir_pending(db_path, queue_dir, s) is not None]
 
 
-def _resurrect_pass(db_path, state_directory, queue_dir, dead_pending, policy, notify=None) -> None:
+def _resurrect_pass(db_path, state_directory, queue_dir, dead_pending, policy, notify=None) -> list:
     """Presence check -> revive for dead managed sessions with mail.
 
     The ``orchestrator_dead`` auto-recovery gap (issue #115): a
@@ -1756,29 +1764,43 @@ def _mark_dead_no_session(db_path, state_directory, sid, streak: int, notify=Non
     no task requeue - its live row belongs to the orchestrator role,
     not a reclaimable worker slot. Both branches dual-journal the
     durable ``decision_events`` row the resurrect leg's marker check
-    reads (the jsonl decision log is not queryable).
+    reads (the jsonl decision log is not queryable). The CAS, the
+    task fold and the marker all commit inside ``db.mark_dead``'s
+    single ``BEGIN IMMEDIATE`` - a ``bridge kill`` racing the edge
+    can no longer wedge ``session_killed`` between the flip and the
+    marker and lose to the late liveness verdict (issue #115 review).
     """
-    if not db.set_session_status(sid, SessionStatus.DEAD, path=db_path):
-        return
     row = db.get_session(sid, path=db_path)
     if row is not None and row["role"] == SessionRole.ORCHESTRATOR.value:
+        detail = f"reason=no_session_streak streak={streak}"
+        body = db.mark_dead(
+            sid,
+            "orchestrator_dead",
+            detail + (" notify-send sent" if notify is not None else ""),
+            path=db_path,
+        )
+        if body is None:
+            return  # already dead or raced - handled before
         if notify is not None:
             notify(
                 "sessions-bridge ORCHESTRATOR DEAD",
                 f"{sid}: absent from session/list in {streak} consecutive probes",
             )
-        detail = f"reason=no_session_streak streak={streak} notify-send sent"
-        _decision(state_directory, "orchestrator_dead", sid, detail)
-        db.record_event(sid, "orchestrator_dead", detail, path=db_path)
+        _decision(state_directory, "orchestrator_dead", sid, body)
         return
     task = db.get_live_task(sid, path=db_path)
-    outcome = "no live task"
-    if task is not None:
-        result = db.requeue_dead_worker(task["id"], note=requeue_note(task["id"]), path=db_path)
-        outcome = f"task={task['id']} -> {result.value if result else 'unchanged'}"
-    detail = f"reason=no_session_streak streak={streak} {outcome}"
-    _decision(state_directory, "worker_dead", sid, detail)
-    db.record_event(sid, "worker_dead", detail, path=db_path)
+    head = f"reason=no_session_streak streak={streak}"
+    body = db.mark_dead(
+        sid,
+        "worker_dead",
+        head if task is not None else f"{head} no live task",
+        task_id=task["id"] if task is not None else None,
+        task_note=requeue_note(task["id"]) if task is not None else None,
+        path=db_path,
+    )
+    if body is None:
+        return  # already dead or raced - handled before
+    _decision(state_directory, "worker_dead", sid, body)
 
 
 # A fresh-enough ack watermark proves the drain turn ran even when the
