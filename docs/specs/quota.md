@@ -24,15 +24,34 @@ claimants.
 
 A `bridge event`/`bridge notice` body SHALL auto-park the reporting
 task only when it carries an explicit rate-limit marker AND a
-parseable reset time; generic errors never park.
+parseable reset time; generic errors never park. A wake or
+dispatch-prompt transport error carrying the same marker parks the
+affected live task the same way; on the transport surface a marker
+without a reset parks for a bounded default window (900s), which the
+quota pass re-probes at its end.
 
 #### Scenario: rpc_error, busy, timeout, lease-expired never park
 
-- **WHEN** a report mentions a generic RPC/transport error without a
-  quota marker and reset
+- **WHEN** a report or transport error carries no quota marker
 - **THEN** no park happens
-- **AND** a marker without a reset records the signal but requires a
-  manual `bridge quota-park` to park
+- **AND** a self-report marker without a reset records the signal but
+  requires a manual `bridge quota-park` to park
+
+#### Scenario: transport-surfaced rate limit parks the live task
+
+- **WHEN** a wake or prompt `rpc_error` body carries a rate-limit
+  marker and the session has a live task
+- **THEN** the task parks as `waiting_quota` with the parsed reset -
+  or the default window when the marker names none - instead of
+  burning the retry streak or finishing the task failed
+- **AND** the session drops out of every wake leg until that reset
+
+#### Scenario: quota signal without a live task journals only
+
+- **WHEN** a wake error carries a quota marker but the session has
+  no live task
+- **THEN** the signal is journaled as `quota_signal_seen` and
+  ordinary `rpc_error` handling applies
 
 ### Requirement: reset releases the park with one control probe
 
