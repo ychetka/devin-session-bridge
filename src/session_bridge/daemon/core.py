@@ -1612,6 +1612,13 @@ def _defer_probe(
                         sid,
                         f"task={task_id} {type(e).__name__}: {e}",
                     )
+                    db.record_event(
+                        sid,
+                        "quota_probe_escalate_failed",
+                        f"task={task_id} escalation threw: {type(e).__name__}: {e}",
+                        task_id=task_id,
+                        path=db_path,
+                    )
             _decision(
                 state_directory,
                 "quota_probe_held_busy",
