@@ -2858,3 +2858,22 @@ def test_item119_gwt10_unverified_header_future_clamped(env):
         "SELECT 1 FROM decision_events WHERE kind=?",
         ("stale_control_dropped",),
     )
+
+
+def test_item119_gwt11_giant_issued_at_header_no_crash(env):
+    """[ITEM-119.GWT-11] (review r2): a >4300-digit self-claimed
+    issued_at must not ValueError the whole pass leg - the file falls
+    back to mtime and the janitor keeps scanning."""
+    now = int(time.time())
+    path = _foreign_msg(
+        env,
+        SID,
+        nid=777777,
+        body=f"notification_id: 777777\nkind: halt\nissued_at: {'9' * 5000}\n\nx",
+    )
+    fresh = _foreign_msg(env, SID, nid=666666, body="notification_id: 666666\nkind: halt\n\nx")
+    daemon._stale_control_pass(env.db, env.qdir, env.sdir, now)
+    # giant header ignored -> fresh mtime -> kept; scan still ran
+    # (the second file was evaluated too, not skipped by a crash)
+    assert os.path.exists(path)
+    assert os.path.exists(fresh)

@@ -71,7 +71,10 @@ def _cmd_disarm(args) -> int:
 
     The durable outbox DISARM row is what a live watcher receives once
     the daemon relays it - mode is cleared first so a restarted or
-    re-arming session sees unmanaged immediately.
+    re-arming session sees unmanaged immediately. With the daemon
+    down the command runs the relay + stale-control janitor itself
+    (issue #119) so the DISARM lands and stale control files are
+    pruned in the same call.
     """
     if args.all:
         sids = [
