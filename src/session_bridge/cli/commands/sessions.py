@@ -532,8 +532,10 @@ def _cmd_kill(args) -> int:
 
     A purely numeric positional addresses a task; anything else is a
     session id (sids are generated word-word names, never numeric).
+    ``isascii`` joins ``isdigit`` because unicode digits like '²'
+    pass isdigit yet explode in ``int()`` (review F1).
     """
-    if args.session_id.isdigit():
+    if args.session_id.isascii() and args.session_id.isdigit():
         return _cmd_kill_task(args)
     return _cmd_kill_session(args)
 
@@ -543,10 +545,11 @@ def _cmd_kill_task(args) -> int:
 
     CAS ``running|dispatch_decided > failed`` ignoring ``lease_owner``
     (``db.kill_task``): the wedged step dies without waiting out the
-    lease or tearing the session down with it. On success the owning
-    session gets a NOTICE through the outbox so its mailbox wakes it to
-    drop the dead work - discovering the CAS loss at ``bridge finish``
-    would burn a full turn on a task already failed.
+    lease or tearing the session down with it. The owning session's
+    NOTICE commits inside the same transaction (``verdict.notice_id``),
+    so its mailbox wakes it to drop the dead work - discovering the
+    CAS loss at ``bridge finish`` would burn a full turn on a task
+    already failed.
     """
     task_id = int(args.session_id)
     verdict = db.kill_task(task_id, path=args.db)
@@ -574,17 +577,6 @@ def _cmd_kill_task(args) -> int:
             f"refused: task {task_id} is {verdict.status}",
         )
     sid = verdict.session_id
-    notified = None
-    target = db.get_session(sid, path=args.db)
-    if target is not None and target["status"] == "active":
-        notified = db.notify(
-            sid,
-            NotificationKind.NOTICE,
-            f"task {task_id} was force-failed by the operator"
-            " (bridge kill): stash dirty state, stop working it,"
-            " and move on - do not retry or finish it",
-            path=args.db,
-        )
     resp = JsonResponse(
         session=sid,
         status="ok",
@@ -592,11 +584,11 @@ def _cmd_kill_task(args) -> int:
             "killed": True,
             "task_id": task_id,
             "status_before": verdict.status_before,
-            "notification_id": notified,
+            "notification_id": verdict.notice_id,
         },
     )
     human = f"killed task {task_id}: status {verdict.status_before}->failed" + (
-        f", notice {notified} queued for {sid}" if notified else ""
+        f", notice {verdict.notice_id} queued for {sid}" if verdict.notice_id else ""
     )
     return _emit(args, resp, ExitCode.OK, human)
 

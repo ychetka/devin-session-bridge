@@ -3080,7 +3080,8 @@ def test_item113_gwt4_kill_task_cli(env, capsys):
     # an already-failed task stays refused (no duplicate event)
     rc, out = _run(["kill", str(tid), "--json"], capsys)
     assert rc == ExitCode.CONFLICT
-    assert db.kill_task is not None
+    rc, out = _run(["events", "--session", "s1", "--kind", "task_killed", "--json"], capsys)
+    assert rc == ExitCode.OK and len(out["data"]["events"]) == 1
 
 
 # --- item_98 / directive 446: fleet-metrics read-only report -------

@@ -2534,6 +2534,25 @@ def test_item113_gwt1_kill_task_force_fails_live(db_path):
     ev = db.list_events(session_id="w1", kind="task_killed", path=db_path)
     assert len(ev) == 1 and f"task_id={running}" in ev[0]["body"]
 
+    # the NOTICE to the owning session commits inside the same txn -
+    # a dead/unregistered owner simply gets no outbox row
+    assert v.notice_id is not None
+    rows = db.unrelayed_notifications("w1", path=db_path)
+    assert rows[0]["id"] == v.notice_id and rows[0]["kind"] == "notice"
+    assert str(running) in rows[0]["body"] and rows[0]["task_id"] == running
+
+    db.register("w2", "/repo/w2", path=db_path)
+    _exec(db_path, "UPDATE sessions SET status='dead' WHERE session_id='w2'")
+    tid2 = db.enqueue("w2", "orphaned", path=db_path)
+    _exec(
+        db_path,
+        "UPDATE tasks SET status=?, lease_owner=? WHERE id=?",
+        (TaskStatus.RUNNING.value, "bridge-2", tid2),
+    )
+    v2 = db.kill_task(tid2, path=db_path)
+    assert isinstance(v2, TaskKilled) and v2.notice_id is None
+    assert db.unrelayed_notifications("w2", path=db_path) == []
+
 
 def test_item113_gwt2_kill_task_staged_and_quota(db_path):
     """[ITEM-113.GWT-2] kill_task also force-fails a staged

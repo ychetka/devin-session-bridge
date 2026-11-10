@@ -2163,9 +2163,13 @@ def kill_task(task_id: int, note: str | None = None, *, path=None) -> TaskKillVe
     duplicate event - idempotent for audit as well as state).
 
     The CAS, the note (``requeue_dead_worker``-style dirty-tree
-    instruction for the owning worker) and the durable
-    ``task_killed`` ``decision_events`` row land inside one
-    ``BEGIN IMMEDIATE`` - the audit cannot separate from the effect.
+    instruction for the owning worker), the durable ``task_killed``
+    ``decision_events`` row AND the NOTICE outbox row for the owning
+    session (when registered and active) all land inside one
+    ``BEGIN IMMEDIATE`` - neither the audit nor the worker's wake-up
+    can separate from the effect (review F2: a notice enqueued
+    post-commit could be lost on a crash with the kill already
+    committed and the retry refused).
     """
     ts = _now()
     kill_note = note or (
@@ -2216,10 +2220,32 @@ def kill_task(task_id: int, note: str | None = None, *, path=None) -> TaskKillVe
                         ts,
                     ),
                 )
+                notice_id = None
+                active = con.execute(
+                    "SELECT 1 FROM sessions WHERE session_id=? AND status='active'",
+                    (row["session_id"],),
+                ).fetchone()
+                if active:
+                    notice_id = con.execute(
+                        "INSERT INTO notifications"
+                        "(session_id,kind,body,task_id,question_id,created_at)"
+                        " VALUES(?,?,?,?,?,?)",
+                        (
+                            row["session_id"],
+                            NotificationKind.NOTICE.value,
+                            f"task {task_id} was force-failed by the operator"
+                            " (bridge kill): stash dirty state, stop working it,"
+                            " and move on - do not retry or finish it",
+                            task_id,
+                            None,
+                            ts,
+                        ),
+                    ).lastrowid
                 con.execute("COMMIT")
                 return TaskKilled(
                     session_id=row["session_id"],
                     status_before=status_before,
+                    notice_id=notice_id,
                 )
             except BaseException:
                 if con.in_transaction:

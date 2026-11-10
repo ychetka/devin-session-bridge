@@ -164,11 +164,14 @@ class TaskKillRefused(_Verdict):
 
 class TaskKilled(_Verdict):
     """The live task force-failed: status ``failed``, lease and step
-    slot cleared, ``task_killed`` event journaled."""
+    slot cleared, ``task_killed`` event journaled. ``notice_id`` is
+    the outbox row sent to the owning session - ``None`` when it was
+    not registered/active."""
 
     kind: Literal["killed"] = "killed"
     session_id: str
     status_before: str
+    notice_id: int | None = None
 
 
 TaskKillVerdict = Annotated[
