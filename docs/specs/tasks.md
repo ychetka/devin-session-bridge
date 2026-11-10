@@ -92,3 +92,28 @@ work.
   or `failed` task
 - **THEN** the command refuses with the current status
 - **AND** no state or event row is written
+
+### Requirement: optional cap on concurrently active sessions
+
+When `SB_MAX_ACTIVE_SESSIONS` is set above zero, the dispatch pump
+SHALL admit a queued task only while fewer than that many distinct
+sessions hold a live (`running` or `dispatch_decided`) task. A task
+whose session would exceed the cap stays `queued` and is counted as
+slot-waiting. The cap is dispatch admission policy, not a claim
+gate: claims of already-staged tasks are unaffected, and a default
+of `0` means unlimited. `bridge status` SHALL report the active
+session count, the configured cap, and the slot-wait backlog.
+
+#### Scenario: queued task waits for a free session slot
+
+- **WHEN** `SB_MAX_ACTIVE_SESSIONS=1`, one session holds a running
+  task, and a queued task targets a different session
+- **THEN** the pump leaves it `queued` and reports it as
+  slot-waiting in `bridge status`
+- **AND** once the running task finishes, the next pass dispatches it
+
+#### Scenario: unset cap never blocks
+
+- **WHEN** `SB_MAX_ACTIVE_SESSIONS` is unset or `0`
+- **THEN** dispatch admits queued tasks regardless of how many
+  sessions are active

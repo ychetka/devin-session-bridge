@@ -2984,3 +2984,23 @@ def test_issue119_latest_control_notification_id(db_path):
     db.notify("s", NotificationKind.DISARM, "x", path=db_path)
     assert db.latest_control_notification_id("s", path=db_path) > r
     assert db.latest_control_notification_id("other", path=db_path) == 0
+
+
+def test_issue121_active_session_ids(db_path):
+    """active_session_ids = distinct sids with running|dispatch_decided
+    tasks - queued/done/failed rows never count."""
+    assert db.active_session_ids(path=db_path) == set()
+    t1 = db.enqueue("s1", "a", path=db_path)
+    t2 = db.enqueue("s2", "b", path=db_path)
+    db.enqueue("s3", "c", path=db_path)
+    assert db.active_session_ids(path=db_path) == set()  # all queued
+    assert db.claim_queued(t1, "w1", Transport.ACP_PUSH, path=db_path)
+    # dispatch_decided counts before running
+    assert db.active_session_ids(path=db_path) == {"s1"}
+    assert db.mark_running(t1, "w1", path=db_path)
+    assert db.active_session_ids(path=db_path) == {"s1"}
+    assert db.claim_queued(t2, "w2", Transport.ACP_PUSH, path=db_path)
+    assert db.mark_running(t2, "w2", path=db_path)
+    assert db.active_session_ids(path=db_path) == {"s1", "s2"}
+    assert db.finish_task(t1, "w1", ok=True, path=db_path)
+    assert db.active_session_ids(path=db_path) == {"s2"}

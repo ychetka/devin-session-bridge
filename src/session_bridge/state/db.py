@@ -1778,6 +1778,30 @@ def count_tasks(status=None, *, transport=None, path=None) -> int:
     return _retry(op)
 
 
+def active_session_ids(*, path=None) -> set:
+    """Session ids holding at least one live (running|dispatch_decided)
+    task - the unit ``SB_MAX_ACTIVE_SESSIONS`` counts (issue #121).
+
+    A session with any live task occupies exactly one slot regardless
+    of how many tasks it holds: queueing a second task to an already
+    active session never spends a new slot, which keeps the cap a
+    concurrency-of-sessions bound rather than a task bound.
+    """
+
+    def op():
+        con = connect(path)
+        try:
+            rows = con.execute(
+                "SELECT DISTINCT session_id FROM tasks"
+                " WHERE status IN ('running','dispatch_decided')"
+            ).fetchall()
+            return {r["session_id"] for r in rows}
+        finally:
+            con.close()
+
+    return _retry(op)
+
+
 # --- sessions ---------------------------------------------------------------
 
 

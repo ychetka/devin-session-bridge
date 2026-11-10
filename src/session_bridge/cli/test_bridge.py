@@ -3614,3 +3614,60 @@ def test_issue119_gwt10_resume_daemon_up_skips_sync(env, capsys, monkeypatch):
     assert rc == ExitCode.OK
     assert "relayed" not in out["data"]
     assert calls == []
+
+
+def test_item121_gwt1_session_slot_cap_blocks_new_sid(env, monkeypatch):
+    """[ITEM-121.GWT-1] cap=1: a queued task for an inactive session
+    waits while every slot is held, and dispatches once a slot frees.
+    (The already-active-sid exemption is unreachable by construction -
+    ux_tasks_live_session allows one live task per session - but the
+    guard stays so the check is safe under any future schema change.)"""
+    monkeypatch.setattr(dispatch, "MAX_ACTIVE_SESSIONS", 1)
+    env.devin["s1"] = {"working_directory": "/r1"}
+    env.devin["s2"] = {"working_directory": "/r2"}
+    t1 = _task(env, sid="s1")
+    owner = _claim_acp(env, t1)  # s1 holds the only slot
+    t2 = _task(env, sid="s2")  # would need a new slot
+
+    args = SimpleNamespace(db=env.db, queue_dir=str(env.qdir), timeout=None)
+    result = bridge.pump(args)
+
+    assert db.get_task(t2, path=env.db)["status"] == TaskStatus.QUEUED.value
+    assert result["slot_wait"] == [t2]
+    assert env.spawned == []
+    # freeing the slot lets the next pass dispatch it
+    assert db.finish_task(t1, owner, ok=True, path=env.db)
+    result = bridge.pump(args)
+    assert db.get_task(t2, path=env.db)["status"] == TaskStatus.RUNNING.value
+    assert result["slot_wait"] == []
+
+
+def test_item121_gwt2_zero_cap_unlimited(env):
+    """[ITEM-121.GWT-2] the default (0) leaves dispatch unbounded -
+    every queued task dispatches regardless of sid count."""
+    for i in range(bridge.SEMAPHOR):
+        sid = f"s{i}"
+        env.devin[sid] = {"working_directory": f"/r{i}"}
+        _task(env, sid=sid)
+    args = SimpleNamespace(db=env.db, queue_dir=str(env.qdir), timeout=None)
+    result = bridge.pump(args)
+    assert result["slot_wait"] == []
+    assert len(env.spawned) == bridge.SEMAPHOR
+
+
+def test_item121_gwt3_status_surfaces_slots(env, monkeypatch):
+    """[ITEM-121.GWT-3] status --json reports the session-slot
+    occupancy, the configured cap, and the slot-wait reason."""
+    monkeypatch.setattr(dispatch, "MAX_ACTIVE_SESSIONS", 1)
+    monkeypatch.setattr("session_bridge.cli.status.MAX_ACTIVE_SESSIONS", 1)
+    env.devin["s1"] = {"working_directory": "/r1"}
+    env.devin["s2"] = {"working_directory": "/r2"}
+    t1 = _task(env, sid="s1")
+    _claim_acp(env, t1)
+    _task(env, sid="s2")
+
+    _rc, out = _run_status_json(env.db)
+
+    assert out["data"]["session_slots"] == {"active": 1, "max": 1}
+    assert out["data"]["slot_wait"] >= 1
+    assert out["data"]["slot_wait_reason"] == "MAX_ACTIVE_SESSIONS_REACHED"
