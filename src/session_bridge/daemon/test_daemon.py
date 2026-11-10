@@ -2682,3 +2682,203 @@ def test_item115_orchestrator_revive_notifies(env, monkeypatch):
     assert daemon.run(env.db, env.qdir, once=True, notify_send=env.notifier) == daemon.RUN_OK
     assert _one(env.db, "SELECT status FROM sessions WHERE session_id='orc'")["status"] == "active"
     assert any("ORCHESTRATOR REVIVED" in t for t, _b in env.sent)
+
+
+# --- issue #119: stale control-message guard -----------------------------------
+
+
+def _age_notification(path, nid, age_seconds):
+    _exec(
+        path,
+        "UPDATE notifications SET created_at=? WHERE id=?",
+        (int(time.time()) - age_seconds, nid),
+    )
+
+
+def test_item119_gwt1_relay_drops_superseded_control(env):
+    """[ITEM-119.GWT-1] HALT + RESUME both in the outbox: the HALT is
+    superseded at delivery time -> consumed (marked relayed, no file)
+    and journaled stale_control_dropped; the RESUME relays normally."""
+    halt = db.notify(SID, NotificationKind.HALT, "stop", path=env.db)
+    resume = db.notify(SID, NotificationKind.RESUME, "go", path=env.db)
+
+    daemon._relay_pass(env.db, env.qdir, env.sdir, int(time.time()))
+
+    mdir = os.path.join(env.qdir, SID)
+    files = _msg_files(mdir)
+    assert files == [f"msg_{resume}.txt"]
+    assert (
+        _one(env.db, "SELECT relayed_at FROM notifications WHERE id=?", (halt,))["relayed_at"]
+        is not None
+    )
+    assert any(
+        d["event"] == "stale_control_dropped" and f"superseded_by={resume}" in d.get("detail", "")
+        for d in _decisions(env)
+    )
+    assert db.list_events(session_id=SID, kind="stale_control_dropped", path=env.db)
+
+
+def test_item119_gwt2_relay_drops_ttl_expired_control(env):
+    """[ITEM-119.GWT-2] a HALT older than SB_CONTROL_TTL_S while still
+    in the outbox is dropped, not delivered."""
+    nid = db.notify(SID, NotificationKind.HALT, "stop", path=env.db)
+    _age_notification(env.db, nid, daemon._CONTROL_TTL_SECONDS + 60)
+
+    daemon._relay_pass(env.db, env.qdir, env.sdir, int(time.time()))
+
+    assert _msg_files(os.path.join(env.qdir, SID)) == []
+    assert (
+        _one(env.db, "SELECT relayed_at FROM notifications WHERE id=?", (nid,))["relayed_at"]
+        is not None
+    )
+    assert any(d["event"] == "stale_control_dropped" for d in _decisions(env))
+
+
+def test_item119_gwt3_relay_delivers_fresh_control(env):
+    """[ITEM-119.GWT-3] a fresh, un-superseded HALT relays normally and
+    carries the issued_at epoch header."""
+    nid = db.notify(SID, NotificationKind.HALT, "stop", path=env.db)
+    daemon._relay_pass(env.db, env.qdir, env.sdir, int(time.time()))
+    files = _msg_files(os.path.join(env.qdir, SID))
+    assert files == [f"msg_{nid}.txt"]
+    text = Path(env.qdir, SID, files[0]).read_text()
+    assert "kind: halt" in text
+    assert "issued_at:" in text
+    assert not any(d["event"] == "stale_control_dropped" for d in _decisions(env))
+
+
+def test_item119_gwt4_janitor_drops_superseded_file(env, monkeypatch):
+    """[ITEM-119.GWT-4] the incident shape: a HALT file relayed while
+    fresh sits in the mailbox, then a RESUME lands -> the janitor
+    unlinks the HALT file before any drain can execute it."""
+    _managed_fresh(env)
+    halt = _undrained_mail(env, SID, NotificationKind.HALT)
+    mdir = os.path.join(env.qdir, SID)
+    assert f"msg_{halt}.txt" in _msg_files(mdir)
+    resume = db.notify(SID, NotificationKind.RESUME, "go", path=env.db)
+
+    _wake_calls(env, monkeypatch)
+    assert daemon.run(env.db, env.qdir, once=True, notify_send=env.notifier) == daemon.RUN_OK
+
+    files = _msg_files(mdir)
+    assert f"msg_{halt}.txt" not in files
+    assert f"msg_{resume}.txt" in files
+    assert any(
+        d["event"] == "stale_control_dropped" and f"msg_{halt}.txt" in d.get("detail", "")
+        for d in _decisions(env)
+    )
+
+
+def test_item119_gwt5_janitor_drops_ttl_file(env):
+    """[ITEM-119.GWT-5] a control file whose notification is older than
+    the TTL is unlinked even with no newer control command."""
+    nid = _undrained_mail(env, SID, NotificationKind.HALT)
+    _age_notification(env.db, nid, daemon._CONTROL_TTL_SECONDS + 60)
+
+    daemon._stale_control_pass(env.db, env.qdir, env.sdir, int(time.time()))
+
+    assert _msg_files(os.path.join(env.qdir, SID)) == []
+    assert db.list_events(session_id=SID, kind="stale_control_dropped", path=env.db)
+
+
+def test_item119_gwt6_janitor_keeps_fresh_control(env):
+    """[ITEM-119.GWT-6] a fresh latest-intent control file survives."""
+    nid = _undrained_mail(env, SID, NotificationKind.RESUME)
+    daemon._stale_control_pass(env.db, env.qdir, env.sdir, int(time.time()))
+    assert f"msg_{nid}.txt" in _msg_files(os.path.join(env.qdir, SID))
+
+
+def test_item119_gwt7_non_control_mail_untouched(env):
+    """[ITEM-119.GWT-7] directives/notices are not control-class: even a
+    superseding HALT does not drop ordinary mail."""
+    directive = _undrained_mail(env, SID, NotificationKind.DIRECTIVE)
+    db.notify(SID, NotificationKind.HALT, "stop", path=env.db)
+    daemon._stale_control_pass(env.db, env.qdir, env.sdir, int(time.time()))
+    assert f"msg_{directive}.txt" in _msg_files(os.path.join(env.qdir, SID))
+
+
+def test_item119_gwt8_foreign_control_file_ttl_only(env):
+    """[ITEM-119.GWT-8] a file claiming kind: halt with no matching
+    notification row gets no epoch check but still dies of old age."""
+    mdir = os.path.join(env.qdir, SID)
+    os.makedirs(mdir, exist_ok=True)
+    path = os.path.join(mdir, "msg_99999.txt")
+    with open(path, "w") as fh:
+        fh.write("notification_id: 99999\nsession_id: x\nkind: halt\n\nstop")
+    daemon._stale_control_pass(env.db, env.qdir, env.sdir, int(time.time()))
+    assert os.path.exists(path)  # fresh foreign file: kept
+    old = int(time.time()) - daemon._CONTROL_TTL_SECONDS - 60
+    os.utime(path, (old, old))
+    daemon._stale_control_pass(env.db, env.qdir, env.sdir, int(time.time()))
+    assert not os.path.exists(path)  # stale foreign file: dropped
+
+
+def test_item119_gwt9_unverified_file_skips_supersede(env):
+    """[ITEM-119.GWT-9] (review r1): a mailbox file whose
+    notification_id header does not resolve to a control row is
+    judged by age ONLY - a forged small id must not trigger the
+    supersession check against a real newer control row."""
+    # real control rows move the epoch past any small file id
+    n1 = db.notify(SID, NotificationKind.HALT, "stop", path=env.db)
+    n2 = db.notify(SID, NotificationKind.RESUME, "back", path=env.db)
+    db.mark_relayed(n1, path=env.db)
+    db.mark_relayed(n2, path=env.db)
+    # foreign file: small filename id + a header id that resolves to
+    # nothing - identity unverifiable, so supersession must not apply
+    # (the pre-fix code would drop it on basename id alone)
+    path = _foreign_msg(env, SID, nid=1, body="notification_id: 7777\nkind: halt\n\nstop")
+    daemon._stale_control_pass(env.db, env.qdir, env.sdir, int(time.time()))
+    # kept: identity unverifiable -> no epoch check, and the file is
+    # fresh (mtime ~ now); nothing may be journaled
+    assert os.path.exists(path)
+    assert not _one(
+        env.db,
+        "SELECT 1 FROM decision_events WHERE kind=?",
+        ("stale_control_dropped",),
+    )
+
+
+def test_item119_gwt10_unverified_header_future_clamped(env):
+    """[ITEM-119.GWT-10] (review r1): a self-claimed `issued_at` in
+    the future cannot extend the TTL - age is min(header, mtime)."""
+    now = int(time.time())
+    old = now - daemon._CONTROL_TTL_SECONDS - 10
+    path = _foreign_msg(
+        env,
+        SID,
+        nid=888888,
+        body=f"notification_id: 888888\nkind: halt\nissued_at: {now + 999999}\n\nx",
+    )
+    os.utime(path, (old, old))
+    daemon._stale_control_pass(env.db, env.qdir, env.sdir, now)
+    # mtime wins the clamp: stale despite the forged future header
+    assert not os.path.exists(path)
+    assert _one(
+        env.db,
+        "SELECT 1 FROM decision_events WHERE kind=?",
+        ("stale_control_dropped",),
+    )
+
+
+def test_item119_gwt11_giant_issued_at_header_no_crash(env):
+    """[ITEM-119.GWT-11] (review r2): a >4300-digit self-claimed
+    issued_at must not ValueError the whole pass leg - the file falls
+    back to mtime and the janitor keeps scanning."""
+    now = int(time.time())
+    path = _foreign_msg(
+        env,
+        SID,
+        nid=777777,
+        body=f"notification_id: 777777\nkind: halt\nissued_at: {'9' * 5000}\n\nx",
+    )
+    fresh = _foreign_msg(env, SID, nid=666666, body="notification_id: 666666\nkind: halt\n\nx")
+    # non-ascii digit: str.isdigit() accepts '²' but int() rejects it
+    uni = _foreign_msg(
+        env, SID, nid=555555, body="notification_id: 555555\nkind: halt\nissued_at: ²\n\nx"
+    )
+    daemon._stale_control_pass(env.db, env.qdir, env.sdir, now)
+    # forged headers ignored -> fresh mtime -> kept; scan still ran
+    # (the other files were evaluated too, not skipped by a crash)
+    assert os.path.exists(path)
+    assert os.path.exists(fresh)
+    assert os.path.exists(uni)

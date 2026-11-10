@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.9.1] - 2026-11-10
+
+### User-facing
+
+#### fix
+- stale halt/resume/disarm deliveries are dropped instead of executed - a control message superseded by a newer one or older than SB_CONTROL_TTL_S (default 6h) no longer self-halts a resumed session `daemon` (issue #119)
+- halt/resume/disarm with the daemon stopped relay + prune control mail synchronously at command time - a drain during the outage meets the same mailbox state `cli` (issue #119)
+
+### Codebase
+
+#### daemon
+- [fix] control deliveries carry an issued_at epoch header; _control_stale_reason judges supersession (latest control notification id) + TTL at both delivery legs: the relay consumes stale outbox rows via mark_relayed-without-file and a _stale_control_pass janitor unlinks stale control files sitting in mailboxes; every drop journals stale_control_dropped (decisions + decision_events); _msg_headers extracted from _msg_is_tick. Why: incident 2026-11-10: a HALT consumed ~24h late self-halted mahogany-dryosaurus mid-task after the fleet was already resumed - control files had no epoch so an obsolete command executed at drain. (issue #119)
+- [fix] janitor resolves genuine relay artifacts through the notification row; unverifiable files are judged by age only (no supersession on a forged basename id) with issued_at clamped to min(header, mtime) so a self-claimed future timestamp cannot extend the TTL (review r1, issue #119)
+
+#### cli
+- [fix] _sync_control_delivery runs relay + janitor synchronously from halt/resume/disarm when the daemon is down (daemon_running lockfile check) - the staleness guard no longer depends on the loop being alive; relay failures degrade to a relay_error field instead of aborting the response (review r1, issue #119)
+
+#### state
+- [refactor] latest_control_notification_id accepts an optional caller-held connection so the janitor's per-file epoch lookups reuse one handle (review r1, issue #119)
+
 ## [0.9.0] - 2026-11-10
 
 ### User-facing

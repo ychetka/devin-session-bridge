@@ -438,6 +438,21 @@ Design answers (task #180):
   it is a drain-on-boundary contract. A busy session sees the HALT
   at its next drain; `--all` reports every target's wake outcome,
   mailbox depth and live task so the operator sees who is mid-turn.
+- **Stale control deliveries are dropped** (v0.9.1, issue #119):
+  `halt`/`resume`/`disarm` files carry an `issued_at` epoch header.
+  A control delivery superseded by a newer control notification for
+  the same session, or older than `SB_CONTROL_TTL_S` (default 6h),
+  is dropped - the relay consumes stale outbox rows without writing
+  a file and a janitor pass unlinks control files that went stale
+  while sitting in the mailbox; every drop is journaled
+  `stale_control_dropped`. When the daemon is stopped, `halt`/
+  `resume`/`disarm` run the relay and janitor synchronously at
+  command time, so a drain during the outage meets the same mailbox
+  state (no stale file survives to execute). The durable `halted_at`
+  flag is unaffected: a dropped HALT file only loses the
+  "stop mid-turn" courtesy - claim refusal still enforces the halt.
+  This closes the incident shape where a HALT consumed ~24h late
+  self-halted a session the operator had already resumed.
 
 Post-halt assessment of the deferred urgent-interrupt /
 human-override items (task #198, v0.3.14):
