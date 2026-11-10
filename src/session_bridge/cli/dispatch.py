@@ -362,7 +362,10 @@ def pump(args) -> dict:
                 if db.claim_queued(
                     tid, owner, Transport.HOOK_QUEUE, path=args.db
                 ) and db.fallback_to_hook(tid, owner, path=args.db):
-                    active_sids.add(sid)
+                    # no active_sids.add: the fold leaves the task
+                    # QUEUED with a decided transport - the sid is not
+                    # live, so it holds no slot (review r2: counting it
+                    # would contradict session_slots.active for a pass)
                     _write_trigger(_queue_dir(args), sid)
                     hooked.append(tid)
                 continue

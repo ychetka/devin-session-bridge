@@ -139,13 +139,20 @@ MAX_ACTIVE_SESSIONS: Final[int] = max(0, _env_int("SB_MAX_ACTIVE_SESSIONS", 0))
 #: fresh slot is free. Queued targets can never satisfy the EXISTS
 #: leg (``ux_tasks_live_session`` forbids a second live task per
 #: session), so for them the count comparison is the gate.
+#: slot-holding statuses as a SQL literal list - derived from the
+#: enum so a rename cannot silently desync (same pattern as
+#: ``_LIVE_SQL``)
+_SLOT_STATUSES_SQL = ", ".join(
+    f"'{v}'" for v in (TaskStatus.RUNNING.value, TaskStatus.DISPATCH_DECIDED.value)
+)
+
 _SLOT_SQL = (
     "( ?=0"
     " OR EXISTS(SELECT 1 FROM tasks t2"
     "  WHERE t2.session_id=tasks.session_id"
-    "  AND t2.status IN ('running','dispatch_decided'))"
+    f"  AND t2.status IN ({_SLOT_STATUSES_SQL}))"
     " OR (SELECT COUNT(DISTINCT session_id) FROM tasks"
-    "  WHERE status IN ('running','dispatch_decided'))<? )"
+    f"  WHERE status IN ({_SLOT_STATUSES_SQL}))<? )"
 )
 
 
@@ -1847,8 +1854,7 @@ def active_session_ids(*, path=None) -> set:
         con = connect(path)
         try:
             rows = con.execute(
-                "SELECT DISTINCT session_id FROM tasks"
-                " WHERE status IN ('running','dispatch_decided')"
+                f"SELECT DISTINCT session_id FROM tasks WHERE status IN ({_SLOT_STATUSES_SQL})"
             ).fetchall()
             return {r["session_id"] for r in rows}
         finally:

@@ -429,7 +429,10 @@ def _on_stop(p: StopPayload, args, cfg: ParkConfig | None):
             if _claim_running(task["id"], owner, args):
                 _reset_cycles(session_id, cfg, args)
                 return _block_deliver(task)
-            # the CAS refused: queue_paused or a racing claimant
+            # the CAS refused: queue_paused, a racing claimant, or a
+            # held SB_MAX_ACTIVE_SESSIONS slot (issue #121) - the
+            # latter two retry on the next Stop event, only pause
+            # warrants flagging
             if _session_paused(session_id, args):
                 _flag_awaiting_user(task, owner, args, "queue paused; awaiting user kick")
             return None
@@ -514,6 +517,11 @@ def _on_session_end(p: SessionEndPayload, args):
                 path=args.db,
             )
         else:
+            # refusal causes: queue_paused (cleared above), a racing
+            # claimant, or a held session-slot cap (issue #121). The
+            # cap path leaves the task queued on the dead session -
+            # bounded: recover_stale/GC own its eventual fate, and
+            # honoring the cap beats exempting a retirement edge
             _log(f"session end: cannot retire queued task {tid}")
     elif st == TaskStatus.DISPATCH_DECIDED.value:
         lease_owner = task["lease_owner"]
