@@ -10,7 +10,7 @@
 ### Codebase
 
 #### cli
-- [feat] db.active_session_ids counts distinct sids holding running|dispatch_decided tasks; the dispatch pump admits a queued task only while active sids < SB_MAX_ACTIVE_SESSIONS (default 0 = unlimited), counting refusals as slot_wait surfaced via bridge status session_slots + slot_wait_reason. Why: fleet-wide quota preservation - the operator needs a coarse lever bounding how many sessions burn in parallel without halting sessions; admission-at-dispatch keeps the cap a pure policy knob that never touches claim CAS semantics (issue #121)
+- [feat] db.active_session_ids counts distinct sids holding running|dispatch_decided tasks; SB_MAX_ACTIVE_SESSIONS (default 0 = unlimited, negatives clamp) is enforced inside the claim_queued / claim_managed / dispatch_managed CAS predicates via _SLOT_SQL - a queued claim needs a free slot while a staged dispatch_decided self-claim passes the EXISTS leg - so every claim edge (pump, Stop hook, user kick, managed claim) honors the cap atomically; the pump additionally pre-filters for slot_wait observability surfaced via bridge status session_slots + slot_wait_reason. Why: fleet-wide quota preservation - the operator needs a coarse lever bounding how many sessions burn in parallel; CAS-enforcement rather than a pump snapshot because direct claim edges would bypass a dispatch-only gate (review r1) (issue #121)
 
 ## [0.9.1] - 2026-11-10
 

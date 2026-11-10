@@ -3004,3 +3004,37 @@ def test_issue121_active_session_ids(db_path):
     assert db.active_session_ids(path=db_path) == {"s1", "s2"}
     assert db.finish_task(t1, "w1", ok=True, path=db_path)
     assert db.active_session_ids(path=db_path) == {"s2"}
+
+
+def test_issue121_claim_edges_honor_cap(db_path, monkeypatch):
+    """Cap enforcement lives inside the claim/staging CAS: direct
+    claim edges (Stop hook claim_queued, managed claim_managed,
+    pump staging dispatch_managed) all refuse a queued task once
+    MAX_ACTIVE_SESSIONS is held - the task stays queued."""
+    monkeypatch.setattr(db, "MAX_ACTIVE_SESSIONS", 1)
+    t1 = db.enqueue("s1", "a", path=db_path)
+    assert db.claim_queued(t1, "w1", Transport.ACP_PUSH, path=db_path)
+    assert db.mark_running(t1, "w1", path=db_path)  # s1 holds the slot
+    t2 = db.enqueue("s2", "b", path=db_path)
+
+    assert not db.claim_queued(t2, "w2", Transport.ACP_PUSH, path=db_path)
+    assert not db.dispatch_managed(t2, "dm-s2", path=db_path)
+    assert not db.claim_managed(t2, "s2", "w2", path=db_path)
+    assert db.get_task(t2, path=db_path)["status"] == "queued"
+
+
+def test_issue121_staged_self_claim_exempt(db_path, monkeypatch):
+    """A dispatch_decided row's own claim passes the EXISTS leg even
+    at a full cap - its slot was spent at stage time; a fresh queued
+    task is still refused."""
+    monkeypatch.setattr(db, "MAX_ACTIVE_SESSIONS", 1)
+    t1 = db.enqueue("s1", "a", path=db_path)
+    assert db.dispatch_managed(t1, "dm-s1", path=db_path)
+    t2 = db.enqueue("s2", "b", path=db_path)  # cap held by s1
+
+    # the staged claim must carry the staging lease_owner (dm-s1) -
+    # that binding, not the slot predicate, owns this refusal path
+    assert db.claim_managed(t1, "s1", "dm-s1", path=db_path)
+    assert db.get_task(t1, path=db_path)["status"] == "running"
+    assert not db.claim_queued(t2, "w2", Transport.HOOK_QUEUE, path=db_path)
+    assert db.get_task(t2, path=db_path)["status"] == "queued"

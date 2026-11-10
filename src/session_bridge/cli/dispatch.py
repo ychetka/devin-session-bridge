@@ -54,7 +54,10 @@ SEMAPHOR = 3
 #: holding a live (running|dispatch_decided) task (issue #121).
 #: 0 = unlimited. Queued tasks for a session over the cap stay
 #: queued; a session already active never spends a second slot.
-MAX_ACTIVE_SESSIONS = _env_int("SB_MAX_ACTIVE_SESSIONS", 0)
+#: The pump-side check is an observability pre-filter (it produces
+#: slot_wait); enforcement itself lives inside the db claim/staging
+#: CAS predicates (db._SLOT_SQL) so every claim edge is covered.
+MAX_ACTIVE_SESSIONS = db.MAX_ACTIVE_SESSIONS
 
 #: default end_turn wait for ``session/prompt`` in the worker.
 WORK_TIMEOUT_DEFAULT = 3600
@@ -257,7 +260,9 @@ def pump(args) -> dict:
     """Lazy recovery + one dispatch pass over queued tasks.
 
     Returns ``{"events", "hooked", "spawned", "unknown", "managed",
-    "saturated"}`` for the calling command's response. The queue is
+    "saturated", "slot_wait"}`` for the calling command's response -
+    ``slot_wait`` lists task ids this pass left queued solely because
+    ``MAX_ACTIVE_SESSIONS`` had no free slot (issue #121). The queue is
     scanned in capped batches paginated by task id, so every queued
     task is visited even beyond the ``list_tasks`` limit; hook-folded
     tasks land back in ``queued`` keeping the same id - already below

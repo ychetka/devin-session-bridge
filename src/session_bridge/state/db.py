@@ -122,6 +122,32 @@ def _env_int(name: str, default: int) -> int:
 #: base constant (db cannot reach the daemon's margin tunable).
 LEASE_SECONDS: Final[int] = max(600, _env_int("SB_LEASE_TTL_S", contract.LEASE_SECONDS))
 
+#: Optional cap on concurrently active sessions - distinct sids
+#: holding a live (running|dispatch_decided) task (issue #121).
+#: Resolved once at import like LEASE_SECONDS; 0 = unlimited and
+#: negative values clamp to it. Enforced INSIDE the claim/staging
+#: CAS predicates (``_SLOT_SQL``) so concurrent pumps and direct
+#: claim edges (hooks, managed claim, user kick) can never
+#: over-admit - a per-process snapshot gate would be racy.
+MAX_ACTIVE_SESSIONS: Final[int] = max(0, _env_int("SB_MAX_ACTIVE_SESSIONS", 0))
+
+#: Session-slot admission predicate for CAS writes that move a
+#: queued task toward running (issue #121). Takes the cap twice as
+#: positional ``?`` parameters. A row proceeds when the cap is off,
+#: its session already holds a live task (a staged dispatch_decided
+#: row claiming itself - the slot was spent at stage time), or a
+#: fresh slot is free. Queued targets can never satisfy the EXISTS
+#: leg (``ux_tasks_live_session`` forbids a second live task per
+#: session), so for them the count comparison is the gate.
+_SLOT_SQL = (
+    "( ?=0"
+    " OR EXISTS(SELECT 1 FROM tasks t2"
+    "  WHERE t2.session_id=tasks.session_id"
+    "  AND t2.status IN ('running','dispatch_decided'))"
+    " OR (SELECT COUNT(DISTINCT session_id) FROM tasks"
+    "  WHERE status IN ('running','dispatch_decided'))<? )"
+)
+
 
 def _default_db_path() -> str:
     override = os.environ.get("SESSIONS_BRIDGE_DB")
@@ -634,6 +660,10 @@ def dispatch_managed(task_id: int, owner: str, *, path=None) -> bool:
     halted session cannot claim would burn a lease attempt per
     redispatch until MAX_ATTEMPTS fails it terminally - the HALT
     contract is that queued tasks persist until ``bridge resume``.
+
+    The session-slot predicate (``_SLOT_SQL``, issue #121) makes
+    admission atomic: racing pumps cannot stage past
+    ``MAX_ACTIVE_SESSIONS`` even between their snapshot checks.
     """
     ts = _now()
 
@@ -648,7 +678,8 @@ def dispatch_managed(task_id: int, owner: str, *, path=None) -> bool:
                 "   WHERE session_id=tasks.session_id), 0) = 0"
                 " AND (SELECT halted_at FROM sessions"
                 "  WHERE session_id=tasks.session_id) IS NULL"
-                " AND COALESCE(step_state,'')<>'waiting_quota'",
+                " AND COALESCE(step_state,'')<>'waiting_quota'"
+                f" AND {_SLOT_SQL}",
                 (
                     TaskStatus.DISPATCH_DECIDED.value,
                     owner,
@@ -657,6 +688,8 @@ def dispatch_managed(task_id: int, owner: str, *, path=None) -> bool:
                     ts,
                     task_id,
                     TaskStatus.QUEUED.value,
+                    MAX_ACTIVE_SESSIONS,
+                    MAX_ACTIVE_SESSIONS,
                 ),
             )
             return cur.rowcount == 1
@@ -682,6 +715,12 @@ def claim_managed(task_id: int, session_id: str, owner: str, *, path=None) -> bo
     an enforced invariant, not a duty-text request - a lease RENEWAL
     on an already-running task is unaffected because finishing the
     current atomic action is exactly what HALT asks for.
+
+    The session-slot predicate (``_SLOT_SQL``, issue #121) also
+    applies: a ``queued`` claim needs a free session slot, while a
+    ``dispatch_decided`` self-claim passes the EXISTS leg - its slot
+    was already spent at stage time, so a staged task is never
+    refused by the cap that admitted it.
     """
     ts = _now()
 
@@ -697,7 +736,8 @@ def claim_managed(task_id: int, session_id: str, owner: str, *, path=None) -> bo
                 "   WHERE session_id=tasks.session_id), 0) = 0"
                 " AND (SELECT halted_at FROM sessions"
                 "  WHERE session_id=tasks.session_id) IS NULL"
-                " AND COALESCE(step_state,'')<>'waiting_quota'",
+                " AND COALESCE(step_state,'')<>'waiting_quota'"
+                f" AND {_SLOT_SQL}",
                 (
                     TaskStatus.RUNNING.value,
                     owner,
@@ -709,6 +749,8 @@ def claim_managed(task_id: int, session_id: str, owner: str, *, path=None) -> bo
                     TaskStatus.QUEUED.value,
                     TaskStatus.DISPATCH_DECIDED.value,
                     owner,
+                    MAX_ACTIVE_SESSIONS,
+                    MAX_ACTIVE_SESSIONS,
                 ),
             )
             return cur.rowcount == 1
@@ -729,6 +771,12 @@ def claim_queued(task_id: int, owner: str, transport, *, path=None) -> bool:
     treats an expired dispatch_decided lease like an expired running
     one and the owner must re-confirm via ``mark_running`` before the
     transport runs.
+
+    The session-slot predicate (``_SLOT_SQL``, issue #121) makes
+    ``MAX_ACTIVE_SESSIONS`` an enforced invariant, not a pump hint:
+    direct claim edges (Stop hook, user kick, managed claim) refuse
+    a ``queued`` task once the cap is held, exactly like the pump's
+    own dispatch legs.
     """
     ts = _now()
 
@@ -741,7 +789,8 @@ def claim_queued(task_id: int, owner: str, transport, *, path=None) -> bool:
                 " WHERE id=? AND status=? AND COALESCE("
                 "  (SELECT queue_paused FROM sessions"
                 "   WHERE session_id=tasks.session_id), 0) = 0"
-                " AND COALESCE(step_state,'')<>'waiting_quota'",
+                " AND COALESCE(step_state,'')<>'waiting_quota'"
+                f" AND {_SLOT_SQL}",
                 (
                     TaskStatus.DISPATCH_DECIDED.value,
                     _val(transport),
@@ -751,6 +800,8 @@ def claim_queued(task_id: int, owner: str, transport, *, path=None) -> bool:
                     ts,
                     task_id,
                     TaskStatus.QUEUED.value,
+                    MAX_ACTIVE_SESSIONS,
+                    MAX_ACTIVE_SESSIONS,
                 ),
             )
             return cur.rowcount == 1
@@ -1786,6 +1837,10 @@ def active_session_ids(*, path=None) -> set:
     of how many tasks it holds: queueing a second task to an already
     active session never spends a new slot, which keeps the cap a
     concurrency-of-sessions bound rather than a task bound.
+    ``awaiting_user`` is deliberately not a slot: a task parked on a
+    user reply burns no worker capacity. The distinction is semantic
+    only - the live-task unique index means an ``awaiting_user``
+    session can never hold a queued task the gate would evaluate.
     """
 
     def op():

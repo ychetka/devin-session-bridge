@@ -95,14 +95,17 @@ work.
 
 ### Requirement: optional cap on concurrently active sessions
 
-When `SB_MAX_ACTIVE_SESSIONS` is set above zero, the dispatch pump
-SHALL admit a queued task only while fewer than that many distinct
-sessions hold a live (`running` or `dispatch_decided`) task. A task
-whose session would exceed the cap stays `queued` and is counted as
-slot-waiting. The cap is dispatch admission policy, not a claim
-gate: claims of already-staged tasks are unaffected, and a default
-of `0` means unlimited. `bridge status` SHALL report the active
-session count, the configured cap, and the slot-wait backlog.
+When `SB_MAX_ACTIVE_SESSIONS` is set above zero, a `queued` task
+SHALL transition toward `running` only while fewer than that many
+distinct sessions hold a live (`running` or `dispatch_decided`)
+task - enforced inside the `claim_queued`, `claim_managed` and
+`dispatch_managed` CAS predicates so every claim edge (pump, Stop
+hook, user kick, managed claim) honors the cap atomically. A
+`dispatch_decided` row's self-claim is exempt: its slot was spent
+at stage time. A task refused by the cap stays `queued` and is
+counted as slot-waiting in `bridge status`, which SHALL report the
+active session count, the configured cap, and the backlog. A
+default of `0` means unlimited.
 
 #### Scenario: queued task waits for a free session slot
 
@@ -111,6 +114,13 @@ session count, the configured cap, and the slot-wait backlog.
 - **THEN** the pump leaves it `queued` and reports it as
   slot-waiting in `bridge status`
 - **AND** once the running task finishes, the next pass dispatches it
+
+#### Scenario: direct claim edges honor the cap
+
+- **WHEN** the cap is held and a session's Stop hook or managed
+  claim targets a still-`queued` task directly
+- **THEN** the claim CAS refuses and the task stays `queued`
+- **AND** a `dispatch_decided` task's own claim is unaffected
 
 #### Scenario: unset cap never blocks
 

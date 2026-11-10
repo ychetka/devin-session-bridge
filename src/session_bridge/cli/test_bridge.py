@@ -3623,6 +3623,8 @@ def test_item121_gwt1_session_slot_cap_blocks_new_sid(env, monkeypatch):
     ux_tasks_live_session allows one live task per session - but the
     guard stays so the check is safe under any future schema change.)"""
     monkeypatch.setattr(dispatch, "MAX_ACTIVE_SESSIONS", 1)
+    # the CAS layer enforces independently of the pump pre-filter
+    monkeypatch.setattr(db, "MAX_ACTIVE_SESSIONS", 1)
     env.devin["s1"] = {"working_directory": "/r1"}
     env.devin["s2"] = {"working_directory": "/r2"}
     t1 = _task(env, sid="s1")
