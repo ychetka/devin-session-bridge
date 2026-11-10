@@ -30,6 +30,10 @@ __all__ = [
     "ReserveConflict",
     "ReserveGranted",
     "ReserveVerdict",
+    "ReviveNotFound",
+    "ReviveRefused",
+    "ReviveVerdict",
+    "SessionRevived",
     "TaskKillNotFound",
     "TaskKillRefused",
     "TaskKillVerdict",
@@ -200,5 +204,44 @@ class Killed(_Verdict):
 
 KillVerdict = Annotated[
     KillNotFound | Killed,
+    Field(discriminator="kind"),
+]
+
+
+class ReviveNotFound(_Verdict):
+    """No session row with that sid (unknown or concurrently removed)."""
+
+    kind: Literal["not_found"] = "not_found"
+
+
+class ReviveRefused(_Verdict):
+    """The row cannot be auto-revived: not dead, not managed, or the
+    latest dead-causing decision marker is not a liveness verdict.
+
+    ``reason`` is ``not_dead`` | ``not_managed`` | ``halted`` |
+    ``operator_killed`` | ``no_marker`` | ``unknown_marker`` - the
+    last three mean an operator ``bridge kill <sid>`` (or an
+    unjournaled dead write, treated the same conservatively)
+    supersedes any older liveness marker, so the resurrect probe
+    must leave the row dead.
+    """
+
+    kind: Literal["refused"] = "refused"
+    reason: str
+    marker: str | None = None
+
+
+class SessionRevived(_Verdict):
+    """dead > active committed and ``session_revived`` journaled in the
+    same transaction. ``marker`` is the liveness verdict that
+    authorized the revive."""
+
+    kind: Literal["revived"] = "revived"
+    session_id: str
+    marker: str
+
+
+ReviveVerdict = Annotated[
+    ReviveNotFound | ReviveRefused | SessionRevived,
     Field(discriminator="kind"),
 ]

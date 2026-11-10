@@ -284,7 +284,11 @@ the full fields (`wake_outcome`, `wake_streak`, `wake_escalated`,
    come from session/list absence, which a heartbeat cannot refute,
    so a heartbeat never revives a managed row - this also prevents a
    leftover observer-shell heartbeat loop from flapping a dead
-   managed session back and forth, v0.3.2).
+   managed session back and forth, v0.3.2). Since v0.9.0 the daemon
+   also revives a dead managed session automatically when pending
+   mail + a positive session/list presence check coincide
+   (`session_revived` decision row) - liveness dead-markers only,
+   an operator `bridge kill <sid>` is never auto-revived.
 
    Refusal output looks like:
 

@@ -80,6 +80,10 @@ from .verdict import (
     ReserveConflict,
     ReserveGranted,
     ReserveVerdict,
+    ReviveNotFound,
+    ReviveRefused,
+    ReviveVerdict,
+    SessionRevived,
     TaskKilled,
     TaskKillNotFound,
     TaskKillRefused,
@@ -1143,6 +1147,52 @@ def recover_stale(*, path=None) -> list[int]:
     return recovered
 
 
+def _requeue_dead_worker_tx(con, task_id: int, note, ts):
+    """requeue_dead_worker's CAS pair on a caller-owned connection.
+
+    Shared by ``requeue_dead_worker`` (autocommit) and ``mark_dead``
+    (inside the dead-flip's ``BEGIN IMMEDIATE``, issue #115 review:
+    the task fold, the status CAS and the dead-marker must commit or
+    roll back together).
+    """
+    # waiting_quota rows survive a dead session too - the park waits on
+    # the provider's reset, not on the worker; folding them to queued
+    # would hand the saved step to a different claimant (task #216).
+    guard = f" WHERE id=? AND status IN ({_LIVE_SQL}) AND COALESCE(step_state,'')<>'waiting_quota'"
+    cur = con.execute(
+        "UPDATE tasks SET status=?, attempt=attempt+1,"
+        " lease_owner=NULL, lease_expires_at=NULL,"
+        " lease_renewed_at=NULL,"
+        " note=COALESCE(?,note), updated_at=?" + _STEP_CLEAR_SQL + guard + " AND attempt+1<?",
+        (
+            TaskStatus.QUEUED.value,
+            note,
+            ts,
+            task_id,
+            MAX_ATTEMPTS,
+        ),
+    )
+    if cur.rowcount == 1:
+        return TaskStatus.QUEUED
+    cur = con.execute(
+        "UPDATE tasks SET status=?, attempt=attempt+1,"
+        " lease_owner=NULL, lease_expires_at=NULL,"
+        " lease_renewed_at=NULL, finished_at=?,"
+        " note=COALESCE(?,note), updated_at=?" + _STEP_CLEAR_SQL + guard + " AND attempt+1>=?",
+        (
+            TaskStatus.FAILED.value,
+            ts,
+            note,
+            ts,
+            task_id,
+            MAX_ATTEMPTS,
+        ),
+    )
+    if cur.rowcount == 1:
+        return TaskStatus.FAILED
+    return None
+
+
 def requeue_dead_worker(task_id: int, note: str | None = None, *, path=None):
     """Supervisor requeue for a live task whose session went dead.
 
@@ -1156,52 +1206,11 @@ def requeue_dead_worker(task_id: int, note: str | None = None, *, path=None):
     when the task already left the live set.
     """
     ts = _now()
-    # waiting_quota rows survive a dead session too - the park waits on
-    # the provider's reset, not on the worker; folding them to queued
-    # would hand the saved step to a different claimant (task #216).
-    guard = f" WHERE id=? AND status IN ({_LIVE_SQL}) AND COALESCE(step_state,'')<>'waiting_quota'"
 
     def op():
         con = connect(path)
         try:
-            cur = con.execute(
-                "UPDATE tasks SET status=?, attempt=attempt+1,"
-                " lease_owner=NULL, lease_expires_at=NULL,"
-                " lease_renewed_at=NULL,"
-                " note=COALESCE(?,note), updated_at=?"
-                + _STEP_CLEAR_SQL
-                + guard
-                + " AND attempt+1<?",
-                (
-                    TaskStatus.QUEUED.value,
-                    note,
-                    ts,
-                    task_id,
-                    MAX_ATTEMPTS,
-                ),
-            )
-            if cur.rowcount == 1:
-                return TaskStatus.QUEUED
-            cur = con.execute(
-                "UPDATE tasks SET status=?, attempt=attempt+1,"
-                " lease_owner=NULL, lease_expires_at=NULL,"
-                " lease_renewed_at=NULL, finished_at=?,"
-                " note=COALESCE(?,note), updated_at=?"
-                + _STEP_CLEAR_SQL
-                + guard
-                + " AND attempt+1>=?",
-                (
-                    TaskStatus.FAILED.value,
-                    ts,
-                    note,
-                    ts,
-                    task_id,
-                    MAX_ATTEMPTS,
-                ),
-            )
-            if cur.rowcount == 1:
-                return TaskStatus.FAILED
-            return None
+            return _requeue_dead_worker_tx(con, task_id, note, ts)
         finally:
             con.close()
 
@@ -2055,18 +2064,24 @@ def kill_session(session_id: str, *, path=None) -> KillVerdict:
     carrying effect counts otherwise. All effects land inside one
     ``BEGIN IMMEDIATE`` and a ``session_killed`` row is appended to
     ``decision_events`` in the same transaction, so the durable audit
-    cannot be lost between commit and a second write. A repeat kill
-    that changes nothing (already dead, no live tasks, no heartbeat)
-    writes no duplicate event and does not bump ``updated_at`` - the
-    command stays idempotent for audit as well as state.
+    cannot be lost between commit and a second write. The marker is
+    written even when nothing else changed - a dead row whose latest
+    marker is still a liveness verdict (or that has no marker) must
+    not stay auto-revivable (issue #115) - while a repeat kill whose
+    marker is already pinned writes no duplicate event and does not
+    bump ``updated_at``: the command stays idempotent for audit as
+    well as state.
 
     Kill detaches bridge state; it is not a ban. A session whose
     process is still alive self-revives on its next ``register``
     call - or, for UNMANAGED sessions, on its next ``heartbeat``
     (item_122 revives dead unmanaged rows only; a managed row stays
-    dead until it re-registers) - so cutting that off needs the
-    process or its hooks stopped first, which is the operator's side
-    of the contract.
+    dead until it re-registers or the daemon resurrect probe sees it
+    present with pending mail, issue #115 - but the ``session_killed``
+    marker written here makes that probe refuse an operator kill
+    forever, so only a liveness verdict is revivable) - so cutting
+    that off needs the process or its hooks stopped first, which is
+    the operator's side of the contract.
     """
     ts = _now()
 
@@ -2119,7 +2134,19 @@ def kill_session(session_id: str, *, path=None) -> KillVerdict:
                 "UPDATE sessions SET status=?, updated_at=? WHERE session_id=? AND status<>?",
                 (SessionStatus.DEAD.value, ts, session_id, SessionStatus.DEAD.value),
             ).rowcount
-            if flipped or requeued or staged or hb:
+            # pin operator intent even on a zero-effect kill (issue #115
+            # review): a dead row whose latest marker is still a liveness
+            # verdict - or that has no marker at all - stays revivable
+            # until ``session_killed`` supersedes it. A repeat kill is
+            # deduped on the marker itself, keeping the audit idempotent.
+            kinds = ",".join("?" * len(_DEAD_MARKERS))
+            latest = con.execute(
+                f"SELECT kind FROM decision_events WHERE session_id=?"
+                f" AND kind IN ({kinds}) ORDER BY id DESC LIMIT 1",
+                (session_id, *_DEAD_MARKERS),
+            ).fetchone()
+            pinned = latest is not None and latest["kind"] == "session_killed"
+            if flipped or requeued or staged or hb or not pinned:
                 con.execute(
                     "INSERT INTO decision_events(session_id,kind,body,created_at) VALUES (?,?,?,?)",
                     (
@@ -2245,6 +2272,200 @@ def kill_task(task_id: int, note: str | None = None, *, path=None) -> TaskKillVe
                     status_before=status_before,
                     notice_id=notice_id,
                 )
+            except BaseException:
+                if con.in_transaction:
+                    con.execute("ROLLBACK")
+                raise
+        finally:
+            con.close()
+
+    return _retry(op)
+
+
+# Dead-causing decision markers (issue #115): the resurrect probe may
+# only undo a LIVENESS verdict - ``worker_dead``/``orchestrator_dead``
+# written by the sweep and the no_session dead path. ``session_killed``
+# is operator intent: a later kill supersedes every earlier liveness
+# marker and must keep the row dead, so the latest marker in the
+# decision journal is what authorizes or refuses a revive.
+# ``session_revived`` is part of the scan so a row that went dead
+# after a revive without a fresh marker stays dead (an unjournaled
+# dead write is operator-class, not liveness-class).
+_LIVENESS_DEAD_MARKERS: Final = ("worker_dead", "orchestrator_dead")
+_DEAD_MARKERS: Final = (*_LIVENESS_DEAD_MARKERS, "session_killed", "session_revived")
+
+
+def dead_revivable_managed(session_ids, *, path=None) -> set:
+    """Subset of ``session_ids`` that are dead managed rows whose
+    latest dead-causing marker is a liveness verdict.
+
+    Read-only pre-filter for the daemon resurrect leg: operator-killed
+    sids and dead rows with no marker are excluded before any acp-host
+    presence probe is spent on them.
+    """
+    sids = list(dict.fromkeys(session_ids))
+    if not sids:
+        return set()
+    marks = ",".join("?" * len(sids))
+    kinds = ",".join("?" * len(_DEAD_MARKERS))
+    con = connect(path)
+    try:
+        rows = con.execute(
+            f"SELECT session_id FROM sessions WHERE session_id IN ({marks})"
+            " AND status=? AND COALESCE(mode,?)=? AND halted_at IS NULL"
+            f" AND (SELECT kind FROM decision_events"
+            f"      WHERE session_id=sessions.session_id AND kind IN ({kinds})"
+            f"      ORDER BY id DESC LIMIT 1) IN (?,?)",
+            (
+                *sids,
+                SessionStatus.DEAD.value,
+                SessionMode.UNMANAGED.value,
+                SessionMode.MANAGED.value,
+                *_DEAD_MARKERS,
+                *_LIVENESS_DEAD_MARKERS,
+            ),
+        ).fetchall()
+        return {r["session_id"] for r in rows}
+    finally:
+        con.close()
+
+
+def revive_dead_managed(session_id: str, *, path=None) -> ReviveVerdict:
+    """CAS ``dead > active`` for a managed session the daemon resurrect
+    probe just saw present in session/list (issue #115).
+
+    The unmanaged counterpart of the heartbeat revive (item_122): a
+    dead-flagged managed session that demonstrably reappears on the
+    host clears its own latch instead of waiting for a manual
+    re-register. The read of the latest dead-causing marker, the
+    status CAS and the ``session_revived`` journal row all land in one
+    ``BEGIN IMMEDIATE`` so an operator ``bridge kill <sid>`` racing the
+    probe still wins - ``session_killed`` supersedes any earlier
+    liveness marker and refuses the revive. A dead row with no marker
+    (unjournaled write) refuses the same way: unknown cause is
+    operator-class, not liveness-class.
+    """
+    ts = _now()
+
+    def op():
+        con = connect(path)
+        try:
+            con.execute("BEGIN IMMEDIATE")
+            try:
+                row = con.execute(
+                    "SELECT status, mode, halted_at FROM sessions WHERE session_id=?",
+                    (session_id,),
+                ).fetchone()
+                if row is None:
+                    con.execute("ROLLBACK")
+                    return ReviveNotFound()
+                if row["status"] != SessionStatus.DEAD.value:
+                    con.execute("ROLLBACK")
+                    return ReviveRefused(reason="not_dead")
+                if (row["mode"] or SessionMode.UNMANAGED.value) != SessionMode.MANAGED.value:
+                    con.execute("ROLLBACK")
+                    return ReviveRefused(reason="not_managed")
+                if row["halted_at"] is not None:
+                    con.execute("ROLLBACK")
+                    return ReviveRefused(reason="halted")
+                kinds = ",".join("?" * len(_DEAD_MARKERS))
+                marker = con.execute(
+                    f"SELECT kind FROM decision_events"
+                    f" WHERE session_id=? AND kind IN ({kinds})"
+                    " ORDER BY id DESC LIMIT 1",
+                    (session_id, *_DEAD_MARKERS),
+                ).fetchone()
+                kind = marker["kind"] if marker is not None else None
+                if kind not in _LIVENESS_DEAD_MARKERS:
+                    con.execute("ROLLBACK")
+                    reason = (
+                        "no_marker"
+                        if kind is None
+                        else "operator_killed"
+                        if kind == "session_killed"
+                        else "unknown_marker"
+                    )
+                    return ReviveRefused(reason=reason, marker=kind)
+                cur = con.execute(
+                    "UPDATE sessions SET status=?, updated_at=? WHERE session_id=? AND status=?",
+                    (
+                        SessionStatus.ACTIVE.value,
+                        ts,
+                        session_id,
+                        SessionStatus.DEAD.value,
+                    ),
+                )
+                if cur.rowcount != 1:
+                    con.execute("ROLLBACK")
+                    return ReviveRefused(reason="not_dead", marker=kind)
+                con.execute(
+                    "INSERT INTO decision_events(session_id,kind,body,created_at) VALUES (?,?,?,?)",
+                    (session_id, "session_revived", f"marker={kind}", ts),
+                )
+                con.execute("COMMIT")
+                return SessionRevived(session_id=session_id, marker=kind)
+            except BaseException:
+                if con.in_transaction:
+                    con.execute("ROLLBACK")
+                raise
+        finally:
+            con.close()
+
+    return _retry(op)
+
+
+def mark_dead(
+    session_id: str,
+    kind: str,
+    detail: str,
+    *,
+    task_id=None,
+    task_note=None,
+    path=None,
+) -> str | None:
+    """Atomic ``active > dead`` CAS + durable dead-marker (issue #115).
+
+    The resurrect leg's revive guard reads the LATEST dead-causing
+    marker, so the marker insert and the status flip must commit in the
+    same ``BEGIN IMMEDIATE``: split writes left a window where a racing
+    ``bridge kill <sid>`` could land ``session_killed`` and then be
+    superseded by the late liveness marker, reviving an operator kill.
+    ``kind`` is restricted to the liveness verdicts - ``session_killed``
+    belongs to ``kill_session`` alone. ``task_id`` folds the worker's
+    live task through the same requeue CAS inside the transaction and
+    the outcome is appended to the marker body, keeping the durable
+    audit complete. Returns the journaled body on the transition edge,
+    ``None`` when the row was already dead or missing.
+    """
+    if kind not in _LIVENESS_DEAD_MARKERS:
+        raise ValueError(f"mark_dead requires a liveness marker, got {kind!r}")
+    ts = _now()
+
+    def op():
+        con = connect(path)
+        try:
+            con.execute("BEGIN IMMEDIATE")
+            try:
+                cur = con.execute(
+                    "UPDATE sessions SET status=?, updated_at=? WHERE session_id=? AND status<>?",
+                    (SessionStatus.DEAD.value, ts, session_id, SessionStatus.DEAD.value),
+                )
+                if cur.rowcount != 1:
+                    con.execute("ROLLBACK")
+                    return None
+                body = detail
+                if task_id is not None:
+                    result = _requeue_dead_worker_tx(con, task_id, task_note, ts)
+                    body = (
+                        f"{detail} task={task_id} ->"
+                        f" {result.value if result is not None else 'unchanged'}"
+                    )
+                con.execute(
+                    "INSERT INTO decision_events(session_id,kind,body,created_at) VALUES (?,?,?,?)",
+                    (session_id, kind, body, ts),
+                )
+                con.execute("COMMIT")
+                return body
             except BaseException:
                 if con.in_transaction:
                     con.execute("ROLLBACK")
