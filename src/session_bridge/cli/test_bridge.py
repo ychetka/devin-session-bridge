@@ -3047,6 +3047,42 @@ def test_item210_gwt16_kill_cli_and_event(env, capsys):
     assert rc == ExitCode.OK and out["data"]["events"][0]["kind"] == "session_killed"
 
 
+def test_item113_gwt4_kill_task_cli(env, capsys):
+    """[ITEM-113.GWT-4] `bridge kill <task_id>` (numeric positional)
+    force-fails a live task: failed row, lease released, task_killed
+    event, and a NOTICE outbox row for the owning session. A sid
+    argument keeps the session path; non-numeric ghosts stay
+    not_found; a queued task is refused."""
+    db.register("s1", "/repo/s", path=env.db)
+    db.heartbeat("s1", path=env.db)
+    tid = _task(env)
+    _claim_acp(env, tid)
+
+    rc, out = _run(["kill", str(tid), "--json"], capsys)
+    assert rc == ExitCode.OK
+    d = out["data"]
+    assert d["killed"] and d["task_id"] == tid and d["status_before"] == "running"
+    assert d["notification_id"] is not None
+    assert db.get_task(tid, path=env.db)["status"] == "failed"
+    rows = db.unrelayed_notifications("s1", path=env.db)
+    assert rows and rows[0]["kind"] == "notice" and str(tid) in rows[0]["body"]
+
+    # session path untouched: a word sid still kills the session
+    rc, out = _run(["kill", "ghost", "--json"], capsys)
+    assert rc == ExitCode.NOT_FOUND and out["status"] == "not_found"
+
+    # a queued task is refused with its status, nothing written
+    tid2 = _task(env)
+    rc, out = _run(["kill", str(tid2), "--json"], capsys)
+    assert rc == ExitCode.CONFLICT and out["status"] == "refused"
+    assert db.get_task(tid2, path=env.db)["status"] == "queued"
+
+    # an already-failed task stays refused (no duplicate event)
+    rc, out = _run(["kill", str(tid), "--json"], capsys)
+    assert rc == ExitCode.CONFLICT
+    assert db.kill_task is not None
+
+
 # --- item_98 / directive 446: fleet-metrics read-only report -------
 
 

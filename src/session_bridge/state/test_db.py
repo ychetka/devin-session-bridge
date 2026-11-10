@@ -35,6 +35,9 @@ from session_bridge.state.verdict import (
     ReleaseRemoved,
     ReserveConflict,
     ReserveGranted,
+    TaskKilled,
+    TaskKillNotFound,
+    TaskKillRefused,
     UnregisterDeleted,
     UnregisterNotFound,
     UnregisterRefusedFreshHeartbeat,
@@ -2503,6 +2506,98 @@ def test_item210_gwt15_kill_detaches_live_state(db_path):
     assert isinstance(db.kill_session("w4", path=db_path), Killed)
     assert isinstance(db.kill_session("w4", path=db_path), Killed)
     assert len(db.list_events(session_id="w4", kind="session_killed", path=db_path)) == 1
+
+
+def test_item113_gwt1_kill_task_force_fails_live(db_path):
+    """[ITEM-113.GWT-1] kill_task: CAS running|dispatch_decided > failed
+    ignoring lease_owner - lease cleared, step slot cleared, finished_at
+    stamped, dirty-tree note set, task_killed event journaled in the
+    same transaction. Unknown ids answer TaskKillNotFound; out-of-scope
+    statuses answer TaskKillRefused with the current status and write
+    nothing."""
+    assert isinstance(db.kill_task(999, path=db_path), TaskKillNotFound)
+
+    db.register("w1", "/repo/w", path=db_path)
+    running = db.enqueue("w1", "wedged work", path=db_path)
+    assert db.claim_queued(running, "bridge-1", Transport.ACP_PUSH, path=db_path)
+    assert db.mark_running(running, "bridge-1", path=db_path)
+
+    v = db.kill_task(running, path=db_path)
+    assert isinstance(v, TaskKilled)
+    assert v.session_id == "w1" and v.status_before == "running"
+
+    t = db.get_task(running, path=db_path)
+    assert t["status"] == TaskStatus.FAILED.value
+    assert t["lease_owner"] is None and t["lease_expires_at"] is None
+    assert t["finished_at"] is not None
+    assert "operator" in (t["note"] or "") or "kill" in (t["note"] or "")
+    ev = db.list_events(session_id="w1", kind="task_killed", path=db_path)
+    assert len(ev) == 1 and f"task_id={running}" in ev[0]["body"]
+
+
+def test_item113_gwt2_kill_task_staged_and_quota(db_path):
+    """[ITEM-113.GWT-2] kill_task also force-fails a staged
+    dispatch_decided row, and is senior to a waiting_quota park: the
+    step slot clears with the terminal write."""
+    db.register("w1", "/repo/w", path=db_path)
+    staged = db.enqueue("w1", "staged", path=db_path)
+    _exec(
+        db_path,
+        "UPDATE tasks SET status=?, lease_owner=?, lease_expires_at=? WHERE id=?",
+        (TaskStatus.DISPATCH_DECIDED.value, "bridge-1", int(time.time()) + 60, staged),
+    )
+    v = db.kill_task(staged, path=db_path)
+    assert isinstance(v, TaskKilled) and v.status_before == "dispatch_decided"
+    assert db.get_task(staged, path=db_path)["status"] == TaskStatus.FAILED.value
+
+    db.register("w2", "/repo/w2", path=db_path)
+    parked = db.enqueue("w2", "rate-limited", path=db_path)
+    assert db.claim_queued(parked, "bridge-2", Transport.ACP_PUSH, path=db_path)
+    assert db.mark_running(parked, "bridge-2", path=db_path)
+    assert db.quota_park(
+        parked,
+        "w2",
+        int(time.time()) + 900,
+        "reset note",
+        "self-report",
+        path=db_path,
+    )
+    v2 = db.kill_task(parked, path=db_path)
+    assert isinstance(v2, TaskKilled)
+    t2 = db.get_task(parked, path=db_path)
+    assert t2["status"] == TaskStatus.FAILED.value
+    assert t2["step_state"] is None and t2["quota_reset_at"] is None
+
+
+def test_item113_gwt3_kill_task_refuses_other_statuses(db_path):
+    """[ITEM-113.GWT-3] queued / awaiting_user / terminal rows are
+    refused with their current status - no state or event written.
+    A second kill reports 'failed', keeping the audit idempotent."""
+    db.register("w1", "/repo/w", path=db_path)
+    queued = db.enqueue("w1", "not started", path=db_path)
+    v = db.kill_task(queued, path=db_path)
+    assert isinstance(v, TaskKillRefused) and v.status == "queued"
+    assert db.get_task(queued, path=db_path)["status"] == TaskStatus.QUEUED.value
+
+    db.register("w2", "/repo/w2", path=db_path)
+    tid = db.enqueue("w2", "parked for answer", path=db_path)
+    assert db.claim_queued(tid, "bridge-2", Transport.ACP_PUSH, path=db_path)
+    assert db.mark_running(tid, "bridge-2", path=db_path)
+    db.set_awaiting_user(tid, "bridge-2", path=db_path)
+    v2 = db.kill_task(tid, path=db_path)
+    assert isinstance(v2, TaskKillRefused) and v2.status == "awaiting_user"
+    assert db.get_task(tid, path=db_path)["status"] == TaskStatus.AWAITING_USER.value
+
+    assert isinstance(db.kill_task(tid, path=db_path), TaskKillRefused)
+
+    db.register("w3", "/repo/w3", path=db_path)
+    live = db.enqueue("w3", "killable", path=db_path)
+    assert db.claim_queued(live, "bridge-3", Transport.ACP_PUSH, path=db_path)
+    assert db.mark_running(live, "bridge-3", path=db_path)
+    assert isinstance(db.kill_task(live, path=db_path), TaskKilled)
+    v3 = db.kill_task(live, path=db_path)
+    assert isinstance(v3, TaskKillRefused) and v3.status == "failed"
+    assert len(db.list_events(session_id="w3", kind="task_killed", path=db_path)) == 1
 
 
 # --- task #216: waiting_quota step state ------------------------------------

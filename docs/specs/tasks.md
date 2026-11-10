@@ -66,3 +66,29 @@ abandonment.
 - **WHEN** the lease owner calls `bridge wait <task_id>` before expiry
 - **THEN** `lease_expires_at` moves out by one lease length
 - **AND** a dead claimer that stops waiting requeues within one period
+
+### Requirement: operator kill force-fails one live task
+
+`bridge kill <task_id>` SHALL CAS `running|dispatch_decided` to
+`failed` ignoring `lease_owner` - the operator verdict is senior to
+the lease and to a `waiting_quota` park (the step slot clears with
+the terminal write). Lease fields clear, `finished_at` stamps, a
+dirty-tree note instructs the owning worker to stash and reset, and
+a durable `task_killed` decision event journals in the same
+transaction. The owning session SHALL receive a NOTICE when it is
+registered and active, so its mailbox wakes it to drop the dead
+work.
+
+#### Scenario: wedged task dies without waiting out the lease
+
+- **WHEN** a running task is force-failed by `bridge kill <task_id>`
+- **THEN** it is `failed` with the lease released and the step slot
+  cleared
+- **AND** the owning session's outbox gains a NOTICE
+
+#### Scenario: out-of-scope statuses are refused, not touched
+
+- **WHEN** `bridge kill` targets a `queued`, `awaiting_user`, `done`
+  or `failed` task
+- **THEN** the command refuses with the current status
+- **AND** no state or event row is written

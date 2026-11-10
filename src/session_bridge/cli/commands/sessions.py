@@ -34,6 +34,8 @@ from session_bridge.state.contract import (
 )
 from session_bridge.state.verdict import (
     KillNotFound,
+    TaskKillNotFound,
+    TaskKillRefused,
     UnregisterNotFound,
     UnregisterRefusedFreshHeartbeat,
     UnregisterRefusedLiveTask,
@@ -525,6 +527,81 @@ def _cmd_resume(args) -> int:
 
 
 def _cmd_kill(args) -> int:
+    """``bridge kill <sid|task_id>``: force-terminate a session (task #210)
+    or force-fail one live task (issue #113).
+
+    A purely numeric positional addresses a task; anything else is a
+    session id (sids are generated word-word names, never numeric).
+    """
+    if args.session_id.isdigit():
+        return _cmd_kill_task(args)
+    return _cmd_kill_session(args)
+
+
+def _cmd_kill_task(args) -> int:
+    """``bridge kill <task_id>``: operator force-fail of one live task.
+
+    CAS ``running|dispatch_decided > failed`` ignoring ``lease_owner``
+    (``db.kill_task``): the wedged step dies without waiting out the
+    lease or tearing the session down with it. On success the owning
+    session gets a NOTICE through the outbox so its mailbox wakes it to
+    drop the dead work - discovering the CAS loss at ``bridge finish``
+    would burn a full turn on a task already failed.
+    """
+    task_id = int(args.session_id)
+    verdict = db.kill_task(task_id, path=args.db)
+    if isinstance(verdict, TaskKillNotFound):
+        resp = JsonResponse(
+            session=None,
+            status="not_found",
+            error=f"no task {task_id}",
+        )
+        return _emit(args, resp, ExitCode.NOT_FOUND, f"not found: task {task_id}")
+    if isinstance(verdict, TaskKillRefused):
+        resp = JsonResponse(
+            session=None,
+            status="refused",
+            error=f"task {task_id} is {verdict.status}, not running/dispatch_decided",
+            agent_instruction=(
+                "only running/dispatch_decided tasks force-fail; "
+                "queued tasks are cancelled, terminal tasks are already done"
+            ),
+        )
+        return _emit(
+            args,
+            resp,
+            ExitCode.CONFLICT,
+            f"refused: task {task_id} is {verdict.status}",
+        )
+    sid = verdict.session_id
+    notified = None
+    target = db.get_session(sid, path=args.db)
+    if target is not None and target["status"] == "active":
+        notified = db.notify(
+            sid,
+            NotificationKind.NOTICE,
+            f"task {task_id} was force-failed by the operator"
+            " (bridge kill): stash dirty state, stop working it,"
+            " and move on - do not retry or finish it",
+            path=args.db,
+        )
+    resp = JsonResponse(
+        session=sid,
+        status="ok",
+        data={
+            "killed": True,
+            "task_id": task_id,
+            "status_before": verdict.status_before,
+            "notification_id": notified,
+        },
+    )
+    human = f"killed task {task_id}: status {verdict.status_before}->failed" + (
+        f", notice {notified} queued for {sid}" if notified else ""
+    )
+    return _emit(args, resp, ExitCode.OK, human)
+
+
+def _cmd_kill_session(args) -> int:
     """``bridge kill <sid>``: force-terminate a session's live state (task #210).
 
     The detach path for a session that is gone or must be cut loose

@@ -30,6 +30,10 @@ __all__ = [
     "ReserveConflict",
     "ReserveGranted",
     "ReserveVerdict",
+    "TaskKillNotFound",
+    "TaskKillRefused",
+    "TaskKillVerdict",
+    "TaskKilled",
     "UnregisterDeleted",
     "UnregisterNotFound",
     "UnregisterRefusedFreshHeartbeat",
@@ -138,6 +142,37 @@ class ReleaseRefusedOwner(_Verdict):
 
 ReleaseVerdict = Annotated[
     ReleaseRemoved | ReleaseNotFound | ReleaseRefusedOwner,
+    Field(discriminator="kind"),
+]
+
+
+class TaskKillNotFound(_Verdict):
+    """No task row with that id."""
+
+    kind: Literal["not_found"] = "not_found"
+
+
+class TaskKillRefused(_Verdict):
+    """The task exists but is not killable: only ``running`` and
+    ``dispatch_decided`` rows force-fail - ``queued`` never started,
+    ``done``/``failed`` are already terminal, ``awaiting_user`` folds
+    on its own paths."""
+
+    kind: Literal["refused"] = "refused"
+    status: str
+
+
+class TaskKilled(_Verdict):
+    """The live task force-failed: status ``failed``, lease and step
+    slot cleared, ``task_killed`` event journaled."""
+
+    kind: Literal["killed"] = "killed"
+    session_id: str
+    status_before: str
+
+
+TaskKillVerdict = Annotated[
+    TaskKillNotFound | TaskKillRefused | TaskKilled,
     Field(discriminator="kind"),
 ]
 

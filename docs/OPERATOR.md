@@ -455,17 +455,12 @@ human-override items (task #198, v0.3.14):
   gives every session at most one live task, so a task can never
   queue-jump ahead of another for the same session - "urgent" means
   push to a session whose slot is free, or kill the live task.
-- **Remaining real gap - operator force-fail of a running task**:
-  `bridge finish` is owner-CAS'd, so a wedged session's running
-  task survives until lease recovery (or `lease_auto_renew`'s
-  ceiling while it reports busy). The delivered `bridge kill
-  <sid>` (v0.5.0) is session-scoped - it detaches the whole
-  session and requeues its task for
-  re-dispatch. A task scoped `bridge kill <task_id>` - CAS
-  `running|dispatch_decided > failed` ignoring lease_owner, with
-  the same `requeue_dead_worker` dirty-tree note - would still
-  close the "stop THIS task now" piece. Small, deferred as a
-  separate item.
+- **Operator force-fail of a running task - delivered (v0.8.3)**:
+  `bridge kill <task_id>` (a numeric positional) CASes
+  `running|dispatch_decided > failed` ignoring `lease_owner`, so a
+  wedged step dies without waiting out the lease or detaching the
+  session. The owning session gets a NOTICE so its mailbox wakes it
+  to drop the dead work. See the command table.
 
 ## Daemon lifecycle
 
@@ -1018,6 +1013,7 @@ Global flags: `--db PATH` (`SESSIONS_BRIDGE_DB`), `--queue-dir DIR`
 | `bridge resume <sid>` / `bridge resume --all` | lift a halt: clears `halted_at`, queues the `resume` semantic and wakes the session (v0.3.11). |
 | `bridge unregister <sid> [--force]` | remove a dead/ghost registration and all its state (v0.3.14): refuses when a live task exists, when the heartbeat is fresh, or when the acp-host still lists the session (`--force` skips the two liveness legs; the live-task refusal always applies). Deletes sessions/heartbeat/tasks/notifications/questions/schedules/wake_state rows and the mailbox dir - `audit_events` and the decision journal keep the audit trail. Since v0.3.15 the mailbox is tombstone-renamed before the delete commits: a refusal restores it, a success removes the tombstone, and mail landing in a recreated `queue/<sid>` during the delete is post-delete state that survives (`mailbox_dir_recreated`/`mailbox_tombstoned` in the JSON output). |
 | `bridge kill <sid>` | force-terminate a session's live bridge state without `unregister`'s liveness refusals or row deletion (v0.5.0): the session flips to `dead`, `running`/`awaiting_user` tasks requeue with leases released (a resurrected session re-dispatches them through the normal pump/claim path - `queued` is the only claimable re-entry state), staged `dispatch_decided` rows fold back to `queued`, and the heartbeat row is removed so metronome writes cannot keep the corpse warm. `queued` tasks stay queued. All effects land in one transaction with a `session_killed` `decision_events` row. Idempotent on an already-dead row (a no-op repeat writes no duplicate event); `not_found` on an unregistered sid. Kill detaches bridge state, it is not a ban - a still-alive session self-revives on its next `register` (unmanaged also on `heartbeat`). |
+| `bridge kill <task_id>` | force-fail one live task (v0.8.3): a numeric positional addresses a task instead of a session. CAS `running|dispatch_decided > failed` ignoring `lease_owner` (senior to `waiting_quota` - the step slot clears with the terminal write), lease fields released, `finished_at` stamped, dirty-tree note set (`operator-kill: stash…`), durable `task_killed` `decision_events` row in the same transaction. The owning session gets a NOTICE outbox row when registered+active so its mailbox wakes it to drop the dead work. `queued`/`awaiting_user`/`done`/`failed` are refused with their current status (a repeat kill reports `failed` - idempotent, no duplicate event); `not_found` on a missing id. |
 | `bridge register <sid> [--role worker\|orchestrator] [--workspace DIR] [--force]` | join the bus and stamp the heartbeat; orchestrator is a CAS singleton. |
 | `bridge ask --session SID --task ID "text"` | post a worker question; refused when another question is pending (`pending_exists`), the task hit the 3-question budget (`question_limit`), or no active orchestrator exists (`no_orchestrator`). |
 | `bridge ack --session SID [--up-to N]` | advance the session's mailbox ack watermark. |
