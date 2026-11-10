@@ -5,7 +5,7 @@
 ### User-facing
 
 #### feat
-- `bridge kill <task_id>` force-fails one wedged live task (running|dispatch_decided > failed ignoring the lease) and notifies the owning session - no waiting out the lease, no session teardown. `cli` (issue #113) `cli,state` (issue #113, item_35 deferred note)
+- `bridge kill <task_id>` force-fails one wedged live task (running|dispatch_decided > failed ignoring the lease) and notifies the owning session - no waiting out the lease, no session teardown. `cli` (issue #113, item_35 deferred note)
 
 ### Codebase
 
