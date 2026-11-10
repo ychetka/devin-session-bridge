@@ -3009,3 +3009,106 @@ def test_item249_gwt5_unverifiable_owner_still_releases(env, monkeypatch):
     events = [e["kind"] for e in db.list_events(session_id=SID, path=env.db)]
     assert "quota_probe_gave_up" in events
     assert "quota_probe_escalated" not in events
+
+
+def test_item249_gwt6_hold_budget_exhausted_releases(env, monkeypatch):
+    """[ITEM-249.GWT-6] (review r1): the busy-hold budget is bounded per
+    episode - past it a still-busy owner releases like an
+    unverifiable one, so a wedged turn cannot park forever."""
+    _managed_fresh(env)
+    tid = _parked_task(env, reset_in=-10)
+    _exec(
+        env.db,
+        "UPDATE tasks SET quota_defer_count=? WHERE id=?",
+        (daemon._QUOTA_PROBE_DEFER_LIMIT + daemon._QUOTA_BUSY_HOLD_LIMIT, tid),
+    )
+    monkeypatch.setattr(daemon, "find_lockfile", lambda *a, **k: None)
+    monkeypatch.setattr(daemon, "wake_session", lambda sid, *a, **k: "sent")
+    monkeypatch.setattr(daemon, "_busy_sessions", lambda *a, **k: {SID})
+
+    assert daemon.run(env.db, env.qdir, once=True, notify_send=env.notifier) == daemon.RUN_OK
+
+    assert db.get_task(tid, path=env.db)["step_state"] is None
+    events = [e["kind"] for e in db.list_events(session_id=SID, path=env.db)]
+    assert "quota_probe_gave_up" in events
+    assert "quota_probe_held_busy" not in events
+
+
+def test_item249_gwt7_notify_send_fallback_without_orchestrator(env, monkeypatch):
+    """[ITEM-249.GWT-7] no active orchestrator -> the busy-hold
+    escalation falls back to notify-send, same as mail-stall."""
+    _managed_fresh(env)
+    tid = _parked_task(env, reset_in=-10)
+    _exec(
+        env.db,
+        "UPDATE tasks SET quota_defer_count=? WHERE id=?",
+        (daemon._QUOTA_PROBE_DEFER_LIMIT, tid),
+    )
+    monkeypatch.setattr(daemon, "find_lockfile", lambda *a, **k: None)
+    monkeypatch.setattr(daemon, "wake_session", lambda sid, *a, **k: "sent")
+    monkeypatch.setattr(daemon, "_busy_sessions", lambda *a, **k: {SID})
+
+    assert daemon.run(env.db, env.qdir, once=True, notify_send=env.notifier) == daemon.RUN_OK
+
+    assert db.get_task(tid, path=env.db)["step_state"] == "waiting_quota"
+    assert any("[QUOTA_PROBE]" in body and f"task={tid}" in body for _, body in env.sent)
+
+
+def test_item249_gwt8_escalate_failure_keeps_hold(env, monkeypatch):
+    """[ITEM-249.GWT-8] (review r1): a throwing escalation must not kill
+    the pass or silently drop the hold - the dedup stamp is already
+    committed, so the failure is journaled and the re-park stands."""
+    _managed_fresh(env)
+    tid = _parked_task(env, reset_in=-10)
+    _exec(
+        env.db,
+        "UPDATE tasks SET quota_defer_count=? WHERE id=?",
+        (daemon._QUOTA_PROBE_DEFER_LIMIT, tid),
+    )
+    monkeypatch.setattr(daemon, "find_lockfile", lambda *a, **k: None)
+    monkeypatch.setattr(daemon, "wake_session", lambda sid, *a, **k: "sent")
+    monkeypatch.setattr(daemon, "_busy_sessions", lambda *a, **k: {SID})
+
+    def boom(*a, **k):
+        raise RuntimeError("outbox full")
+
+    monkeypatch.setattr(daemon, "_quota_escalate", boom)
+
+    assert daemon.run(env.db, env.qdir, once=True, notify_send=env.notifier) == daemon.RUN_OK
+
+    row = db.get_task(tid, path=env.db)
+    assert row["step_state"] == "waiting_quota"
+    assert row["quota_source"] == "busy-hold"
+    assert any(d["event"] == "quota_probe_escalate_failed" for d in _decisions(env))
+    assert any(
+        e["kind"] == "quota_probe_held_busy" for e in db.list_events(session_id=SID, path=env.db)
+    )
+
+
+def test_item249_gwt9_busy_hold_lost_cas_journaled(env, monkeypatch):
+    """[ITEM-249.GWT-9] a busy-hold CAS lost to a moved task / fresher
+    park journals durably instead of releasing or resurrecting."""
+    _managed_fresh(env)
+    tid = _parked_task(env, reset_in=-10)
+    _exec(
+        env.db,
+        "UPDATE tasks SET quota_defer_count=? WHERE id=?",
+        (daemon._QUOTA_PROBE_DEFER_LIMIT, tid),
+    )
+    monkeypatch.setattr(daemon, "find_lockfile", lambda *a, **k: None)
+    monkeypatch.setattr(daemon, "wake_session", lambda sid, *a, **k: "sent")
+    monkeypatch.setattr(daemon, "_busy_sessions", lambda *a, **k: {SID})
+    # task finishes between the busy check and the hold re-park
+    orig_park = db.quota_park
+
+    def racing_park(*a, **k):
+        _exec(env.db, "UPDATE tasks SET status='done' WHERE id=?", (tid,))
+        return orig_park(*a, **k)
+
+    monkeypatch.setattr(daemon.db, "quota_park", racing_park)
+
+    assert daemon.run(env.db, env.qdir, once=True, notify_send=env.notifier) == daemon.RUN_OK
+
+    events = [e["kind"] for e in db.list_events(session_id=SID, path=env.db)]
+    assert "quota_probe_hold_lost" in events
+    assert "quota_probe_gave_up" not in events

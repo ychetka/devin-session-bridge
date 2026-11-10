@@ -105,8 +105,11 @@ worker failure. The park instead re-arms for a bounded hold
 (`SESSIONS_BRIDGE_QUOTA_BUSY_HOLD_SECONDS`, default 3600s) and the
 first give-up per episode escalates once to the orchestrator as a
 `[QUOTA_PROBE]` notice (notify-send fallback); repeat give-ups
-re-hold without re-alerting. An owner that cannot be verified busy
-keeps the release contract.
+re-hold without re-alerting. Holds are bounded at
+`_QUOTA_BUSY_HOLD_LIMIT` (3) per episode - a permanently-busy
+(wedged) turn cannot park its task forever after a single
+escalation. An owner that cannot be verified busy, or whose hold
+budget is spent, keeps the release contract.
 
 #### Scenario: busy owner holds, idle owner releases
 
@@ -116,8 +119,9 @@ keeps the release contract.
   orchestrator gets one `[QUOTA_PROBE]` notice naming task, session
   and defer count, and `quota_probe_escalated`/`quota_probe_held_busy`
   events journal durably
-- **AND** when the owner is absent, idle or unverifiable, the park
-  releases with `quota_probe_gave_up` exactly as before
+- **AND** when the owner is absent, idle or unverifiable, or the
+  episode's hold budget is exhausted, the park releases with
+  `quota_probe_gave_up` exactly as before
 
 ### Requirement: HALT is senior to a quota reset
 

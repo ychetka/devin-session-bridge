@@ -1477,14 +1477,22 @@ _QUOTA_PROBE_DEFER_LIMIT = 10
 #: mid-turn (task #249): releasing to the lease lifecycle there folds
 #: a delivery problem into a worker failure - the task that hit the
 #: defer limit while its owner kept working lost its lease and died
-#: on attempts. A busy owner keeps the park (bounded so a wedged turn
-#: still hands off through the same give-up path later) and the first
-#: give-up escalates to the orchestrator; repeat give-ups inside the
-#: episode re-hold silently - ``quota_defer_count`` past the limit is
-#: the dedup stamp.
+#: on attempts. A busy owner keeps the park and the first give-up
+#: escalates to the orchestrator; repeat give-ups inside the episode
+#: re-hold silently - ``quota_defer_count`` past the limit is the
+#: dedup stamp.
 _QUOTA_BUSY_HOLD_SECONDS = max(
     300, _env_int("SESSIONS_BRIDGE_QUOTA_BUSY_HOLD_SECONDS", db.LEASE_SECONDS)
 )
+
+#: bound on consecutive busy-holds per episode (review r1): an
+#: unbounded hold would let a permanently-busy (wedged) turn park its
+#: task forever after one escalation - the same failure shape
+#: ``_LEASE_AUTO_RENEW_LIMIT`` bounds for auto-renew. Past the budget
+#: the give-up releases to the lease lifecycle exactly like an
+#: unverifiable owner. ``quota_defer_count`` doubles as the hold
+#: counter: deferrals reach the probe limit, each hold adds one more.
+_QUOTA_BUSY_HOLD_LIMIT = 3
 
 
 def _orchestrator_sid(db_path):
@@ -1501,9 +1509,7 @@ def _orchestrator_sid(db_path):
         con.close()
 
 
-def _quota_escalate(
-    db_path, state_directory, sid, task_id, now: int, why: str, defers: int, notify
-) -> None:
+def _quota_escalate(db_path, state_directory, sid, task_id, why: str, defers: int, notify) -> None:
     """First give-up on a busy owner: escalate instead of release.
 
     Mirrors the ``_mail_stall_pass`` escalation shape - a ``notice``
@@ -1567,9 +1573,11 @@ def _defer_probe(
     verifiably mid-turn, where release would fail a working task for
     a delivery problem: then the park re-arms for
     ``_QUOTA_BUSY_HOLD_SECONDS`` and the first give-up escalates to
-    the orchestrator (task #249). The re-park CASes on
-    ``step_state IS NULL`` - a fresher self-report park landing
-    mid-sweep always wins over a stale defer.
+    the orchestrator (task #249). Holds are bounded per episode by
+    ``_QUOTA_BUSY_HOLD_LIMIT`` - a permanently-busy (wedged) turn
+    cannot park its task forever after a single escalation. The
+    re-park CASes on ``step_state IS NULL`` - a fresher self-report
+    park landing mid-sweep always wins over a stale defer.
     """
     task = db.get_task(task_id, path=db_path)
     defers = (task["quota_defer_count"] or 0) if task is not None else 0
@@ -1577,11 +1585,13 @@ def _defer_probe(
         busy = sid in _busy_sessions(
             [sid], state_directory, verify_failed_event="quota_probe_verify_failed"
         )
-        if busy and db.quota_park(
+        holdable = busy and defers < _QUOTA_PROBE_DEFER_LIMIT + _QUOTA_BUSY_HOLD_LIMIT
+        if holdable and db.quota_park(
             task_id,
             sid,
             now + _QUOTA_BUSY_HOLD_SECONDS,
-            row["quota_note"] if row is not None else f"probe undeliverable ({why})",
+            (row["quota_note"] if row is not None and row["quota_note"] else None)
+            or f"probe undeliverable ({why})",
             "busy-hold",
             model=row["quota_model"] if row is not None else None,
             checkpoint=row["quota_checkpoint"] if row is not None else None,
@@ -1590,7 +1600,18 @@ def _defer_probe(
             path=db_path,
         ):
             if defers == _QUOTA_PROBE_DEFER_LIMIT:
-                _quota_escalate(db_path, state_directory, sid, task_id, now, why, defers, notify)
+                try:
+                    _quota_escalate(db_path, state_directory, sid, task_id, why, defers, notify)
+                except Exception as e:
+                    # the dedup stamp already committed - a thrown
+                    # escalation must not kill the pass or lose the
+                    # hold silently; journal the lost alert instead
+                    _decision(
+                        state_directory,
+                        "quota_probe_escalate_failed",
+                        sid,
+                        f"task={task_id} {type(e).__name__}: {e}",
+                    )
             _decision(
                 state_directory,
                 "quota_probe_held_busy",
@@ -1606,7 +1627,7 @@ def _defer_probe(
                 path=db_path,
             )
             return
-        if busy:
+        if holdable:
             # the hold CAS lost to a moved task / fresher park -
             # journal like defer_lost and stop: no release decision
             # to make for a row we no longer own
@@ -1628,13 +1649,15 @@ def _defer_probe(
             state_directory,
             "quota_probe_gave_up",
             sid,
-            f"task={task_id} why={why} after {defers} defers",
+            f"task={task_id} why={why} after {defers} defers"
+            + (" - busy-hold budget exhausted" if busy else ""),
         )
         db.record_event(
             sid,
             "quota_probe_gave_up",
             f"task={task_id} probe undeliverable after {defers} defers ({why})"
-            " - released to ordinary lease lifecycle",
+            + (", busy-hold budget exhausted" if busy else "")
+            + " - released to ordinary lease lifecycle",
             task_id=task_id,
             path=db_path,
         )

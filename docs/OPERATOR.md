@@ -165,7 +165,8 @@ Storage layout (state dir = the directory holding `state.db`, default
    3600s) under `quota_source=busy-hold` and the first give-up
    escalates once to the orchestrator as a `[QUOTA_PROBE]` notice -
    a still-working session must not lose its task to a probe-delivery
-   problem; repeat give-ups re-hold silently. Every real park commits
+   problem; repeat give-ups re-hold silently, bounded at 3 holds per
+   episode so a permanently-busy (wedged) turn cannot park forever. Every real park commits
    a durable `quota_park` decision_events row with the reset window,
    source and the original marker text, defer re-parks preserve the
    original `quota_note`, and control probes pace on their own budget
