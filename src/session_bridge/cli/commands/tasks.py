@@ -445,7 +445,7 @@ def _cmd_claim(args) -> int:
         resp = JsonResponse(
             session=sid,
             status="conflict",
-            error=f"claim of task {tid} refused (queue_paused or raced)",
+            error=f"claim of task {tid} refused (queue_paused, raced, or session-slot cap)",
         )
         return _emit(args, resp, ExitCode.CONFLICT, f"conflict: claim refused for task {tid}")
     row = db.get_task(tid, path=args.db)

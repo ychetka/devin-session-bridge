@@ -50,6 +50,15 @@ from session_bridge.state.contract import (
 #: concurrent acp-push sessions cap; queued tasks beyond it wait.
 SEMAPHOR = 3
 
+#: optional cap on concurrently active sessions - distinct sids
+#: holding a live (running|dispatch_decided) task (issue #121).
+#: 0 = unlimited. Queued tasks for a session over the cap stay
+#: queued; a session already active never spends a second slot.
+#: The pump-side check is an observability pre-filter (it produces
+#: slot_wait); enforcement itself lives inside the db claim/staging
+#: CAS predicates (db._SLOT_SQL) so every claim edge is covered.
+MAX_ACTIVE_SESSIONS = db.MAX_ACTIVE_SESSIONS
+
 #: default end_turn wait for ``session/prompt`` in the worker.
 WORK_TIMEOUT_DEFAULT = 3600
 
@@ -251,7 +260,9 @@ def pump(args) -> dict:
     """Lazy recovery + one dispatch pass over queued tasks.
 
     Returns ``{"events", "hooked", "spawned", "unknown", "managed",
-    "saturated"}`` for the calling command's response. The queue is
+    "saturated", "slot_wait"}`` for the calling command's response -
+    ``slot_wait`` lists task ids this pass left queued solely because
+    ``MAX_ACTIVE_SESSIONS`` had no free slot (issue #121). The queue is
     scanned in capped batches paginated by task id, so every queued
     task is visited even beyond the ``list_tasks`` limit; hook-folded
     tasks land back in ``queued`` keeping the same id - already below
@@ -263,6 +274,7 @@ def pump(args) -> dict:
     unknown: list[str] = []
     managed: list[int] = []
     saturated = False
+    slot_wait: list[int] = []
 
     _sweep_worker_logs(args)
 
@@ -289,6 +301,11 @@ def pump(args) -> dict:
         path=args.db,
     )
 
+    # session-slot admission set (issue #121): distinct sids holding a
+    # live task. Refreshed per pass and updated in-place on every
+    # successful dispatch so intra-pass ordering sees the real count.
+    active_sids = db.active_session_ids(path=args.db)
+
     last_id = 0
     while True:
         batch = db.list_tasks(
@@ -302,6 +319,18 @@ def pump(args) -> dict:
             last_id = task["id"]
             tid = task["id"]
             sid = task["session_id"]
+            if (
+                MAX_ACTIVE_SESSIONS
+                and sid not in active_sids
+                and len(active_sids) >= MAX_ACTIVE_SESSIONS
+            ):
+                # session-slot cap (issue #121): dispatching to an
+                # inactive sid would spend a new slot the operator
+                # has bounded - the task waits for the next pass.
+                # A sid already active is exempt: its extra tasks
+                # never consume additional slots.
+                slot_wait.append(tid)
+                continue
             if _session_mode(sid, args) == SessionMode.MANAGED.value:
                 # managed sessions take deliveries only through the
                 # notifications outbox -> fs mailbox (the daemon relay
@@ -314,6 +343,7 @@ def pump(args) -> dict:
                 if not _has_open_dispatch(tid, args):
                     owner = _managed_owner(sid, tid)
                     if db.dispatch_managed(tid, owner, path=args.db):
+                        active_sids.add(sid)
                         db.notify(
                             sid,
                             NotificationKind.TASK_DISPATCH,
@@ -332,6 +362,10 @@ def pump(args) -> dict:
                 if db.claim_queued(
                     tid, owner, Transport.HOOK_QUEUE, path=args.db
                 ) and db.fallback_to_hook(tid, owner, path=args.db):
+                    # no active_sids.add: the fold leaves the task
+                    # QUEUED with a decided transport - the sid is not
+                    # live, so it holds no slot (review r2: counting it
+                    # would contradict session_slots.active for a pass)
                     _write_trigger(_queue_dir(args), sid)
                     hooked.append(tid)
                 continue
@@ -389,6 +423,7 @@ def pump(args) -> dict:
                 continue
             spawned.append(tid)
             running_acp += 1
+            active_sids.add(sid)
     return {
         "events": events,
         "hooked": hooked,
@@ -396,6 +431,7 @@ def pump(args) -> dict:
         "unknown": unknown,
         "managed": managed,
         "saturated": saturated,
+        "slot_wait": slot_wait,
     }
 
 

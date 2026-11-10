@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.10.0] - 2026-11-10
+
+### User-facing
+
+#### feat
+- optional SB_MAX_ACTIVE_SESSIONS caps concurrently active sessions; over-cap tasks queue with a slot-wait reason in bridge status `cli` (issue #121)
+
+### Codebase
+
+#### cli
+- [feat] db.active_session_ids counts distinct sids holding running|dispatch_decided tasks; SB_MAX_ACTIVE_SESSIONS (default 0 = unlimited, negatives clamp) is enforced inside the claim_queued / claim_managed / dispatch_managed CAS predicates via _SLOT_SQL - a queued claim needs a free slot while a staged dispatch_decided self-claim passes the EXISTS leg - so every claim edge (pump, Stop hook, user kick, managed claim) honors the cap atomically; the pump additionally pre-filters for slot_wait observability surfaced via bridge status session_slots + slot_wait_reason. Why: fleet-wide quota preservation - the operator needs a coarse lever bounding how many sessions burn in parallel; CAS-enforcement rather than a pump snapshot because direct claim edges would bypass a dispatch-only gate (review r1) (issue #121)
+
 ## [0.9.1] - 2026-11-10
 
 ### User-facing

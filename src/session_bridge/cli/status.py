@@ -16,6 +16,7 @@ from session_bridge.cli.contract import (
 )
 from session_bridge.cli.dispatch import (
     _LIVE_VALUES,
+    MAX_ACTIVE_SESSIONS,
     SEMAPHOR,
     STATE_DISPATCHING,
     STATE_FAILED,
@@ -616,6 +617,14 @@ def _cmd_status(args) -> int:
             ),
             "max": SEMAPHOR,
         },
+        # issue #121: optional session-slot cap; max 0 = unlimited.
+        # slot_wait is the backlog this pass left queued only because
+        # a fresh session slot was unavailable
+        "session_slots": {
+            "active": len(db.active_session_ids(path=args.db)),
+            "max": MAX_ACTIVE_SESSIONS,
+        },
+        "slot_wait": len(result["slot_wait"]),
         # item_13e2 fleet view: the human render below reads only
         # these keys; --json carries the uncapped structures
         "attention": snap["attention"],
@@ -625,6 +634,8 @@ def _cmd_status(args) -> int:
     }
     if result["saturated"]:
         data["saturation_reason"] = "MAX_CONCURRENT_REACHED"
+    if result["slot_wait"]:
+        data["slot_wait_reason"] = "MAX_ACTIVE_SESSIONS_REACHED"
     resp = JsonResponse(
         status="ok",
         queue_depth=queue_depth,
@@ -637,7 +648,7 @@ def _cmd_status(args) -> int:
 def _next_action(task) -> str:
     st = task["status"]
     if st == TaskStatus.QUEUED.value:
-        return "waiting for dispatch (semaphore or hook trigger)"
+        return "waiting for dispatch (semaphore, session-slot cap, or hook trigger)"
     if st == TaskStatus.DISPATCH_DECIDED.value:
         return "dispatch in progress"
     if st == TaskStatus.RUNNING.value:
