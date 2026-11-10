@@ -3527,3 +3527,5 @@ def test_item230_work_park_cas_lost_falls_through(env, capsys, monkeypatch):
     row = db.get_task(tid, path=env.db)
     assert row["step_state"] is None
     assert row["status"] == TaskStatus.FAILED.value
+    events = [e["kind"] for e in db.list_events(session_id=SID, path=env.db)]
+    assert "quota_park_lost" in events
