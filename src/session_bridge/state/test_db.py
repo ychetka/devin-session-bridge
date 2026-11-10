@@ -2800,6 +2800,37 @@ def test_quota_terminal_writers_clear_step_fields(db_path):
     assert db.get_task(tid2, path=db_path)["step_state"] is None
 
 
+def test_quota_park_journals_marker_durably(db_path):
+    """GWT-249-1: every real park commits a durable ``quota_park``
+    event in the same transaction as the CAS - the postmortem journal
+    carries the reset window, the source and the original marker text
+    (task 249 incident: the durable audit saw unpark/probe cycles for
+    a park it could never explain)."""
+    db.register("s1", "/repo/s1", path=db_path)
+    tid = _enqueue_running(db_path, "s1", "w1")
+    marker = "Reached free model rate limit. reset in 58 minutes"
+    assert db.quota_park(tid, "s1", 1799999999, marker, "wake", path=db_path)
+    events = db.list_events(session_id="s1", kind="quota_park", path=db_path)
+    assert len(events) == 1
+    body = events[0]["body"]
+    assert f"task={tid}" in body and "source=wake" in body
+    assert "reset_at=1799999999" in body and marker in body
+    assert events[0]["task_id"] == tid
+    # a refused CAS writes no event
+    assert not db.quota_park(999999, "s1", 1, "x", "wake", path=db_path)
+    assert len(db.list_events(session_id="s1", kind="quota_park", path=db_path)) == 1
+
+
+def test_quota_park_defer_writes_no_park_event(db_path):
+    """GWT-249-2: deferral re-parks journal ``quota_probe_deferred`` at
+    the daemon layer - a second ``quota_park`` row per cycle would
+    double-count the episode, so defer parks deliberately skip it."""
+    db.register("s1", "/repo/s1", path=db_path)
+    tid = _enqueue_running(db_path, "s1", "w1")
+    assert db.quota_park(tid, "s1", 1, "marker", "probe-defer", defer=True, path=db_path)
+    assert db.list_events(session_id="s1", kind="quota_park", path=db_path) == []
+
+
 def test_lease_ttl_env_override():
     """issue #105 (directive): ``SB_LEASE_TTL_S`` resolves once at db
     import; a malformed value falls back to the contract default,

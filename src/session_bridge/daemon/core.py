@@ -860,6 +860,12 @@ def _wake_quota_park(db_path, state_directory, sid, exc, now: int) -> bool:
             sid,
             f"no live task - {str(exc)[:200]}",
         )
+        db.record_event(
+            sid,
+            "quota_signal_seen",
+            f"no live task - {str(exc)[:400]}",
+            path=db_path,
+        )
         return False
     reset_at = signal["reset_at"]
     note = str(exc)[:500]
@@ -1467,8 +1473,87 @@ _QUOTA_PROBE_DEFER_SECONDS = 120
 #: the outcome, with a durable give-up event for the operator.
 _QUOTA_PROBE_DEFER_LIMIT = 10
 
+#: hold window when a probe-undeliverable task's owner is verifiably
+#: mid-turn (task #249): releasing to the lease lifecycle there folds
+#: a delivery problem into a worker failure - the task that hit the
+#: defer limit while its owner kept working lost its lease and died
+#: on attempts. A busy owner keeps the park and the first give-up
+#: escalates to the orchestrator; repeat give-ups inside the episode
+#: re-hold silently - ``quota_defer_count`` past the limit is the
+#: dedup stamp.
+_QUOTA_BUSY_HOLD_SECONDS = max(
+    300, _env_int("SESSIONS_BRIDGE_QUOTA_BUSY_HOLD_SECONDS", db.LEASE_SECONDS)
+)
 
-def _defer_probe(db_path, state_directory, sid, task_id, now: int, why: str, row=None) -> None:
+#: bound on consecutive busy-holds per episode (review r1): an
+#: unbounded hold would let a permanently-busy (wedged) turn park its
+#: task forever after one escalation - the same failure shape
+#: ``_LEASE_AUTO_RENEW_LIMIT`` bounds for auto-renew. Past the budget
+#: the give-up releases to the lease lifecycle exactly like an
+#: unverifiable owner. ``quota_defer_count`` doubles as the hold
+#: counter: deferrals reach the probe limit, each hold adds one more.
+_QUOTA_BUSY_HOLD_LIMIT = 3
+
+
+def _orchestrator_sid(db_path):
+    """The active orchestrator's session id for escalation notices."""
+    con = db.connect(db_path)
+    try:
+        row = con.execute(
+            "SELECT session_id FROM sessions WHERE role=? AND status=?"
+            " ORDER BY updated_at DESC LIMIT 1",
+            (SessionRole.ORCHESTRATOR.value, SessionStatus.ACTIVE.value),
+        ).fetchone()
+        return row["session_id"] if row else None
+    finally:
+        con.close()
+
+
+def _quota_escalate(db_path, state_directory, sid, task_id, why: str, defers: int, notify) -> None:
+    """First give-up on a busy owner: escalate instead of release.
+
+    Mirrors the ``_mail_stall_pass`` escalation shape - a ``notice``
+    carrying a parseable ``[QUOTA_PROBE]`` marker goes to the active
+    orchestrator (``notify_send`` when none is registered), and a
+    durable ``quota_probe_escalated`` row keeps the audit restart-
+    proof. Fires only when ``defers`` equals the limit exactly: the
+    hold re-park bumps the count past it, so repeat give-ups inside
+    one episode re-hold without re-alerting.
+    """
+    body = (
+        f"[QUOTA_PROBE] task={task_id} on {sid}: control probe"
+        f" undeliverable after {defers} defers ({why})"
+        "; owner verifiably mid-turn - task held waiting_quota"
+        f" {_QUOTA_BUSY_HOLD_SECONDS}s instead of lease expiry"
+        " (manual `bridge wake`, `quota-resume`, or wait for turn end)"
+    )
+    orch = _orchestrator_sid(db_path)
+    if orch is not None and orch != sid:
+        db.notify(orch, NotificationKind.NOTICE, body, path=db_path)
+        target = f"orchestrator {orch}"
+    elif notify is not None:
+        notify("sessions-bridge QUOTA PROBE", body)
+        target = "notify-send"
+    else:
+        target = "none"
+    _decision(
+        state_directory,
+        "quota_probe_escalated",
+        sid,
+        f"task={task_id} why={why} defers={defers} -> {target}",
+    )
+    db.record_event(
+        sid,
+        "quota_probe_escalated",
+        body,
+        task_id=task_id,
+        path=db_path,
+    )
+
+
+def _defer_probe(
+    db_path, state_directory, sid, task_id, now: int, why: str, row=None, notify=None
+) -> None:
     """Re-park a released task when its control probe could not run.
 
     A short fresh window keeps ``waiting_quota`` semantics alive (no
@@ -1476,29 +1561,110 @@ def _defer_probe(db_path, state_directory, sid, task_id, now: int, why: str, row
     probe - the alternative, leaving the re-armed lease to lapse,
     would fold the task into ``recover_stale`` for a delivery problem,
     not a worker problem. ``row`` carries the swept park's metadata so
-    the defer does not NULL the operator's model/checkpoint fields.
+    the defer does not NULL the operator's model/checkpoint fields,
+    and its ``quota_note`` is preserved verbatim - the original park
+    marker stays readable on the row for the whole episode (task
+    #249), with the defer reason living in the probe events instead.
     Bounded per episode: ``quota_defer_count`` increments on each
     defer and resets on every real park, so past
     ``_QUOTA_PROBE_DEFER_LIMIT`` consecutive defers the park is not
     renewed and a ``quota_probe_gave_up`` event marks the hand-off
-    back to the ordinary lease lifecycle. The re-park CASes on
-    ``step_state IS NULL`` - a fresher self-report park landing
-    mid-sweep always wins over a stale defer.
+    back to the ordinary lease lifecycle - unless the owner is
+    verifiably mid-turn, where release would fail a working task for
+    a delivery problem: then the park re-arms for
+    ``_QUOTA_BUSY_HOLD_SECONDS`` and the first give-up escalates to
+    the orchestrator (task #249). Holds are bounded per episode by
+    ``_QUOTA_BUSY_HOLD_LIMIT`` - a permanently-busy (wedged) turn
+    cannot park its task forever after a single escalation. The
+    re-park CASes on ``step_state IS NULL`` - a fresher self-report
+    park landing mid-sweep always wins over a stale defer.
     """
     task = db.get_task(task_id, path=db_path)
     defers = (task["quota_defer_count"] or 0) if task is not None else 0
     if defers >= _QUOTA_PROBE_DEFER_LIMIT:
+        busy = sid in _busy_sessions(
+            [sid], state_directory, verify_failed_event="quota_probe_verify_failed"
+        )
+        holdable = busy and defers < _QUOTA_PROBE_DEFER_LIMIT + _QUOTA_BUSY_HOLD_LIMIT
+        if holdable and db.quota_park(
+            task_id,
+            sid,
+            now + _QUOTA_BUSY_HOLD_SECONDS,
+            (row["quota_note"] if row is not None and row["quota_note"] else None)
+            or f"probe undeliverable ({why})",
+            "busy-hold",
+            model=row["quota_model"] if row is not None else None,
+            checkpoint=row["quota_checkpoint"] if row is not None else None,
+            defer=True,
+            require_unparked=True,
+            path=db_path,
+        ):
+            if defers == _QUOTA_PROBE_DEFER_LIMIT:
+                try:
+                    _quota_escalate(db_path, state_directory, sid, task_id, why, defers, notify)
+                except Exception as e:
+                    # the dedup stamp already committed - a thrown
+                    # escalation must not kill the pass or lose the
+                    # hold silently; journal the lost alert instead
+                    _decision(
+                        state_directory,
+                        "quota_probe_escalate_failed",
+                        sid,
+                        f"task={task_id} {type(e).__name__}: {e}",
+                    )
+                    db.record_event(
+                        sid,
+                        "quota_probe_escalate_failed",
+                        f"task={task_id} escalation threw: {type(e).__name__}: {e}",
+                        task_id=task_id,
+                        path=db_path,
+                    )
+            _decision(
+                state_directory,
+                "quota_probe_held_busy",
+                sid,
+                f"task={task_id} why={why} owner mid-turn - hold re-armed",
+            )
+            db.record_event(
+                sid,
+                "quota_probe_held_busy",
+                f"task={task_id} probe undeliverable ({why}); owner mid-turn"
+                f" - re-parked {_QUOTA_BUSY_HOLD_SECONDS}s",
+                task_id=task_id,
+                path=db_path,
+            )
+            return
+        if holdable:
+            # the hold CAS lost to a moved task / fresher park -
+            # journal like defer_lost and stop: no release decision
+            # to make for a row we no longer own
+            _decision(
+                state_directory,
+                "quota_probe_hold_lost",
+                sid,
+                f"task={task_id} why={why} busy hold lost CAS",
+            )
+            db.record_event(
+                sid,
+                "quota_probe_hold_lost",
+                f"task={task_id} busy hold lost CAS ({why})",
+                task_id=task_id,
+                path=db_path,
+            )
+            return
         _decision(
             state_directory,
             "quota_probe_gave_up",
             sid,
-            f"task={task_id} why={why} after {defers} defers",
+            f"task={task_id} why={why} after {defers} defers"
+            + (" - busy-hold budget exhausted" if busy else ""),
         )
         db.record_event(
             sid,
             "quota_probe_gave_up",
             f"task={task_id} probe undeliverable after {defers} defers ({why})"
-            " - released to ordinary lease lifecycle",
+            + (", busy-hold budget exhausted" if busy else "")
+            + " - released to ordinary lease lifecycle",
             task_id=task_id,
             path=db_path,
         )
@@ -1507,7 +1673,8 @@ def _defer_probe(db_path, state_directory, sid, task_id, now: int, why: str, row
         task_id,
         sid,
         now + _QUOTA_PROBE_DEFER_SECONDS,
-        f"control probe deferred ({why})",
+        (row["quota_note"] if row is not None and row["quota_note"] else None)
+        or f"control probe deferred ({why})",
         "probe-defer",
         model=row["quota_model"] if row is not None else None,
         checkpoint=row["quota_checkpoint"] if row is not None else None,
@@ -1547,7 +1714,7 @@ def _defer_probe(db_path, state_directory, sid, task_id, now: int, why: str, row
         )
 
 
-def _quota_pass(db_path, state_directory, now: int, policy: WakePolicy) -> None:
+def _quota_pass(db_path, state_directory, now: int, policy: WakePolicy, notify=None) -> None:
     """Lift expired ``waiting_quota`` parks and fire the control probe.
 
     ``db.unpark_quota_expired`` clears the step state and re-arms the
@@ -1558,8 +1725,16 @@ def _quota_pass(db_path, state_directory, now: int, policy: WakePolicy) -> None:
     still limited answers with another rate-limit error; the worker's
     self-report parks the task again with the new reset, so repeated
     failures extend the park instead of burning attempts or spamming
-    wakes. The ordinary wake cooldown applies so a reset storm cannot
-    burst probes past the pacing policy.
+    wakes.
+
+    The probe paces on a DEDICATED ``WakePolicy`` instance (task
+    #249), not the wake pass's: the incident that spawned the fix saw
+    a session whose undrained mail kept the shared 300s cooldown
+    armed, so every one of its 10 control probes was ``paced``
+    without ever being attempted - the defer window (120s) can never
+    outlive a cooldown it shares the budget with. A separate policy
+    keeps storm pacing for probes while making delivery independent
+    of ordinary mail wakes.
 
     A probe that never lands (paced, no lockfile, WakeError) is not
     spent silently: ``_defer_probe`` re-parks the task for a short
@@ -1585,11 +1760,11 @@ def _quota_pass(db_path, state_directory, now: int, policy: WakePolicy) -> None:
         # one pass, and a stale key must not poison the breaker.
         lock_data = find_lockfile()
         if lock_data is None:
-            _defer_probe(db_path, state_directory, sid, r["id"], now, "no_lockfile", r)
+            _defer_probe(db_path, state_directory, sid, r["id"], now, "no_lockfile", r, notify)
             continue
         host_key = lock_data["_path"]
         if policy.check(sid, host_key) is not None:
-            _defer_probe(db_path, state_directory, sid, r["id"], now, "paced", r)
+            _defer_probe(db_path, state_directory, sid, r["id"], now, "paced", r, notify)
             continue
         policy.record_attempt(sid)
         try:
@@ -1610,7 +1785,9 @@ def _quota_pass(db_path, state_directory, now: int, policy: WakePolicy) -> None:
                 sid,
                 f"task={r['id']} reason={e.reason}",
             )
-            _defer_probe(db_path, state_directory, sid, r["id"], now, f"probe_{e.reason}", r)
+            _defer_probe(
+                db_path, state_directory, sid, r["id"], now, f"probe_{e.reason}", r, notify
+            )
             continue
         policy.record_result(host_key, True)
         _decision(state_directory, "quota_probe_sent", sid, f"task={r['id']} outcome={outcome}")
@@ -2115,6 +2292,9 @@ def run(
         jitter = STARTUP_JITTER_SECONDS
     notify = notify_send or _notify_send
     wake_policy = WakePolicy()
+    # dedicated probe budget (task #249): sharing the wake pass's
+    # policy let undrained-mail cooldowns starve every control probe
+    quota_probe_policy = WakePolicy()
     stop = threading.Event()
 
     def _on_term(_signum, _frame):
@@ -2190,7 +2370,15 @@ def run(
                 # and get their single control probe; still-open
                 # windows suppress the wake leg by reset_at > now, so
                 # the pass order vs wake is not load-bearing
-                _timed("quota", _quota_pass, db_path, state_directory, now, wake_policy)
+                _timed(
+                    "quota",
+                    _quota_pass,
+                    db_path,
+                    state_directory,
+                    now,
+                    quota_probe_policy,
+                    notify,
+                )
                 # recovery runs AFTER lease_renew: verifiably-busy
                 # tasks renew first, only genuinely lapsed leases
                 # fold into recover_stale here (task #207 item b)
