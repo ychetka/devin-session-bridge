@@ -2971,3 +2971,16 @@ def test_issue115_r1_kill_racing_flip_keeps_operator_marker(db_path):
     kinds = [e["kind"] for e in db.list_events(session_id="w", path=db_path)]
     assert kinds == ["session_killed"]
     assert "w" not in db.dead_revivable_managed(["w"], path=db_path)
+
+
+def test_issue119_latest_control_notification_id(db_path):
+    """Control epoch = MAX(id) over halt/resume/disarm only."""
+    assert db.latest_control_notification_id("s", path=db_path) == 0
+    h = db.notify("s", NotificationKind.HALT, "x", path=db_path)
+    db.notify("s", NotificationKind.DIRECTIVE, "x", path=db_path)
+    assert db.latest_control_notification_id("s", path=db_path) == h
+    r = db.notify("s", NotificationKind.RESUME, "x", path=db_path)
+    assert db.latest_control_notification_id("s", path=db_path) == r
+    db.notify("s", NotificationKind.DISARM, "x", path=db_path)
+    assert db.latest_control_notification_id("s", path=db_path) > r
+    assert db.latest_control_notification_id("other", path=db_path) == 0

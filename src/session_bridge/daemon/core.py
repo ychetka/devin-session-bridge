@@ -47,7 +47,7 @@ import tempfile
 import threading
 import time
 
-from session_bridge.mailbox import mailbox_dir, write_message
+from session_bridge.mailbox import mailbox_dir, queue_root, write_message
 from session_bridge.quota import DEFAULT_PARK_SECONDS, parse_quota_signal
 from session_bridge.state import db
 from session_bridge.state.contract import (
@@ -158,6 +158,12 @@ def relay_payload(notification, source: str | None = None) -> str:
         f"session_id: {_hdr(notification['session_id'])}",
         f"kind: {notification['kind']}",
     ]
+    if notification["kind"] in db.CONTROL_KINDS:
+        # control deliveries carry their epoch (issue #119): the
+        # janitor drops a file whose issued_at is past the control
+        # TTL without needing the notification row, and the drain
+        # can see when the command was actually issued
+        lines.append(f"issued_at: {notification['created_at']}")
     if source is not None:
         lines.append(f"from: {_hdr(source)}")
     if notification["task_id"] is not None:
@@ -402,9 +408,44 @@ def _schedule_pass(db_path, state_directory, now: int) -> None:
         )
 
 
-def _relay_pass(db_path, queue_dir, state_directory) -> None:
-    """Drain the outbox: unrelayed -> fs msg file -> mark_relayed."""
+def _control_stale_reason(sid, nid, issued_at, now: int, *, db_path=None) -> str | None:
+    """Why a control delivery must be dropped, or ``None``.
+
+    Two staleness signals (issue #119): supersession - a newer
+    control notification exists for the session (the control epoch
+    moved past this command) - and age - the delivery is older than
+    ``_CONTROL_TTL_SECONDS``. ``issued_at`` is the notification's
+    ``created_at`` when the row is known, otherwise the file's own
+    timestamp.
+    """
+    latest = db.latest_control_notification_id(sid, path=db_path)
+    if latest and nid is not None and nid < latest:
+        return f"superseded_by={latest}"
+    if issued_at is not None and now - issued_at > _CONTROL_TTL_SECONDS:
+        return f"stale age={now - issued_at}s ttl={_CONTROL_TTL_SECONDS}"
+    return None
+
+
+def _relay_pass(db_path, queue_dir, state_directory, now: int) -> None:
+    """Drain the outbox: unrelayed -> fs msg file -> mark_relayed.
+
+    Control-class rows that went stale while queued (daemon down,
+    superseded by a newer halt/resume/disarm) are consumed without
+    delivery: a control command must never execute out of epoch
+    (issue #119). The row is still marked relayed so the drop does
+    not spin the outbox, and the journal names the reason.
+    """
     for row in db.unrelayed_notifications(path=db_path):
+        if row["kind"] in db.CONTROL_KINDS:
+            reason = _control_stale_reason(
+                row["session_id"], row["id"], row["created_at"], now, db_path=db_path
+            )
+            if reason is not None:
+                db.mark_relayed(row["id"], path=db_path)
+                detail = f"notification={row['id']} kind={row['kind']} {reason}"
+                _decision(state_directory, "stale_control_dropped", row["session_id"], detail)
+                db.record_event(row["session_id"], "stale_control_dropped", detail, path=db_path)
+                continue
         try:
             path = write_message(
                 row["session_id"],
@@ -429,6 +470,73 @@ def _relay_pass(db_path, queue_dir, state_directory) -> None:
             f"notification={row['id']} kind={row['kind']} file={path}"
             f" mark={'ok' if marked else 'superseded'}",
         )
+
+
+def _stale_control_pass(db_path, queue_dir, state_directory, now: int) -> None:
+    """Unlink stale control files already sitting in mailboxes.
+
+    The relay-side drop only covers rows still in the outbox; a
+    control file delivered while fresh can still sit through a long
+    turn and execute out of epoch at drain (issue #119's incident
+    shape: a HALT consumed 24h late). Same staleness rule as the
+    relay leg - superseded by a newer control notification or older
+    than ``_CONTROL_TTL_SECONDS`` - evaluated per file. Genuine relay
+    artifacts resolve their real sid + issue time through the
+    notification row; unverifiable files fall back to ``issued_at``
+    header or file mtime for the age leg only.
+    """
+    root = queue_root(db_path, queue_dir)
+    try:
+        dirnames = os.listdir(root)
+    except OSError:
+        return
+    con = db.connect(db_path)
+    try:
+        for dirname in dirnames:
+            mdir = os.path.join(root, dirname)
+            if not os.path.isdir(mdir):
+                continue
+            try:
+                names = [n for n in os.listdir(mdir) if n.startswith("msg_") and n.endswith(".txt")]
+            except OSError:
+                continue
+            for name in names:
+                path = os.path.join(mdir, name)
+                headers = _msg_headers(path)
+                if headers.get("kind") not in db.CONTROL_KINDS:
+                    continue
+                nid = _msg_nid(name)
+                sid = dirname  # mailbox dirs are named by sanitized sid
+                issued_at = None
+                if nid is not None and headers.get("notification_id") == str(nid):
+                    row = con.execute(
+                        "SELECT session_id, created_at FROM notifications WHERE id=?",
+                        (nid,),
+                    ).fetchone()
+                    if row is not None:
+                        sid = row["session_id"]
+                        issued_at = row["created_at"]
+                if issued_at is None:
+                    iat = headers.get("issued_at", "")
+                    if iat.isdigit():
+                        issued_at = int(iat)
+                if issued_at is None:
+                    try:
+                        issued_at = int(os.path.getmtime(path))
+                    except OSError:
+                        continue  # vanished mid-scan - already consumed
+                reason = _control_stale_reason(sid, nid, issued_at, now, db_path=db_path)
+                if reason is None:
+                    continue
+                try:
+                    os.unlink(path)
+                except OSError:
+                    continue  # raced with the consumer - either outcome is a drain
+                detail = f"file={name} kind={headers['kind']} {reason}"
+                _decision(state_directory, "stale_control_dropped", sid, detail)
+                db.record_event(sid, "stale_control_dropped", detail, path=db_path)
+    finally:
+        con.close()
 
 
 def _stale_sessions(db_path, now: int):
@@ -1157,12 +1265,44 @@ _LEASE_AUTO_RENEW_LIMIT = max(
     _env_int("SESSIONS_BRIDGE_LEASE_AUTO_RENEW_SECONDS", 6 * db.LEASE_SECONDS),
 )
 
+#: Control-delivery TTL (issue #119): a halt/resume/disarm delivery
+#: this old is dropped, not executed - the durable flag it accompanied
+#: already did the enforcing (``halted_at`` blocks claims regardless),
+#: so the file is only a courtesy signal whose semantics a stale
+#: read would invert (a 24h-late HALT self-halting a resumed fleet).
+#: ``SB_CONTROL_TTL_S`` override; default 6h.
+_CONTROL_TTL_SECONDS = _env_int("SB_CONTROL_TTL_S", 21600)
+
 
 def _msg_nid(name: str):
     """Numeric notification id from ``msg_<nid>.txt``; None when the
     name carries no digits (a foreign file that matches no row)."""
     stem = name[4:-4] if name.startswith("msg_") and name.endswith(".txt") else ""
     return int(stem) if stem.isdigit() else None
+
+
+def _msg_headers(path: str) -> dict:
+    """Parsed relay headers of a msg file (first 8 lines, up to blank).
+
+    ``{}`` on unreadable files. Provenance stays the caller's job:
+    the headers are what the file claims, only a ``notification_id``
+    matching the basename id makes them trustworthy (the msg_003
+    lesson - a foreign writer can collide with an unrelated row id).
+    """
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            head = [fh.readline() for _ in range(8)]
+    except OSError:
+        return {}
+    headers = {}
+    for line in head:
+        line = line.strip()
+        if not line:
+            break
+        key, sep, val = line.partition(":")
+        if sep:
+            headers[key.strip()] = val.strip()
+    return headers
 
 
 def _msg_is_tick(path: str, nid) -> bool:
@@ -1176,19 +1316,7 @@ def _msg_is_tick(path: str, nid) -> bool:
     erring on the actionable side re-breaks nothing - the msg_003
     incident was undetected foreign mail, not a noisy wake.
     """
-    try:
-        with open(path, encoding="utf-8", errors="replace") as fh:
-            head = [fh.readline() for _ in range(8)]
-    except OSError:
-        return False
-    headers = {}
-    for line in head:
-        line = line.strip()
-        if not line:
-            break
-        key, sep, val = line.partition(":")
-        if sep:
-            headers[key.strip()] = val.strip()
+    headers = _msg_headers(path)
     return (
         headers.get("kind") == NotificationKind.HEARTBEAT_TICK.value
         and nid is not None
@@ -2015,7 +2143,18 @@ def run(
             try:
                 now = int(time.time())
                 _timed("schedule", _schedule_pass, db_path, state_directory, now)
-                _timed("relay", _relay_pass, db_path, queue_dir, state_directory)
+                _timed("relay", _relay_pass, db_path, queue_dir, state_directory, now)
+                # stale-control janitor (issue #119) runs after relay
+                # so a fresh superseding command is already on disk
+                # before older control files are judged against it
+                _timed(
+                    "stale_control",
+                    _stale_control_pass,
+                    db_path,
+                    queue_dir,
+                    state_directory,
+                    now,
+                )
                 # one mailbox-dir scan per pass shared by the wake and
                 # stall legs (review: computing it twice per pass was a
                 # wasted second connection + listdir round)

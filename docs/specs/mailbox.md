@@ -47,3 +47,23 @@ durable `mail_stall` decision event - and SHALL re-alert every
 - **THEN** the daemon emits the stall escalation once
 - **AND** a later pass inside the same episode is silent until the
   re-alert cadence lapses
+
+### Requirement: stale control deliveries are dropped, not executed
+
+Control-class deliveries (`halt`, `resume`, `disarm`) SHALL carry
+their epoch (`issued_at` header) and be dropped at delivery when
+stale - superseded by a newer control notification for the same
+session, or older than `SB_CONTROL_TTL_S` (default 21600s). The drop
+applies at both relay (stale outbox row is marked relayed without a
+file) and at a janitor pass that unlinks stale control files already
+sitting in mailboxes; every drop is journaled as
+`stale_control_dropped`. The durable flag the command accompanied is
+unaffected - `halted_at` enforcement lives in the database, the file
+is only a courtesy signal.
+
+#### Scenario: superseded halt never reaches the drain
+
+- **WHEN** a `halt` then a `resume` notification exist for one session
+- **THEN** the `halt` delivery is dropped with a
+  `stale_control_dropped` journal entry naming the superseding id
+- **AND** only the `resume` file reaches the mailbox

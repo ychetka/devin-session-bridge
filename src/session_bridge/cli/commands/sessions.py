@@ -483,7 +483,7 @@ def _cmd_halt(args) -> int:
             # drain nothing and skip the save-state step. Relay them
             # synchronously now that the lock is free.
             try:
-                daemon._relay_pass(args.db, _queue_dir(args), sdir)
+                daemon._relay_pass(args.db, _queue_dir(args), sdir, int(time.time()))
                 data["relayed"] = True
             except Exception as e:
                 # state is already safe (flag set + outbox rows exist);

@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.9.1] - 2026-11-10
+
+### User-facing
+
+#### fix
+- stale halt/resume/disarm deliveries are dropped instead of executed - a control message superseded by a newer one or older than SB_CONTROL_TTL_S (default 6h) no longer self-halts a resumed session `daemon` (issue #119)
+
+### Codebase
+
+#### daemon
+- [fix] control deliveries carry an issued_at epoch header; _control_stale_reason judges supersession (latest control notification id) + TTL at both delivery legs: the relay consumes stale outbox rows via mark_relayed-without-file and a _stale_control_pass janitor unlinks stale control files sitting in mailboxes; every drop journals stale_control_dropped (decisions + decision_events); _msg_headers extracted from _msg_is_tick. Why: incident 2026-11-10: a HALT consumed ~24h late self-halted mahogany-dryosaurus mid-task after the fleet was already resumed - control files had no epoch so an obsolete command executed at drain. (issue #119)
+
 ## [0.9.0] - 2026-11-10
 
 ### User-facing
