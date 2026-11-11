@@ -224,3 +224,58 @@ schema does not track at all.
 - **WHEN** `SB_MAX_ACTIVE_SESSIONS` is unset or `0`
 - **THEN** dispatch admits queued tasks regardless of how many
   sessions are active
+
+### Requirement: thrash breaker refuses retries after repeated failures
+
+The bridge SHALL count consecutive task-level failure outcomes in
+`tasks.fail_streak`: every `finish --fail` and every terminal wedge
+fold (a lease-expiry or dead-worker requeue landing on `failed`)
+increments it, a `done` finish resets it to `0`, and a plain `retry`
+SHALL preserve it - a requeue is not an outcome, and resetting the
+streak there would reproduce the infinite fix-fail-fix loop that
+`attempt` already permits. Operator verdicts (`kill`, `withdraw`)
+SHALL NOT touch the streak.
+
+When `fail_streak` reaches `SB_THRASH_LIMIT` (default 3, resolved
+once at import like the other env constants; `<=0` disables the
+breaker entirely), the retry CAS SHALL refuse a plain `bridge
+retry` and the trip SHALL be journaled: a `thrash_breaker`
+`decision_events` row with the structured record (task, session,
+streak, threshold, last failure note), an ESCALATION `audit_events`
+row (`doa_trigger='thrash_breaker'`, open until its directive is
+filled) summarizing the failure run and the unpark paths, and a
+`notice` to the registered orchestrator - skipped when no active
+orchestrator exists. The escalation SHALL be written once per task
+while open: a later trip observation (e.g. a refused retry) journals
+another decision event but no duplicate escalation. The manual
+unpark is `bridge escalate reply` plus `bridge retry --force`;
+`--force` SHALL skip the guard and zero the streak in the same
+write.
+
+#### Scenario: fix-fail-fix loop trips the breaker
+
+- **WHEN** a task's `fail_streak` reaches `SB_THRASH_LIMIT` through
+  repeated `finish --fail` > `retry` cycles
+- **THEN** a plain `bridge retry` is refused with the escalation id
+- **AND** a `thrash_breaker` decision event, one open ESCALATION row
+  and (when registered) an orchestrator notice are journaled
+
+#### Scenario: refused retry journals without duplicating
+
+- **WHEN** a `bridge retry` is refused while an open thrash-breaker
+  escalation already names the task
+- **THEN** another `thrash_breaker` decision event is appended
+- **AND** no second ESCALATION row or orchestrator notice is written
+
+#### Scenario: force retry is the manual unpark
+
+- **WHEN** the operator replies to the escalation and runs
+  `bridge retry --force`
+- **THEN** the task requeues with `attempt=0` and `fail_streak=0`
+- **AND** the next plain retry below the limit behaves as before
+
+#### Scenario: disabled threshold never trips
+
+- **WHEN** `SB_THRASH_LIMIT` is `0` or negative
+- **THEN** `retry` carries no streak guard and no thrash-breaker
+  rows are written regardless of `fail_streak`

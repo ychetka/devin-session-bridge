@@ -339,7 +339,42 @@ def _cmd_retry(args) -> int:
             ExitCode.CONFLICT,
             f"conflict: task {task['id']} is {task['status']}, not failed",
         )
-    if not db.retry(task["id"], path=args.db):
+    if not db.retry(task["id"], force=args.force, path=args.db):
+        # the CAS refused: either a genuine race (the row left failed
+        # under us) or the thrash breaker - a fail_streak at/over
+        # SB_THRASH_LIMIT with no --force (issue #153). A refused
+        # manual retry after the trip is journaled too; the trip
+        # helper re-verifies the streak inside its own transaction,
+        # so a below-threshold race answer stays a plain conflict.
+        trip = None
+        if not args.force:
+            row = db.get_task(task["id"], path=args.db)
+            if row is not None and row["status"] == TaskStatus.FAILED.value:
+                trip = db.trip_thrash_breaker(task["id"], path=args.db)
+        if trip is not None:
+            error = (
+                f"thrash breaker tripped: task {task['id']} failed"
+                f" {trip['fail_streak']} times in a row"
+                f" (SB_THRASH_LIMIT={db.THRASH_LIMIT}) - retry refused;"
+                f" escalation #{trip['escalation_id']} open"
+            )
+            resp = JsonResponse(
+                session=task["session_id"],
+                status="thrash_breaker",
+                error=error,
+                agent_instruction=(
+                    "do not retry: thrash breaker tripped - resolve the"
+                    " escalation (`bridge escalate reply`) or pass"
+                    " --force to override"
+                ),
+                data={
+                    "task_id": task["id"],
+                    "fail_streak": trip["fail_streak"],
+                    "threshold": db.THRASH_LIMIT,
+                    "escalation_id": trip["escalation_id"],
+                },
+            )
+            return _emit(args, resp, ExitCode.CONFLICT, f"conflict: {error}")
         resp = JsonResponse(
             session=task["session_id"],
             status=task["status"],
@@ -509,8 +544,31 @@ def _cmd_finish(args) -> int:
             ExitCode.CONFLICT,
             f"conflict: finish refused for task {tid}",
         )
-    resp = JsonResponse(session=sid, status="done" if ok else "failed")
-    return _emit(args, resp, ExitCode.OK, f"task {tid}: {'done' if ok else 'failed'}")
+    # post-fail thrash-breaker evaluation (issue #153): when this
+    # failure lands the streak on SB_THRASH_LIMIT the trip is journaled
+    # (decision event + first-observation escalation + orchestrator
+    # notice) and the worker is told its next plain retry will refuse
+    trip = None if ok else db.trip_thrash_breaker(tid, path=args.db)
+    resp = JsonResponse(
+        session=sid,
+        status="done" if ok else "failed",
+        agent_instruction=(
+            (
+                "thrash breaker tripped - do not retry: resolve the"
+                " escalation or use `bridge retry --force`"
+            )
+            if trip is not None
+            else None
+        ),
+        data={"thrash_breaker": trip} if trip is not None else None,
+    )
+    human = f"task {tid}: {'done' if ok else 'failed'}"
+    if trip is not None:
+        human += (
+            f" [THRASH BREAKER: retry refused until escalate reply"
+            f" or --force; escalation #{trip['escalation_id']}]"
+        )
+    return _emit(args, resp, ExitCode.OK, human)
 
 
 def _cmd_wait(args) -> int:

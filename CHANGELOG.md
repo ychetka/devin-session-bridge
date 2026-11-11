@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.15.0] - 2026-11-12
+
+### User-facing
+
+#### feat
+- `bridge retry` now trips a thrash breaker after `SB_THRASH_LIMIT` (default 3) consecutive task failures - it refuses with an open human escalation until the escalation is answered or `--force` is passed. `state` (issue #153)
+
+### Codebase
+
+#### state
+- [feat] New `tasks.fail_streak` column counts consecutive failure outcomes (finish --fail and terminal wedge folds; done resets, plain retry preserves); the retry CAS guards on it, and a trip writes a thrash_breaker decision event plus a deduplicated ESCALATION audit row plus an orchestrator notice - all atomically. Why: A fix-fail-fix loop was invisible to the bus because retry resets attempt, so repeated gate/test failures cycled forever; fail_streak counts outcomes across retries so the breaker can park a thrashing task on a human escalation. (issue #153)
+
 ## [0.14.0] - 2026-11-12
 
 ### User-facing

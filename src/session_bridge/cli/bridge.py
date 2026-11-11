@@ -185,6 +185,11 @@ def _parse_args(argv) -> argparse.Namespace:
 
     sp = sub.add_parser(Command.RETRY.value, help="requeue a failed task")
     sp.add_argument("ref", help="session id or task id")
+    sp.add_argument(
+        "--force",
+        action="store_true",
+        help="override thrash breaker",
+    )
     _add_json(sp)
 
     # managed mode (item_13c); the Command enum in cli/contract.py is

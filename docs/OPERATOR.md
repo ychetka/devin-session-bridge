@@ -1076,7 +1076,7 @@ Global flags: `--db PATH` (`SESSIONS_BRIDGE_DB`), `--queue-dir DIR`
 | `bridge inspect <sid\|task_id>` | full task detail + next action. |
 | `bridge clear <sid>` | drop the session's queued task. |
 | `bridge unpark <sid>` | resume a paused/awaiting session (requeues paused tasks, clears the queue pause). |
-| `bridge retry <sid\|task_id>` | requeue a failed task; attempt resets. |
+| `bridge retry <sid\|task_id> [--force]` | requeue a failed task; attempt resets. Refused while the thrash breaker is tripped - `fail_streak >= SB_THRASH_LIMIT` (default 3) consecutive failures - unless `--force` overrides it (see "Thrash breaker" below). |
 | `bridge quota-park <sid> --task N --reset-at <iso\|HH:MM UTC> [--note T] [--model M] [--checkpoint T]` | manually park a live task into `waiting_quota` (v0.7.0, task #216): the step state stores orthogonally to the lifecycle - the task stays live, keeps its claimant lease, spends no attempt, is skipped by `recover_stale`/dead-worker fold and cannot be re-claimed; daemon wakes and `bridge wake` suppress until the reset, then the quota pass clears the park and sends one control probe. A `bridge event`/`bridge notice` body with explicit rate-limit text + a parseable reset auto-parks too (self-report channel); `rpc_error`/`busy`/`timeout`/`lease expired` never park. |
 | `bridge quota-resume <sid> --task N` | release a `waiting_quota` park before its reset (operator override; refuses on non-parked tasks and halted sessions - HALT is senior). |
 | `bridge arm <sid>` | enroll the session into managed mode; also clears a leftover `queue_paused` flag so tasks stay claimable. |
@@ -1106,6 +1106,36 @@ Global flags: `--db PATH` (`SESSIONS_BRIDGE_DB`), `--queue-dir DIR`
 | `bridge escalate reply <id> A\|B\|defer\|abort\|override:<text>` | resolve an escalation (see Playbook 3). |
 | `bridge daemon start\|stop\|status\|once\|run` | supervisor lifecycle (see above). |
 | `bridge --version` / `bridge version` | true deployed version + source path (item_102a): reads the checkout's pyproject.toml when running from a `src/` tree - editable installs carry stale dist-info and `pip show` lies. `--json` carries it under `data.version`. |
+
+## Thrash breaker
+
+A fix-fail-fix loop is invisible to `attempt` - `bridge retry` resets
+it, so a task that keeps failing its gate or tests can cycle
+`finish --fail` > `retry` forever. `tasks.fail_streak` closes that
+gap (v0.15.0): it counts consecutive task-level failure outcomes -
+every `finish --fail` and every terminal wedge fold (exhausted lease
+or dead-worker requeue landing on `failed`) increments it, a
+`done` resets it, and a plain `retry` deliberately preserves it (a
+requeue is not an outcome). `withdraw`/`kill` leave it untouched -
+those are operator verdicts, not task failures.
+
+When the streak reaches `SB_THRASH_LIMIT` (default 3; `<=0`
+disables the breaker entirely) the breaker trips: a `thrash_breaker`
+`decision_events` row journals the trip (task, session, streak,
+threshold, last failure note), an open ESCALATION audit row
+(`doa_trigger='thrash_breaker'`) surfaces in `bridge status` /
+`bridge escalate show`, and a `notice` goes to the registered
+orchestrator (skipped when none is registered - the escalation
+banner still surfaces). The escalation is written once per task
+while open: a refused retry afterwards journals another decision
+event but no duplicate escalation. A plain `bridge retry` while
+tripped is refused with the escalation id; a `finish --fail` that
+lands the streak on the limit reports the trip in its response.
+
+Manual unpark paths: answer the escalation (`bridge escalate reply
+<id> ...`) and then `bridge retry <task_id> --force`, which skips
+the guard and zeroes the streak in the same write - or `--force`
+directly when no reply is needed.
 
 ## Session heartbeats
 
@@ -1157,3 +1187,4 @@ the target workspace as `.devin/orchestrator/PLAYBOOK.md`).
 | `SESSIONS_BRIDGE_MAIL_STALL_SECONDS` | 1800 | legacy alias of `SB_STALL_THRESHOLD_S`; the canonical name wins when both are set. |
 | `SESSIONS_BRIDGE_GHOST_TTL` | 86400 | seconds after `sessions.updated_at` before a no-heartbeat-row unmanaged registration (ghost) is swept dead. |
 | `SESSIONS_BRIDGE_BUSY_GRACE_SECONDS` | 7200 (4x stall) | ceiling on mid-turn busy grace - a still-busy session escalates past it; clamped at the stall threshold. |
+| `SB_THRASH_LIMIT` | 3 | consecutive task failures before the thrash breaker trips - `bridge retry` refuses at/above it until `bridge escalate reply` + `retry --force` (v0.15.0); `<=0` disables the breaker. |

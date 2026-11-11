@@ -142,6 +142,19 @@ MAX_ACTIVE_SESSIONS: Final[int] = max(0, _env_int("SB_MAX_ACTIVE_SESSIONS", 0))
 #: enforce the same cap instead of silently seeing 0 = unlimited.
 SETTING_MAX_ACTIVE_SESSIONS: Final[str] = "max_active_sessions"
 
+#: Thrash-breaker threshold (issue #153): consecutive task-level
+#: failures (``finish --fail`` and terminal wedge folds, counted in
+#: ``tasks.fail_streak``) at/above which the breaker trips - ``retry``
+#: is refused unless forced, and the trip journals a
+#: ``thrash_breaker`` decision event plus a deduplicated ESCALATION
+#: audit row. ``fail_streak`` deliberately survives a plain retry -
+#: it counts failure OUTCOMES, and a requeue is not an outcome;
+#: resetting it on retry would reproduce exactly the infinite
+#: fix-fail-fix loop ``attempt`` already permits. Resolved once at
+#: import like LEASE_SECONDS; ``<=0`` disables the breaker entirely
+#: (no CAS guard, no trip writes).
+THRASH_LIMIT: Final[int] = max(0, _env_int("SB_THRASH_LIMIT", 3))
+
 #: Session-slot admission predicate for CAS writes that move a
 #: queued task toward running (issue #121). Takes the cap twice as
 #: positional ``?`` parameters. A row proceeds when the cap is off,
@@ -478,6 +491,14 @@ _TASK_COLUMN_MIGRATIONS = (
     # lease-expiry folds instead of a sticky 'lease expired' note.
     ("wait_reason", "TEXT"),
     ("lease_expired_at", "INTEGER"),
+    # issue #153 thrash breaker: consecutive task-level failures.
+    # finish --fail and terminal wedge folds increment it, finish ok
+    # and a forced retry reset it; a plain retry leaves it alone (the
+    # streak counts outcomes, a requeue is not one). Orthogonal to
+    # ``attempt``, which counts wedge folds only and is reset by every
+    # retry - exactly why an attempt-based bound cannot see a
+    # fix-fail-fix loop.
+    ("fail_streak", "INTEGER NOT NULL DEFAULT 0"),
 )
 
 # Columns the item_139 schema adds to wake_state, applied idempotently
@@ -1226,8 +1247,12 @@ def requeue_or_fail(task_id: int, note: str | None = None, *, path=None):
             )
             if cur.rowcount == 1:
                 return TaskStatus.QUEUED
+            # the terminal fold is a task-level failure too: it feeds
+            # the thrash breaker's fail_streak alongside finish --fail
+            # (issue #153)
             cur = con.execute(
                 "UPDATE tasks SET status=?, attempt=attempt+1,"
+                " fail_streak=fail_streak+1,"
                 " lease_owner=NULL, lease_expires_at=NULL,"
                 " lease_renewed_at=NULL, lease_expired_at=?, finished_at=?,"
                 " note=COALESCE(?,note), updated_at=?"
@@ -1346,8 +1371,11 @@ def _requeue_dead_worker_tx(con, task_id: int, note, ts):
     )
     if cur.rowcount == 1:
         return TaskStatus.QUEUED
+    # same terminal fold as requeue_or_fail: the streak counts it
+    # (issue #153)
     cur = con.execute(
         "UPDATE tasks SET status=?, attempt=attempt+1,"
+        " fail_streak=fail_streak+1,"
         " lease_owner=NULL, lease_expires_at=NULL,"
         " lease_renewed_at=NULL, finished_at=?,"
         " note=COALESCE(?,note), updated_at=?" + _STEP_CLEAR_SQL + guard + " AND attempt+1>=?",
@@ -1402,8 +1430,15 @@ def finish_task(
 
     A stale worker (owner mismatch, e.g. after lease expiry and reclaim)
     loses the CAS and cannot overwrite the current owner's state.
+
+    ``fail_streak`` bookkeeping (issue #153): a failed finish is a
+    task-level failure and increments the thrash-breaker streak; a
+    successful finish resets it - the streak counts consecutive
+    failures, and ``done`` breaks the run.
     """
     target = TaskStatus.DONE.value if ok else TaskStatus.FAILED.value
+    # done breaks the failure run; failed extends it
+    streak_sql = " fail_streak=0," if ok else " fail_streak=fail_streak+1,"
     ts = _now()
 
     def op():
@@ -1411,7 +1446,8 @@ def finish_task(
         try:
             cur = con.execute(
                 "UPDATE tasks SET status=?,"
-                " last_assistant_message=COALESCE(?,last_assistant_message),"
+                + streak_sql
+                + " last_assistant_message=COALESCE(?,last_assistant_message),"
                 " note=COALESCE(?,note), lease_owner=NULL,"
                 " lease_expires_at=NULL, finished_at=?, updated_at=?"
                 + _STEP_CLEAR_SQL
@@ -1636,13 +1672,35 @@ def quota_resume(task_id: int, session_id: str, *, path=None) -> bool:
     return _retry(op)
 
 
-def retry(task_id: int, note: str | None = None, *, path=None) -> bool:
+def retry(task_id: int, note: str | None = None, *, force: bool = False, path=None) -> bool:
     """Manual ``retry`` command: terminal ``failed > queued``.
 
     Resets ``attempt`` and clears all lease fields. The automatic
     transition map has no edge out of ``failed`` - this is the only exit.
+
+    Thrash breaker (issue #153): while ``fail_streak`` is at/over
+    ``THRASH_LIMIT`` the CAS carries a ``fail_streak < THRASH_LIMIT``
+    guard and the requeue is refused - a plain retry cannot feed an
+    infinite fix-fail-fix loop. The streak survives a plain retry by
+    design (it counts failure outcomes; a requeue is not an outcome).
+    ``force=True`` is the manual unpark after the escalation path: it
+    skips the guard and zeroes ``fail_streak`` in the same UPDATE, so
+    the override and the reset commit atomically.
     """
     ts = _now()
+    guard = "" if (force or THRASH_LIMIT <= 0) else " AND fail_streak<?"
+    # a forced retry is the manual unpark: it clears the streak in the
+    # same CAS so the override and the reset commit atomically
+    reset = ", fail_streak=0" if force else ""
+    args: list = [
+        TaskStatus.QUEUED.value,
+        note,
+        ts,
+        task_id,
+        TaskStatus.FAILED.value,
+    ]
+    if guard:
+        args.append(THRASH_LIMIT)
 
     def op():
         con = connect(path)
@@ -1652,17 +1710,146 @@ def retry(task_id: int, note: str | None = None, *, path=None) -> bool:
                 " lease_expires_at=NULL, lease_renewed_at=NULL,"
                 " finished_at=NULL,"
                 " note=COALESCE(?,note), updated_at=?"
+                + reset
                 + _STEP_CLEAR_SQL
-                + " WHERE id=? AND status=?",
-                (
-                    TaskStatus.QUEUED.value,
-                    note,
-                    ts,
-                    task_id,
-                    TaskStatus.FAILED.value,
-                ),
+                + " WHERE id=? AND status=?"
+                + guard,
+                args,
             )
             return cur.rowcount == 1
+        finally:
+            con.close()
+
+    return _retry(op)
+
+
+def trip_thrash_breaker(task_id: int, *, path=None) -> dict | None:
+    """Journal a thrash-breaker trip for ``task_id``.
+
+    Called when a task's ``fail_streak`` reaches ``THRASH_LIMIT`` -
+    post ``finish --fail`` in the CLI, or on a ``retry`` the breaker
+    CAS refused. Every observation appends a ``thrash_breaker``
+    ``decision_events`` row carrying the structured trip record
+    (task id, session, streak, threshold, last failure note): a
+    refused manual retry after the trip is evidence too and is
+    journaled the same way.
+
+    The human-facing half is first-observation only: while an open
+    ESCALATION row (``directive IS NULL``) with
+    ``doa_trigger='thrash_breaker'`` already names the task, its id is
+    reused instead of writing a duplicate, and no second orchestrator
+    NOTICE goes out. The escalation ``question_text`` summarizes the
+    failure run and names the unpark paths (``escalate reply`` or
+    ``retry --force``). All writes commit in one BEGIN IMMEDIATE.
+
+    Returns ``{"decision_id", "escalation_id", "first", "notified",
+    "fail_streak"}`` or ``None`` when the breaker is disabled, the
+    task is missing, or its streak is below the limit.
+    """
+    if THRASH_LIMIT <= 0:
+        return None
+    ts = _now()
+
+    def op():
+        con = connect(path)
+        try:
+            con.execute("BEGIN IMMEDIATE")
+            try:
+                task = con.execute(
+                    "SELECT id, session_id, fail_streak, note FROM tasks WHERE id=?",
+                    (task_id,),
+                ).fetchone()
+                if task is None or task["fail_streak"] < THRASH_LIMIT:
+                    con.execute("ROLLBACK")
+                    return None
+                open_esc = con.execute(
+                    "SELECT id FROM audit_events"
+                    " WHERE kind=? AND doa_trigger='thrash_breaker'"
+                    " AND task_id=? AND directive IS NULL"
+                    " ORDER BY id LIMIT 1",
+                    (AuditEventKind.ESCALATION.value, task_id),
+                ).fetchone()
+                summary = (
+                    f"thrash breaker tripped: task {task_id}"
+                    f" (session {task['session_id']}) failed"
+                    f" {task['fail_streak']} times in a row"
+                    f" (threshold {THRASH_LIMIT});"
+                    f" last failure: {task['note'] or '-'};"
+                    " retry refused until escalate reply or --force"
+                )
+                body = json.dumps(
+                    {
+                        "task_id": task_id,
+                        "session_id": task["session_id"],
+                        "fail_streak": task["fail_streak"],
+                        "threshold": THRASH_LIMIT,
+                        "note": task["note"],
+                    }
+                )
+                cur = con.execute(
+                    "INSERT INTO decision_events"
+                    "(session_id,kind,body,task_id,created_at)"
+                    " VALUES (?,?,?,?,?)",
+                    (task["session_id"], "thrash_breaker", body, task_id, ts),
+                )
+                decision_id = int(cur.lastrowid)
+                first = open_esc is None
+                notified = False
+                if first:
+                    cur = con.execute(
+                        "INSERT INTO audit_events"
+                        "(kind,session_id,task_id,question_text,"
+                        " partner_outputs,doa_trigger,created_at)"
+                        " VALUES(?,?,?,?,?,?,?)",
+                        (
+                            AuditEventKind.ESCALATION.value,
+                            task["session_id"],
+                            task_id,
+                            summary,
+                            "{}",
+                            "thrash_breaker",
+                            ts,
+                        ),
+                    )
+                    esc_id = int(cur.lastrowid)
+                    # role='orchestrator' is a CAS singleton - LIMIT 1
+                    # is the whole active set (same lookup ask() does).
+                    # With no registered orchestrator the escalation
+                    # banner still surfaces the trip.
+                    orch = con.execute(
+                        "SELECT session_id FROM sessions"
+                        " WHERE role=? AND status=?"
+                        " ORDER BY updated_at DESC LIMIT 1",
+                        (SessionRole.ORCHESTRATOR.value, SessionStatus.ACTIVE.value),
+                    ).fetchone()
+                    if orch is not None:
+                        con.execute(
+                            "INSERT INTO notifications"
+                            "(session_id,kind,body,task_id,created_at)"
+                            " VALUES(?,?,?,?,?)",
+                            (
+                                orch["session_id"],
+                                NotificationKind.NOTICE.value,
+                                f"[thrash_breaker] {summary} (escalation #{esc_id})",
+                                task_id,
+                                ts,
+                            ),
+                        )
+                        notified = True
+                else:
+                    esc_id = int(open_esc["id"])
+                con.execute("COMMIT")
+                return {
+                    "decision_id": decision_id,
+                    "escalation_id": esc_id,
+                    "first": first,
+                    "notified": notified,
+                    "fail_streak": task["fail_streak"],
+                }
+            except BaseException:
+                if con.in_transaction:
+                    con.execute("ROLLBACK")
+                raise
         finally:
             con.close()
 
