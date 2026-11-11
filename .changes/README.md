@@ -5,6 +5,26 @@ slug). Copy `_template.md`, fill the frontmatter, keep the content
 public-safe - this repository is public and these entries feed the
 published CHANGELOG/release notes.
 
+## Enforcement (issue #135)
+
+The entry is gated, not just conventional: `tools/check_changes_entry.sh`
+runs in the CI lint job on every pull request and as a pre-merge guard
+inside `.devin/scripts/repo_merge.sh`. A PR that changes files merges
+only when it carries ONE of:
+
+- a new `.changes/<slug>.md` fragment (tooling/chore changes use
+  `user_visible: false` - the record still lands in the Codebase
+  section);
+- a `CHANGELOG.md` change - release-prep branches fold fragments into
+  the changelog directly instead of carrying a pending file;
+- the `no-changes-entry` marker in the PR title, body, or a label -
+  the documented opt-out for pure docs/ops changes that produce no
+  release notes.
+
+A version bump is NOT required per PR: `pyproject.toml` stays on the
+release branch's own step so parallel PRs cannot collide on the
+version number.
+
 Required frontmatter fields (indented continuation lines fold into
 the previous field's value):
 
