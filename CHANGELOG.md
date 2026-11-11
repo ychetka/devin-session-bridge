@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.13.2] - 2026-11-11
+
+### Codebase
+
+#### tooling
+- [chore] Canon adoption: 12 files copied byte-for-byte from ai_controller canonical sources and md5-verified - agent profiles (code_writer, judge, reviewer), gate scripts (gate_tests, hygiene_check, migration_gate, ship_commit, plus new migration_pattern.sh), hazard docs (CODING_HAZARDS, REVIEW_HAZARDS), and director-model docs (harness.md, plus new controller-manager/development-cycle.md). Why: local copies had drifted from the canonical templates; byte-for-byte adoption restores a single point of truth for fleet tooling. (issue #146)
+
 ## [0.13.1] - 2026-11-11
 
 ### Codebase
