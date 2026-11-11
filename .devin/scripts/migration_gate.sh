@@ -29,7 +29,7 @@ CHECK_ONLY=0
 [ "${1:-}" = "--check" ] && CHECK_ONLY=1
 
 MIG_PAT='(^|/)(migrations?|alembic/versions|db/migrate|flyway|liquibase)/|(^|/)[VU][0-9]+(_[0-9]+)*__.*\.sql$'
-mapfile -t staged < <(git diff --cached --name-only --diff-filter=AM | grep -E "$MIG_PAT" || true)
+mapfile -t staged < <(git diff --cached --name-only --diff-filter=AMR | grep -E "$MIG_PAT" || true)
 if [ ${#staged[@]} -eq 0 ]; then
   echo "no staged migration files - nothing to verify" >&2
   exit 1
@@ -39,19 +39,28 @@ fi
 ROLLBACK_RE='downgrade|rollback|revert|\bundo\b|\bdown\b'
 PAIRED_RE='(down|undo|rollback|revert)|(^|/)U[0-9]+(_[0-9]+)*__'
 
-# Files that count as a paired rollback for any staged migration.
-mapfile -t pairs < <(git diff --cached --name-only --diff-filter=AM | grep -iE "$PAIRED_RE" || true)
+# Stem of a migration filename: the leading identifier that a paired
+# rollback file must share (001_x <-> 001_y, V2__x <-> U2__y share "2",
+# alembic rev hash shares its hex prefix).
+stemof() {
+  basename "$1" | sed -E 's/^[VU]?([0-9]+(_[0-9]+)*).*/\1/; t; s/[^A-Za-z0-9].*//'
+}
+
+# Files that count as a paired rollback candidate (stem check below).
+mapfile -t pairs < <(git diff --cached --name-only --diff-filter=AMR | grep -iE "$PAIRED_RE" || true)
 
 fail=0
 for f in "${staged[@]}"; do
   covered=""
-  # a) staged paired rollback file (other than the migration itself)
+  stem=$(stemof "$f")
+  # a) staged paired rollback file sharing the same stem
   for p in ${pairs[@]+"${pairs[@]}"}; do
     [ "$p" = "$f" ] && continue
-    covered="paired rollback: $p"; break
+    [ "$(stemof "$p")" = "$stem" ] && { covered="paired rollback: $p"; break; }
   done
-  # b) embedded rollback/downgrade section
-  if [ -z "$covered" ] && grep -qiE "$ROLLBACK_RE" "$f" 2>/dev/null; then
+  # b) embedded rollback/downgrade section in the STAGED blob
+  #    (index content, not the working copy - they may differ)
+  if [ -z "$covered" ] && git show ":$f" 2>/dev/null | grep -qiE "$ROLLBACK_RE"; then
     covered="embedded rollback section"
   fi
   # c) approved roll-forward note
@@ -79,7 +88,7 @@ if [ $CHECK_ONLY -eq 1 ]; then
   exit 0
 fi
 
-want=$(git ls-files -s -- "${staged[@]}" | awk '{print $2}' | sort | sha256sum | cut -d' ' -f1)
+want=$(for f in "${staged[@]}"; do git ls-files -s -- "$f"; done | awk '{print $2}' | sort | sha256sum | cut -d' ' -f1)
 {
   echo "files=$want"
   echo "verified_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"

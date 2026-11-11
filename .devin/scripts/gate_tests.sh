@@ -65,6 +65,15 @@ git add db/migrations/001_up.sql
 "$SHIP" "change migration" >"$SCRATCH/out" 2>&1; expect T5-stale-stamp 3 $? "MIGRATION_GATE"
 git reset -q --hard HEAD 2>/dev/null || git reset -q
 
+# --- T8: rename+modify cannot smuggle a changed migration under an
+# old stamp (pure rename of verified content keeps the stamp - the
+# stamp binds staged blob content, not the filename)
+git mv db/migrations/001_up.sql db/migrations/002_up.sql
+printf 'ALTER TABLE t ADD COLUMN c2 int;\n' >> db/migrations/002_up.sql
+git add db/migrations/002_up.sql
+"$SHIP" "rename+modify migration" >"$SCRATCH/out" 2>&1; expect T8-rename-modify-block 3 $? "MIGRATION_GATE"
+git reset -q --hard HEAD 2>/dev/null || git reset -q
+
 # --- T6: re-grounding emitted on every call (even on gate failures)
 echo y > docs_x.md && mkdir -p docs && mv docs_x.md docs/x.md && git add docs/x.md
 "$SHIP" "test" >"$SCRATCH/out" 2>&1

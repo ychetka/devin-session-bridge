@@ -21,7 +21,7 @@ MSG="${1:?usage: ship_commit.sh \"message\" [file ...]}"
 shift || true
 
 # Stage explicit file list if given
-[ $# -gt 0 ] && git add -- "$@"
+[ $# -gt 0 ] && { git add -- "$@" || { echo "git add failed" >&2; exit 1; }; }
 
 # --- Gate 0: precommit re-grounding (mechanical, cannot be skipped) ---
 # The caller is always confronted with the real staged footprint.
@@ -56,11 +56,11 @@ fi
 
 # --- Gate 2: migration gate ---
 MIG_PAT='(^|/)(migrations?|alembic/versions|db/migrate|flyway|liquibase)/|(^|/)[VU][0-9]+(_[0-9]+)*__.*\.sql$'
-migs=$(git diff --cached --name-only --diff-filter=AM | grep -E "$MIG_PAT" || true)
+migs=$(git diff --cached --name-only --diff-filter=AMR | grep -E "$MIG_PAT" || true)
 if [ -n "$migs" ]; then
   stamp="$DEVIN_DIR/migration_ok"
   # Bind to staged blob hashes (index), not working-copy files.
-  want=$(git ls-files -s -- $migs 2>/dev/null | awk '{print $2}' | sort | sha256sum | cut -d' ' -f1)
+  want=$(while IFS= read -r f; do git ls-files -s -- "$f"; done <<< "$migs" | awk '{print $2}' | sort | sha256sum | cut -d' ' -f1)
   have=""
   [ -f "$stamp" ] && have=$(grep -m1 '^files=' "$stamp" | cut -d= -f2)
   if [ "$want" != "$have" ] || [ -z "$have" ]; then
