@@ -72,9 +72,10 @@ if [ -n "$migs" ]; then
   fi
 fi
 
-# --- Gate 3: hygiene (message + staged content; raw diff keeps paths so
-# per-file language exemptions from project.json apply)
-{ echo "$MSG"; git diff --cached; } | "$DEVIN_DIR/scripts/hygiene_check.sh" --diff
+# --- Gate 3: hygiene (message + staged content). The sentinel keeps a
+# fake "diff --git" line inside the message from steering diff parsing;
+# raw diff keeps paths so per-file language exemptions apply.
+{ echo "$MSG"; echo '@@SUBJECTS_END@@'; git diff --cached; } | "$DEVIN_DIR/scripts/hygiene_check.sh" --diff
 rc=$?
 if [ $rc -ne 0 ]; then
   echo "HYGIENE_GATE: rejected" >&2

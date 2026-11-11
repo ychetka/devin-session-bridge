@@ -6,6 +6,8 @@
 #   T3 migration gate: staged migration without stamp is rejected (exit 3)
 #   T4 migration gate: rollback-covered migration gets stamped, commit ok
 #   T5 migration stamp invalidates when the migration file changes
+#   T8 rename+modify of a stamped migration is blocked
+#   T9 staged up+down pair verifies via paired-rollback coverage
 #   T6 re-grounding output is emitted on every call
 #   T7 hygiene gate still rejects (cyrillic on en-language repo)
 # Exits non-zero if any expectation fails. Run from anywhere:
@@ -73,6 +75,13 @@ printf 'ALTER TABLE t ADD COLUMN c2 int;\n' >> db/migrations/002_up.sql
 git add db/migrations/002_up.sql
 "$SHIP" "rename+modify migration" >"$SCRATCH/out" 2>&1; expect T8-rename-modify-block 3 $? "MIGRATION_GATE"
 git reset -q --hard HEAD 2>/dev/null || git reset -q
+
+# --- T9: staged up+down pair verifies via paired-rollback coverage
+printf 'CREATE TABLE u(id int);\n' > db/migrations/003_up.sql
+printf 'DROP TABLE u;\n' > db/migrations/003_down.sql
+git add db/migrations/003_up.sql db/migrations/003_down.sql
+"$GATE" >"$SCRATCH/out" 2>&1; expect T9a-paired-verify 0 $? "paired rollback"
+"$SHIP" "migration pair" >"$SCRATCH/out" 2>&1; expect T9b-commit-ok 0 $?
 
 # --- T6: re-grounding emitted on every call (even on gate failures)
 echo y > docs_x.md && mkdir -p docs && mv docs_x.md docs/x.md && git add docs/x.md

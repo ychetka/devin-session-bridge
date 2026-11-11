@@ -41,7 +41,10 @@ mode = os.environ.get("HYGIENE_MODE", "stdin")
 with open(os.environ["HYGIENE_INPUT_FILE"], encoding="utf-8",
           errors="replace") as fh:
     text = fh.read()
-cyr_paths = json.loads(os.environ.get("HYGIENE_CYR_PATHS", "[]"))
+# Fleet convention: .devin/agents/ profiles are intentionally Russian
+# in every repo, so that path is exempt even without project.json.
+cyr_paths = list({".devin/agents/"} | set(
+    json.loads(os.environ.get("HYGIENE_CYR_PATHS", "[]"))))
 violations = []
 
 def hit(cls, pattern, line_no, hint, path=None):
