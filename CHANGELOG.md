@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.13.3] - 2026-11-11
+
+### Codebase
+
+#### tooling
+- [docs] Lifecycle reconciliation - docs/OPERATOR.md marks `bridge kill <task_id>` the destructive last-resort against withdraw's benign scope-pull, and docs/PARENT_CHILD_SESSIONS.md lands the parent-child linkage design note (linkage recording, status tree annotation, explicit propagation policy). Why: Task 282 closes the residual kill-vs-withdraw ambiguity after v0.13.0 - withdraw covers every benign pull path and kill keeps only the wedged-live-work niche; the parent-child spec is written down as a design item following the 2026-11-11 misroute incident, and the stale SOAK-3 soak note is closed as covered by continuous fleet operation. (issue #149, task 282)
+
 ## [0.13.2] - 2026-11-11
 
 ### Codebase
