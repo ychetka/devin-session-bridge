@@ -51,7 +51,7 @@ decisions only.
 
 | Action | Effect on children |
 | --- | --- |
-| `bridge halt` (sid or `--all`) | fleet-wide stop - halts every session including children (unchanged; halt is global state) |
+| `bridge halt` (sid or `--all`) | per-session claim/wake flag, NOT global state - `halt <sid>` targets exactly one session, `--all` reaches `managed AND active` sessions only; children are never halted implicitly (the 2026-11-11 incident). Propagation to children stays an explicit operator choice, e.g. a future `halt --tree` |
 | `bridge withdraw` on a parent task | does NOT cascade - children withdraw individually by task id |
 | `bridge kill <sid>` (session kill) | children unaffected - they keep their own rows and slots |
 | `session/cancel` | per-turn only - aborts the target session's live turn, never a child's |
