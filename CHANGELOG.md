@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.14.0] - 2026-11-12
+
+### User-facing
+
+#### feat
+- `bridge status` now surfaces `bridge wait` external waits - the parked phase reads `ewait`/`waiting` with the declared reason, the 24h digest counts lease expiries, and a `waiting-external` gauge tracks parked claimers. `cli` (issue #151, task 293)
+
+### Codebase
+
+#### cli
+- [feat] status.py renders fresh wait_until stamps as a distinct parked phase (session view PARKED + 'external wait: <note>', fleet waiting/ewait cells, wait_until/wait_reason in --json) and the digest gains lease_expired + waiting_external; OPERATOR.md documents the notice/directive un-park flow. Why: A wait-stamped running task was indistinguishable from real work in `bridge status` (running + '-'), so parked claimers were invisible and the un-park convention was undocumented; this is observability only - no lifecycle change and no external polling. (issue #151, task 293)
+
 ## [0.13.3] - 2026-11-11
 
 ### Codebase

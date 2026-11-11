@@ -56,6 +56,7 @@ def _session_views(args) -> tuple[list[dict], list[Event], int]:
     queued tasks the capped listing actually folded into views, so the
     caller can flag truncation against the true COUNT(*).
     """
+    now = int(time.time())
     tasks = db.list_tasks(limit=1000, path=args.db)
     queue_shown = sum(1 for t in tasks if t["status"] == TaskStatus.QUEUED.value)
     by_session: dict[str, list] = {}
@@ -95,7 +96,15 @@ def _session_views(args) -> tuple[list[dict], list[Event], int]:
             state = STATE_PARKED
             action = f"waiting_quota until {_quota_reset_label(live)}"
         elif live is not None and live["status"] == TaskStatus.RUNNING.value:
-            state, action = STATE_RUNNING, "-"
+            if _external_wait_fresh(live["wait_until"], now):
+                # `bridge wait` parked the claimer on an out-of-band
+                # answer - observability only, the lifecycle stays
+                # running (issue #151)
+                state = STATE_PARKED
+                note = (live["note"] or "").strip()
+                action = _cut(f"external wait: {note}" if note else "external wait", 48)
+            else:
+                state, action = STATE_RUNNING, "-"
         elif live is not None and live["status"] == TaskStatus.DISPATCH_DECIDED.value:
             # a claimed task mid-dispatch is visible, not a silent wedge
             state = STATE_DISPATCHING
@@ -126,7 +135,7 @@ def _session_views(args) -> tuple[list[dict], list[Event], int]:
                     session_id=sid,
                     task_id=task_row["id"],
                     detail=task_row["note"],
-                    ts=int(time.time()),
+                    ts=now,
                 )
             )
             _notify(
@@ -139,6 +148,7 @@ def _session_views(args) -> tuple[list[dict], list[Event], int]:
         repo = "-"
         if srow is not None:
             repo = srow["cwd"] or srow["title"] or "-"
+        wait_until = live["wait_until"] if live is not None else None
         views.append(
             {
                 "session": sid,
@@ -147,6 +157,10 @@ def _session_views(args) -> tuple[list[dict], list[Event], int]:
                 "state": state,
                 "queue": 1 if live is not None and live["status"] == TaskStatus.QUEUED.value else 0,
                 "action": action,
+                "wait_until": wait_until,
+                "wait_reason": (
+                    live["note"] if live is not None and live["wait_until"] is not None else None
+                ),
                 "log_path": log_path,
                 "stderr_tail": stderr_tail,
             }
@@ -227,6 +241,20 @@ def _quota_reset_label(task) -> str:
     return time.strftime("%H:%MZ", time.gmtime(reset))
 
 
+def _external_wait_fresh(wait_until, now=None) -> bool:
+    """True while a ``bridge wait`` stamp is inside the lease window.
+
+    ``wait_until`` mirrors the lease expiry it was stamped with, so a
+    stamp at or past ``now`` decays on its own - an abandoned wait
+    simply stops reading as parked (issue #151).
+    """
+    if wait_until is None:
+        return False
+    if now is None:
+        now = int(time.time())
+    return int(wait_until) > now
+
+
 def _fleet_state(session_status, task) -> str:
     """The one-word state cell for a fleet row.
 
@@ -236,7 +264,9 @@ def _fleet_state(session_status, task) -> str:
     finished task means the session is simply idle. A task parked in
     ``waiting_quota`` overrides the lifecycle word: the session is
     deliberately asleep until the provider's reset, which is neither
-    running nor idle.
+    running nor idle. A fresh ``wait_until`` stamp reads ``waiting``:
+    the claimer is parked on an out-of-band answer, distinct from a
+    session that is actually running (issue #151).
     """
     if session_status == SessionStatus.DEAD.value:
         return "dead"
@@ -244,6 +274,8 @@ def _fleet_state(session_status, task) -> str:
         return "idle"
     if task["step_state"] == "waiting_quota":
         return "quota"
+    if task["status"] == TaskStatus.RUNNING.value and _external_wait_fresh(task["wait_until"]):
+        return "waiting"
     return _FLEET_STATE_ALIAS.get(task["status"], task["status"])
 
 
@@ -321,6 +353,23 @@ def _status_snapshot(args) -> dict:
                     (AuditEventKind.ESCALATION.value, cutoff),
                 ).fetchone()["c"]
             ),
+            # item_2/issue #151: lease-expiry pressure - recover_stale
+            # stamps exactly this note on every requeue/fail fold
+            "lease_expired": int(
+                con.execute(
+                    "SELECT COUNT(*) AS c FROM tasks WHERE note='lease expired' AND updated_at>=?",
+                    (cutoff,),
+                ).fetchone()["c"]
+            ),
+            # a current-snapshot gauge, not a windowed count: running
+            # tasks parked on a still-fresh `bridge wait` stamp
+            "waiting_external": int(
+                con.execute(
+                    "SELECT COUNT(*) AS c FROM tasks WHERE status=?"
+                    " AND wait_until IS NOT NULL AND wait_until>?",
+                    (TaskStatus.RUNNING.value, now),
+                ).fetchone()["c"]
+            ),
         }
     finally:
         con.close()
@@ -352,6 +401,8 @@ def _status_snapshot(args) -> dict:
             "task_status": t["status"] if t is not None else None,
             "step_state": t["step_state"] if t is not None else None,
             "quota_reset_at": t["quota_reset_at"] if t is not None else None,
+            "wait_until": t["wait_until"] if t is not None else None,
+            "wait_reason": (t["note"] if t is not None and t["wait_until"] is not None else None),
             "attempt": t["attempt"] if t is not None else None,
             "questions": qcounts.get(t["id"], 0) if t is not None else None,
             "heartbeat_age_seconds": _age(now, r["seen"]),
@@ -380,6 +431,8 @@ def _status_snapshot(args) -> dict:
             "task_status": t["status"],
             "step_state": t["step_state"],
             "quota_reset_at": t["quota_reset_at"],
+            "wait_until": t["wait_until"],
+            "wait_reason": t["note"] if t["wait_until"] is not None else None,
             "attempt": t["attempt"],
             "questions": qcounts.get(t["id"], 0),
             "heartbeat_age_seconds": None,
@@ -517,13 +570,17 @@ def _task_state_cell(r) -> str:
 
     A ``waiting_quota`` park overrides the lifecycle word - "the step
     is asleep until reset" is the answer the column must give, and the
-    raw status stays one ``inspect`` away.
+    raw status stays one ``inspect`` away. A fresh ``wait_until`` stamp
+    overrides a bare ``run`` likewise: ``ewait`` marks the claimer
+    parked on an out-of-band answer (issue #151).
     """
     st = r.get("task_status")
     if not st:
         return "-"
     if r.get("step_state") == "waiting_quota":
         return "quota"
+    if st == TaskStatus.RUNNING.value and _external_wait_fresh(r.get("wait_until")):
+        return "ewait"
     return _TASK_STATE_CELL.get(st, _cut(st, 6))
 
 
@@ -594,10 +651,13 @@ def _render_status(snap) -> str:
         else:
             lines.extend(_fleet_row_line(r) for r in shown)
     g = snap["digest"]
-    lines.append(
+    footer = (
         f"24h: done {g['done']} | auto-decisions {g['auto_decisions']}"
-        f" | escalations {g['escalations']}"
+        f" | escalations {g['escalations']} | lease-expired {g['lease_expired']}"
     )
+    if g["waiting_external"]:
+        footer += f" | waiting-external {g['waiting_external']}"
+    lines.append(footer)
     return "\n".join(lines[:STATUS_MAX_LINES])
 
 
@@ -632,6 +692,9 @@ def _cmd_status(args) -> int:
             "max": db.effective_max_active_sessions(path=args.db),
         },
         "slot_wait": len(result["slot_wait"]),
+        # issue #151: live gauge of `bridge wait` parked claimers -
+        # the digest below carries the same count plus lease_expired
+        "waiting_external": snap["digest"]["waiting_external"],
         # item_13e2 fleet view: the human render below reads only
         # these keys; --json carries the uncapped structures
         "attention": snap["attention"],

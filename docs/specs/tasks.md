@@ -61,13 +61,48 @@ ceiling `SESSIONS_BRIDGE_LEASE_AUTO_RENEW_SECONDS` (default 6x lease).
 `bridge wait` SHALL extend the caller's task lease by one
 `LEASE_SECONDS` per call under the same owner CAS as claim/finish -
 an out-of-band block (CI, reviews, partner consults) must not read as
-abandonment.
+abandonment. A `running` task whose `wait_until` stamp is still fresh
+SHALL render as a parked/waiting phase in `bridge status` - the
+per-session view reads PARKED with `external wait: <reason>` as its
+action, the fleet row shows `ewait` in TSTAT and `waiting` in STATE,
+and `--json` carries `wait_until`/`wait_reason` - without any
+lifecycle change. Un-parking is a mail delivery, not a status flip:
+a `bridge notice` or `bridge directive` to the session wakes it, and
+the waiter drains and finishes/fails the task itself. No external
+poller (GitHub, CI) is part of the design - the resolution signal
+comes from the side that knows the condition resolved.
 
 #### Scenario: wait beats expiry
 
 - **WHEN** the lease owner calls `bridge wait <task_id>` before expiry
 - **THEN** `lease_expires_at` moves out by one lease length
 - **AND** a dead claimer that stops waiting requeues within one period
+
+#### Scenario: fresh wait stamp reads parked, stale decays alone
+
+- **WHEN** a `running` task's `wait_until` is still ahead of now
+- **THEN** `bridge status` shows the external-wait phase with its
+  declared reason in the human view and `--json`
+- **AND** once the stamp ages past now the row reads `running` again
+  with no clearing write
+
+### Requirement: status digest reports lease and wait pressure
+
+The `bridge status` 24h digest SHALL count `lease_expired` - tasks
+stamped `lease expired` by `requeue_or_fail` inside the window - and
+SHALL report `waiting_external`, a current-snapshot gauge of
+`running` tasks whose `wait_until` stamp is still fresh. Both fields
+SHALL appear in the human footer (`waiting-external` only when >0)
+and in the `--json` payload.
+
+#### Scenario: expiry and parked waiter are countable
+
+- **WHEN** a lease fold requeues a task inside 24h and another task
+  is wait-parked right now
+- **THEN** the digest counts each under `lease_expired` and
+  `waiting_external` respectively
+- **AND** notes other than `lease expired` and stamps already past
+  now are not counted
 
 ### Requirement: operator kill force-fails one live task
 
