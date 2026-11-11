@@ -2844,6 +2844,28 @@ def test_issue142_gwt9_parent_child_independence_documented(db_path):
     assert "parent_task_id" not in cols
 
 
+def test_issue142_gwt10_withdraw_expires_open_questions(db_path):
+    """[ISSUE-142.GWT-10] withdrawing an awaiting_user task expires
+    its pending/claimed questions in the same transaction - the
+    orchestrator keeps no live deliberation and the janitor ships no
+    re-ask notice for a terminal task (PR #143 review)."""
+    db.register("orch", "/repo/o", role="orchestrator", path=db_path)
+    db.register("w1", "/repo/w1", path=db_path)
+    tid = db.enqueue("w1", "work with a question", path=db_path)
+    assert db.claim_queued(tid, "w", Transport.ACP_PUSH, path=db_path)
+    assert db.mark_running(tid, "w", path=db_path)
+    res = db.ask("w1", tid, "which way?", path=db_path)
+    assert res.accepted
+    qid = res.question_id
+    db.set_awaiting_user(tid, "w", path=db_path)
+
+    v = db.withdraw_task(tid, "orch", "scope pulled", path=db_path)
+    assert isinstance(v, TaskWithdrawn)
+    assert db.get_question(qid, path=db_path)["state"] == "expired"
+    ev = db.list_events(session_id="w1", kind="task_withdrawn", path=db_path)
+    assert "questions_expired=1" in ev[0]["body"]
+
+
 # --- task #216: waiting_quota step state ------------------------------------
 
 

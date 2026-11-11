@@ -2549,7 +2549,7 @@ def withdraw_task(
                     (
                         TaskStatus.CANCELLED.value,
                         ts,
-                        f"withdrawn by {actor}: {reason}",
+                        f"withdrawn by {actor}" + (f": {reason}" if reason else ""),
                         ts,
                         task_id,
                         TaskStatus.QUEUED.value,
@@ -2562,6 +2562,20 @@ def withdraw_task(
                 if cur.rowcount != 1:
                     con.rollback()
                     return TaskWithdrawRefused(status=status_before)
+                # a withdrawn awaiting_user task must not keep its
+                # pending/claimed question alive - the orchestrator
+                # would keep deliberating and the janitor would later
+                # ship a re-ask notice for a row that is already
+                # terminal (PR #143 review)
+                qexp = con.execute(
+                    "UPDATE questions SET state=? WHERE task_id=? AND state IN (?,?)",
+                    (
+                        QuestionState.EXPIRED.value,
+                        task_id,
+                        QuestionState.PENDING.value,
+                        QuestionState.CLAIMED.value,
+                    ),
+                ).rowcount
                 con.execute(
                     "INSERT INTO decision_events(session_id,kind,body,task_id,created_at)"
                     " VALUES (?,?,?,?,?)",
@@ -2570,17 +2584,18 @@ def withdraw_task(
                         "task_withdrawn",
                         f"task_id={task_id} status_before={status_before}"
                         f" actor={actor} stop_turn={int(stop_turn)}"
+                        f" questions_expired={qexp}"
                         f" reason={reason}",
                         task_id,
                         ts,
                     ),
                 )
                 notice_id = None
-                registered = con.execute(
-                    "SELECT 1 FROM sessions WHERE session_id=?",
+                active = con.execute(
+                    "SELECT 1 FROM sessions WHERE session_id=? AND status='active'",
                     (row["session_id"],),
                 ).fetchone()
-                if registered:
+                if active:
                     notice_id = con.execute(
                         "INSERT INTO notifications"
                         "(session_id,kind,body,task_id,question_id,created_at)"

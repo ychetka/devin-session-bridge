@@ -701,19 +701,29 @@ def cancel_turn(
                 }
             )
             deadline = time.monotonic() + confirm_timeout
-            while True:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    return "requested"
-                listing = call("session/list", {}, timeout=remaining)
-                still_busy = False
-                for item in listing.get("sessions", []):
-                    if item.get("sessionId") == session_id:
-                        still_busy = _is_busy(item)
-                        break
-                if not still_busy:
-                    return "confirmed"
-                time.sleep(min(0.25, deadline - time.monotonic()))
+            # post-send confirmation only ever upgrades the report -
+            # the cancel IS on the wire, so any failure here degrades
+            # to "requested", never to a raised error claiming nothing
+            # was sent (PR #143 review)
+            try:
+                while True:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return "requested"
+                    listing = call("session/list", {}, timeout=remaining)
+                    still_busy = False
+                    for item in listing.get("sessions", []):
+                        if item.get("sessionId") == session_id:
+                            still_busy = _is_busy(item)
+                            break
+                    if not still_busy:
+                        return "confirmed"
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return "requested"
+                    time.sleep(min(0.25, remaining))
+            except WakeError:
+                return "requested"
         finally:
             try:
                 sock.close()
