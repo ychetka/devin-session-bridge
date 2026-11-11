@@ -19,10 +19,11 @@ def _git(repo, *args):
     subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True)
 
 
-def _scratch(tmp_path):
+def _scratch(tmp_path, base_fragment=False):
     """A repo on main with one base commit, branched to `feature` -
     tests then commit their scenario on the feature branch and diff
-    against main."""
+    against main. With base_fragment=True a pending fragment is
+    already committed at the merge-base."""
     (tmp_path / "tools").mkdir(parents=True)
     (tmp_path / ".changes").mkdir()
     shutil.copy(SCRIPT, tmp_path / "tools" / "check_changes_entry.sh")
@@ -32,6 +33,8 @@ def _scratch(tmp_path):
     _git(repo, "config", "user.email", "t@t")
     _git(repo, "config", "user.name", "t")
     (repo / "app.py").write_text("x = 1\n")
+    if base_fragment:
+        (repo / ".changes" / "0001-old.md").write_text("old\n")
     _git(repo, "add", "-A")
     _git(repo, "commit", "-qm", "base")
     _git(repo, "switch", "-qc", "feature")
@@ -127,16 +130,11 @@ def test_gwt6_template_and_readme_do_not_count(tmp_path):
 
 
 def test_gwt7_modified_fragment_counts(tmp_path):
-    """Given a pending fragment carried over from base and edited on
-    the branch, When checked, Then it passes - the record is present
-    in the diff either way."""
-    repo = _scratch(tmp_path)
-    (repo / ".changes" / "0001-old.md").write_text("old\n")
-    _git(repo, "switch", "main")
-    (repo / ".changes" / "0001-old.md").write_text("old\n")
-    _git(repo, "add", "-A")
-    _git(repo, "commit", "-qm", "base fragment")
-    _git(repo, "switch", "feature")
+    """Given a fragment already committed on main (status M in the
+    merge-base diff) and edited on the branch, When checked, Then it
+    passes - a record present in the diff counts however it got
+    there."""
+    repo = _scratch(tmp_path, base_fragment=True)
     _commit(repo, ".changes/0001-old.md", "old updated\n")
     assert _run(repo).returncode == 0
 
@@ -148,3 +146,19 @@ def test_gwt8_empty_diff_passes(tmp_path):
     out = _run(repo)
     assert out.returncode == 0, out.stderr
     assert "no file changes" in out.stdout
+
+
+def test_gwt9_prose_mention_does_not_exempt(tmp_path):
+    """Given a body that merely mentions the marker inside a sentence
+    (review r1: deliberate-declaration tightening), When checked, Then
+    the opt-out does not fire."""
+    repo = _scratch(tmp_path)
+    _commit(repo, "app.py")
+    out = _run(
+        repo,
+        env={"PR_BODY": "Note: I considered no-changes-entry but added one anyway."},
+    )
+    assert out.returncode == 1
+    # a whole-line marker is the deliberate declaration
+    out = _run(repo, env={"PR_BODY": "Docs only.\n\nno-changes-entry\n"})
+    assert out.returncode == 0

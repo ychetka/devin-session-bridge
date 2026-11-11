@@ -34,4 +34,5 @@ jobs:
           PR_TITLE: ${{ github.event.pull_request.title }}
           PR_BODY: ${{ github.event.pull_request.body }}
           PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ' ') }}
-        run: bash tools/check_changes_entry.sh --base "origin/${{ github.base_ref }}"
+          BASE_REF: ${{ github.base_ref }}
+        run: bash tools/check_changes_entry.sh --base "origin/$BASE_REF"

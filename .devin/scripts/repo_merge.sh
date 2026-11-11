@@ -65,12 +65,17 @@ fi
 # issue #135: the release-notes record is part of the objective gate -
 # a PR without a new .changes fragment, a folded CHANGELOG.md change,
 # or the no-changes-entry marker does not merge.
-ENTRY=$(bash "$TOP/tools/check_changes_entry.sh" --pr "$PR" 2>/dev/null)
+ENTRY=$(bash "$TOP/tools/check_changes_entry.sh" --pr "$PR" 2>&1 | tail -n 1)
 ENTRY_OK=$(echo "$ENTRY" | python3 -c 'import json,sys
 try: print("yes" if json.load(sys.stdin).get("status") == "pass" else "no")
 except Exception: print("no")')
 if [ "$ENTRY_OK" != "yes" ]; then
-  echo "{\"status\":\"blocked\",\"failure_class\":\"missing_changes_entry\",\"gate_report\":{\"changes_entry\":$ENTRY}}"
+  ENTRY="$ENTRY" python3 -c 'import json,os,sys
+raw = os.environ.get("ENTRY", "")
+try: report = json.loads(raw)
+except Exception: report = {"status": "error", "detail": raw}
+print(json.dumps({"status": "blocked", "failure_class": "missing_changes_entry",
+                  "gate_report": {"changes_entry": report}}))'
   exit 1
 fi
 

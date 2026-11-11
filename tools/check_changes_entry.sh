@@ -3,8 +3,8 @@
 # (issue #135).
 #
 # Every PR that changes files must carry ONE of:
-#   1. a new `.changes/<slug>.md` fragment (added or renamed - not
-#      `_template.md`, not `README.md`),
+#   1. a `.changes/<slug>.md` fragment in the diff (added, modified or
+#      renamed - not `_template.md`, not `README.md`),
 #   2. a `CHANGELOG.md` change - release-prep PRs fold fragments into
 #      the changelog directly instead of carrying a pending file,
 #   3. the `no-changes-entry` marker in the PR title, body, or a label
@@ -23,7 +23,8 @@
 # and exit 1 otherwise. See .changes/README.md for the convention.
 set -uo pipefail
 
-fail() { echo "FAIL: $1" >&2; echo "{\"status\":\"fail\",\"reason\":\"$1\"}"; exit 1; }
+fail() { echo "FAIL: $1" >&2; REASON="$1" python3 -c \
+  'import json,os;print(json.dumps({"status":"fail","reason":os.environ["REASON"]}))'; exit 1; }
 pass() { echo "{\"status\":\"pass\",\"reason\":\"$1\"}"; exit 0; }
 
 MODE=""
@@ -49,7 +50,9 @@ if [ "$MODE" = "base" ]; then
     FILES=$(git diff --name-status "$BASE" HEAD 2>/dev/null) \
       || fail "cannot diff $BASE HEAD"
   fi
-  META="${PR_TITLE:-}"$'\n'"${PR_BODY:-}"$'\n'"${PR_LABELS:-}"
+  META_TITLE="${PR_TITLE:-}"
+  META_BODY="${PR_BODY:-}"
+  META_LABELS="${PR_LABELS:-}"
 else
   FILES=$(gh api "repos/{owner}/{repo}/pulls/$PR/files?per_page=100" --paginate \
             --jq '.[] | [.status, .filename] | @tsv' 2>/dev/null) \
@@ -66,16 +69,21 @@ for line in sys.stdin:
          "renamed": "R", "changed": "M", "copied": "A"}
     print(f"{m.get(parts[0], parts[0])}\t{parts[-1]}")
 ')
-  META=$(gh pr view "$PR" --json title,body,labels \
-    --jq '[.title, .body, ([.labels[].name] | join(" "))] | join("\n")' 2>/dev/null) \
+  PRMETA=$(gh pr view "$PR" --json title,body,labels 2>/dev/null) \
     || fail "cannot read metadata for PR $PR"
+  META_TITLE=$(echo "$PRMETA" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("title") or "")')
+  META_BODY=$(echo "$PRMETA" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("body") or "")')
+  META_LABELS=$(echo "$PRMETA" | python3 -c 'import json,sys;print(" ".join(l["name"] for l in json.load(sys.stdin).get("labels") or []))')
 fi
 
-FILES="$FILES" META="$META" python3 - <<'PYEOF'
+FILES="$FILES" META_TITLE="$META_TITLE" META_BODY="$META_BODY" \
+META_LABELS="$META_LABELS" python3 - <<'PYEOF'
 import os, re, sys
 
 files = os.environ.get("FILES", "")
-meta = os.environ.get("META", "")
+meta_title = os.environ.get("META_TITLE", "")
+meta_body = os.environ.get("META_BODY", "")
+meta_labels = os.environ.get("META_LABELS", "")
 
 fragment = False
 changelog = False
@@ -91,7 +99,7 @@ for line in files.splitlines():
         if name.endswith(".md") and not name.startswith("_") \
                 and name != "README.md":
             fragment = True
-    if path == "CHANGELOG.md":
+    if path == "CHANGELOG.md" and status[0] in ("A", "M", "R"):
         changelog = True
 
 if not entries:
@@ -103,7 +111,12 @@ if fragment:
 if changelog:
     print('{"status":"pass","reason":"CHANGELOG.md changed - folded release record"}')
     sys.exit(0)
-if re.search(r"\bno-changes-entry\b", meta, re.IGNORECASE):
+# the marker must be a deliberate declaration: a whole line in the
+# title or body, or an exact label name - a mention inside prose does
+# not exempt
+if re.search(r"(?im)^[ \t]*no-changes-entry[ \t]*$",
+             meta_title + "\n" + meta_body) \
+        or "no-changes-entry" in meta_labels.split():
     print('{"status":"pass","reason":"no-changes-entry marker present"}')
     sys.exit(0)
 
