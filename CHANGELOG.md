@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.11.0] - 2026-11-11
+
+### User-facing
+
+#### feat
+- Every PR that changes files must now carry a release-notes record: a new `.changes` fragment, a folded `CHANGELOG.md` change, or the `no-changes-entry` opt-out marker - enforced by CI and by the merge gate. `tooling` (issue #135, task 261)
+
+### Codebase
+
+#### tooling
+- [feat] New `tools/check_changes_entry.sh` runs in the lint workflow on pull_request (diff vs base ref, PR metadata via env) and inside `.devin/scripts/repo_merge.sh` as a pre-merge guard over the gh API file list; merges without a record are blocked with failure_class `missing_changes_entry`. `CHANGELOG.md` changes satisfy the gate so release-prep folds still merge, and `no-changes-entry` in title/body/labels is the documented docs/ops opt-out. Why: PRs #128 and #132 merged with no `.changes` fragment and no version bump, each blocking `repo_release.sh` on version_drift until a retroactive fragment+bump PR fixed the record. Approved design gates the fragment itself - not the version bump, which stays a release-step concern so parallel PRs cannot collide on the version number. (issue #135, task 261)
+
 ## [0.10.3] - 2026-11-10
 
 ### User-facing
