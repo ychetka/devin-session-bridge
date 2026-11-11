@@ -25,7 +25,6 @@ set -uo pipefail
 
 fail() { echo "FAIL: $1" >&2; REASON="$1" python3 -c \
   'import json,os;print(json.dumps({"status":"fail","reason":os.environ["REASON"]}))'; exit 1; }
-pass() { echo "{\"status\":\"pass\",\"reason\":\"$1\"}"; exit 0; }
 
 MODE=""
 BASE=""
