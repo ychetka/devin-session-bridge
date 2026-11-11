@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.12.0] - 2026-11-11
+
+### User-facing
+
+#### feat
+- Worker sessions now follow the director session model: short event-driven turns, one background executor, mandatory checkpoints. `docs` (issue #137, task 262)
+
+### Codebase
+
+#### docs
+- [feat] Adopted canonical director session model section into controller-manager/harness.md; mid-turn inject proven impossible (issue #137). Why: Canonical rollout of the director session model (task 262). A live ACP probe proved session/prompt is rejected mid-turn ("a turn is already running"), so the event-driven model is the only viable variant. (issue #137, task 262)
+
 ## [0.11.0] - 2026-11-11
 
 ### User-facing
