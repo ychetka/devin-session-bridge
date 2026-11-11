@@ -11,11 +11,13 @@
 #      (downgrade|rollback|revert|undo, or "down" inside a -- comment
 #      line like goose's "-- +goose Down"), or
 #   c) an approved roll-forward note exists at
-#      .devin/migration_rollforward.md that names the file's
-#      repo-relative path explicitly (human-approved, contains the
+#      .devin/migration_rollforward.md that lists the file's
+#      repo-relative path on its own line - the note enumerates
+#      covered paths one per line, so a substring like a .bak name
+#      can never cover the real file (human-approved, contains the
 #      justification for going forward-only)
 # A staged DELETION of a migration file is covered only by (c): the
-# note must name the deleted path explicitly.
+# note must list the deleted path on its own line.
 #
 # Optional: if the project provides a native dry-run entrypoint via
 # the "dry_run_cmd" key in .devin/project.json, it is executed in a
@@ -80,7 +82,7 @@ stemof() {
 }
 
 fail=0
-for f in "${staged[@]}"; do
+for f in ${staged[@]+"${staged[@]}"}; do
   covered=""
   stem=$(stemof "$f")
   # a) staged paired rollback file sharing the same stem
@@ -93,8 +95,9 @@ for f in "${staged[@]}"; do
   if [ -z "$covered" ] && git show ":$f" 2>/dev/null | grep -qiE "$ROLLBACK_RE"; then
     covered="embedded rollback section"
   fi
-  # c) approved roll-forward note naming this file explicitly
-  if [ -z "$covered" ] && [ -s "$NOTE" ] && grep -qF -- "$f" "$NOTE"; then
+  # c) approved roll-forward note listing this path on its own line
+  #    (whole-line match - a substring like a .bak name cannot cover)
+  if [ -z "$covered" ] && [ -s "$NOTE" ] && grep -qxF -- "$f" "$NOTE"; then
     covered="approved roll-forward (.devin/migration_rollforward.md)"
   fi
   if [ -z "$covered" ]; then
@@ -105,11 +108,11 @@ for f in "${staged[@]}"; do
   fi
 done
 
-# Staged deletions: covered ONLY by the roll-forward note naming each
-# deleted path explicitly - pairs and embedded sections cannot apply
-# to a file that no longer exists.
+# Staged deletions: covered ONLY by the roll-forward note listing each
+# deleted path on its own line - pairs and embedded sections cannot
+# apply to a file that no longer exists.
 for f in ${deleted[@]+"${deleted[@]}"}; do
-  if [ -s "$NOTE" ] && grep -qF -- "$f" "$NOTE"; then
+  if [ -s "$NOTE" ] && grep -qxF -- "$f" "$NOTE"; then
     echo "OK: $f -> approved roll-forward (.devin/migration_rollforward.md)"
   else
     echo "MIGRATION GATE FAIL: deleted migration $f has no roll-forward coverage" >&2
@@ -120,12 +123,14 @@ done
 
 # Optional native dry-run, only via the command the project declares
 # in its own manifest (.devin/project.json key "dry_run_cmd"). Absent
-# file or absent key = no dry-run; never an ad-hoc env var.
+# file, absent key, or explicit null = no dry-run; never an ad-hoc
+# env var. The `or ""` turns an explicit null into "" (not the string
+# "None"), and the [ -n ] guard below is what actually gates the run.
 DRY_RUN_CMD=""
 if [ -f "$DEVIN_DIR/project.json" ]; then
   DRY_RUN_CMD=$(python3 -c 'import json,sys
 try:
-    print(json.load(open(sys.argv[1])).get("dry_run_cmd",""))
+    print(json.load(open(sys.argv[1])).get("dry_run_cmd") or "")
 except Exception:
     print("")' "$DEVIN_DIR/project.json" 2>/dev/null || true)
 fi
@@ -143,7 +148,7 @@ fi
 # Stamp binds the full staged footprint of migration-pattern files
 # (migrations + their rollback artifacts + staged deletions as D:<path>
 # lines) - the same set ship_commit recomputes via MIG_PAT.
-want=$( { for f in "${all_mig[@]}"; do git ls-files -s -- "$f" | awk '{print $2}'; done; for d in ${deleted[@]+"${deleted[@]}"}; do printf 'D:%s\n' "$d"; done; } | sort | sha256sum | cut -d' ' -f1)
+want=$( { for f in ${all_mig[@]+"${all_mig[@]}"}; do git ls-files -s -- "$f" | awk '{print $2}'; done; for d in ${deleted[@]+"${deleted[@]}"}; do printf 'D:%s\n' "$d"; done; } | sort | sha256sum | cut -d' ' -f1)
 {
   echo "files=$want"
   echo "verified_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"

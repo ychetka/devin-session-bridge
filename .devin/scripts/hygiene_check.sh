@@ -38,8 +38,9 @@ with open(os.environ["HYGIENE_INPUT_FILE"], encoding="utf-8",
           errors="replace") as fh:
     text = fh.read()
 # project.json drives language + cyrillic-path exemptions. Absent file
-# -> defaults (en, no extra paths). Present but malformed -> fail
-# closed: emit an infra violation instead of silently defaulting.
+# -> defaults (en, no extra paths). Present but malformed - bad JSON,
+# non-object root, or a wrong value type - -> fail closed: emit an
+# infra violation instead of silently defaulting.
 lang = "en"
 # Fleet convention: .devin/agents/ profiles are intentionally Russian
 # in every repo, so that path is exempt even without project.json.
@@ -51,8 +52,22 @@ if pj and os.path.exists(pj):
             cfg = json.load(fh)
         if not isinstance(cfg, dict):
             raise ValueError("project.json is not a JSON object")
-        lang = cfg.get("text_language", "en")
-        cyr_paths |= set(cfg.get("cyrillic_paths", []))
+        # Value types are validated before use - a wrong type is
+        # malformed config and must fail closed, never silently
+        # default: "text_language":null would disable the cyrillic
+        # gate, and "cyrillic_paths":"s" would coerce to {"s"} and
+        # exempt every path starting with "s".
+        tl = cfg.get("text_language", "en")
+        if not isinstance(tl, str):
+            raise ValueError(
+                "project.json text_language must be a string")
+        cp = cfg.get("cyrillic_paths", [])
+        if not isinstance(cp, list) or not all(
+                isinstance(p, str) for p in cp):
+            raise ValueError(
+                "project.json cyrillic_paths must be a list of strings")
+        lang = tl
+        cyr_paths |= set(cp)
     except (OSError, ValueError) as exc:
         print(json.dumps({"violations": [{
             "class": "infra", "line": 0,

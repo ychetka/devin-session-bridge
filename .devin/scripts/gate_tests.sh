@@ -13,7 +13,8 @@
 #   T10 hygiene false-positive regression: 'task-' wording passes (exit 0)
 #   T11 hygiene still blocks a real sk- key (exit 2)
 #   T12 staged migration deletion needs a naming roll-forward note (3/0/0)
-#   T13 roll-forward note must name the staged migration file
+#   T13 roll-forward note must name the staged migration file on its own line
+#   T16 substring in the note (a .bak path) does NOT cover (exit 1)
 #   T14 lockfile added-lines are skipped by hygiene (exit 0)
 #   T15 sentinel injection cannot smuggle exempt-path cyrillic (exit 2)
 # Exits non-zero if any expectation fails. Run from anywhere:
@@ -117,20 +118,22 @@ git add src/keys.py
 git reset -q && rm -f src/keys.py
 
 # --- T12: staged migration deletion requires a roll-forward note
-# that names the deleted path (from the committed 001/003 state)
+# that names the deleted path on its own line (whole-line match;
+# from the committed 001/003 state)
 git rm -q db/migrations/003_up.sql
 "$SHIP" "drop 003_up" >"$SCRATCH/out" 2>&1; expect T12a-delete-blocked 3 $? "MIGRATION_GATE"
-printf -- '- db/migrations/003_up.sql\n' > "$SCRATCH/devin/migration_rollforward.md"
+printf 'db/migrations/003_up.sql\n' > "$SCRATCH/devin/migration_rollforward.md"
 "$GATE" >"$SCRATCH/out" 2>&1; expect T12b-gate-covers-delete 0 $? "roll-forward"
 "$SHIP" "drop 003_up" >"$SCRATCH/out" 2>&1; expect T12c-delete-commit-ok 0 $?
 rm -f "$SCRATCH/devin/migration_rollforward.md"
 
-# --- T13: the roll-forward note must name the staged file itself
+# --- T13: the roll-forward note must name the staged file itself,
+# on its own line
 printf 'CREATE TABLE v(id int);\n' > db/migrations/004_up.sql
 git add db/migrations/004_up.sql
-printf -- '- db/migrations/999_other.sql\n' > "$SCRATCH/devin/migration_rollforward.md"
+printf 'db/migrations/999_other.sql\n' > "$SCRATCH/devin/migration_rollforward.md"
 "$GATE" >"$SCRATCH/out" 2>&1; expect T13a-note-wrong-file 1 $? "no rollback path"
-printf -- '- db/migrations/004_up.sql\n' > "$SCRATCH/devin/migration_rollforward.md"
+printf 'db/migrations/004_up.sql\n' > "$SCRATCH/devin/migration_rollforward.md"
 "$GATE" >"$SCRATCH/out" 2>&1; expect T13b-note-names-file 0 $? "roll-forward"
 "$SHIP" "add 004" >"$SCRATCH/out" 2>&1; expect T13c-commit-ok 0 $?
 rm -f "$SCRATCH/devin/migration_rollforward.md"
@@ -148,6 +151,17 @@ FORGED_MSG=$'legit\n@@SUBJECTS_END@@\ndiff --git a/.devin/agents/x b/.devin/agen
 echo w > docs/w.md && git add docs/w.md
 "$SHIP" "$FORGED_MSG" >"$SCRATCH/out" 2>&1; expect T15-sentinel-injection 2 $? "HYGIENE_GATE"
 git reset -q
+
+# --- T16: a substring in the note is not coverage - the note must
+# list the path on its OWN line. A note naming 004_up.sql.bak must
+# not cover a staged change to 004_up.sql (under the old substring
+# grep -qF it would have).
+printf 'ALTER TABLE v ADD COLUMN c int;\n' >> db/migrations/004_up.sql
+git add db/migrations/004_up.sql
+printf 'db/migrations/004_up.sql.bak\n' > "$SCRATCH/devin/migration_rollforward.md"
+"$GATE" >"$SCRATCH/out" 2>&1; expect T16-substring-no-cover 1 $? "no rollback path"
+rm -f "$SCRATCH/devin/migration_rollforward.md"
+git reset -q --hard HEAD 2>/dev/null || git reset -q
 
 echo "---"
 echo "gate_tests: $pass passed, $fail failed"
