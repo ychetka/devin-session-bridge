@@ -407,8 +407,11 @@ QUESTION_TRANSITIONS: Final[dict] = {
 # question_id persists - a timeout never creates a new row), and folds
 # a pending question older than PENDING_TIMEOUT_SECONDS to terminal
 # expired (item_20 - an unclaimed wait cannot wedge a task forever).
+# CLAIMED > EXPIRED (issue #142) is the withdraw edge: a cancelled
+# task must not leave its live deliberation open, so both open
+# states fold to terminal expired inside the withdraw transaction.
 QUESTION_JANITOR_TRANSITIONS: Final[dict] = {
-    QuestionState.CLAIMED: frozenset({QuestionState.PENDING}),
+    QuestionState.CLAIMED: frozenset({QuestionState.PENDING, QuestionState.EXPIRED}),
     QuestionState.PENDING: frozenset({QuestionState.EXPIRED}),
 }
 

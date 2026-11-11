@@ -2524,7 +2524,14 @@ def withdraw_task(
     interrupt the live ACP turn (the CLI emits a best-effort
     ``session/cancel`` after this call) - the journal states what was
     requested, not whether the backend confirmed the turn stopped.
+
+    Open questions die with the task: pending and claimed questions
+    fold to terminal ``expired`` inside the same transaction (a
+    janitor edge), so no live deliberation or later re-ask notice
+    survives a cancelled task.
     """
+    validate_question_transition(QuestionState.PENDING, QuestionState.EXPIRED, janitor=True)
+    validate_question_transition(QuestionState.CLAIMED, QuestionState.EXPIRED, janitor=True)
     ts = _now()
 
     def op():
