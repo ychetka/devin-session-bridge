@@ -2857,13 +2857,20 @@ def test_issue142_gwt10_withdraw_expires_open_questions(db_path):
     res = db.ask("w1", tid, "which way?", path=db_path)
     assert res.accepted
     qid = res.question_id
+    # one pending slot per task: claim the first question so a second
+    # ask can land - withdraw must expire BOTH states.
+    assert db.claim_question(qid, "orch", path=db_path)
+    res2 = db.ask("w1", tid, "and which file?", path=db_path)
+    assert res2.accepted
+    qid2 = res2.question_id
     db.set_awaiting_user(tid, "w", path=db_path)
 
     v = db.withdraw_task(tid, "orch", "scope pulled", path=db_path)
     assert isinstance(v, TaskWithdrawn)
     assert db.get_question(qid, path=db_path)["state"] == "expired"
+    assert db.get_question(qid2, path=db_path)["state"] == "expired"
     ev = db.list_events(session_id="w1", kind="task_withdrawn", path=db_path)
-    assert "questions_expired=1" in ev[0]["body"]
+    assert "questions_expired=2" in ev[0]["body"]
 
 
 # --- task #216: waiting_quota step state ------------------------------------
