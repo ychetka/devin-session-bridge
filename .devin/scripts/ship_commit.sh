@@ -56,11 +56,15 @@ fi
 
 # --- Gate 2: migration gate ---
 MIG_PAT='(^|/)(migrations?|alembic/versions|db/migrate|flyway|liquibase)/|(^|/)[VU][0-9]+(_[0-9]+)*__.*\.sql$'
-migs=$(git diff --cached --name-only --diff-filter=AMR | grep -E "$MIG_PAT" || true)
+migs=$(git diff --cached --name-only --diff-filter=AMRD | grep -E "$MIG_PAT" || true)
 if [ -n "$migs" ]; then
   stamp="$DEVIN_DIR/migration_ok"
-  # Bind to staged blob hashes (index), not working-copy files.
-  want=$(while IFS= read -r f; do git ls-files -s -- "$f"; done <<< "$migs" | awk '{print $2}' | sort | sha256sum | cut -d' ' -f1)
+  deleted=$(git diff --cached --name-only --diff-filter=D | grep -E "$MIG_PAT" || true)
+  # Bind to staged blob hashes (index), not working-copy files; each
+  # staged deletion contributes a D:<path> line - the same formula
+  # migration_gate.sh stamps (ls-files yields nothing for index-gone
+  # paths, so feeding the AMRD list is safe).
+  want=$( { while IFS= read -r f; do git ls-files -s -- "$f" | awk '{print $2}'; done <<< "$migs"; while IFS= read -r d; do [ -n "$d" ] && printf 'D:%s\n' "$d"; done <<< "$deleted"; } | sort | sha256sum | cut -d' ' -f1)
   have=""
   [ -f "$stamp" ] && have=$(grep -m1 '^files=' "$stamp" | cut -d= -f2)
   if [ "$want" != "$have" ] || [ -z "$have" ]; then
@@ -82,4 +86,6 @@ if [ $rc -ne 0 ]; then
   exit 2
 fi
 
-git commit -m "$MSG"
+# Commit, then remove the migration stamp so it is single-use and can
+# never silently authorize a later, unverified migration footprint.
+git commit -m "$MSG" && rm -f "$DEVIN_DIR/migration_ok"

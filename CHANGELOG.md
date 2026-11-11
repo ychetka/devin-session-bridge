@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.13.1] - 2026-11-11
+
+### Codebase
+
+#### tooling
+- [fix] Post-incident audit fixes for the fleet quality gates rollout: hygiene_check anchors the `sk-` secret pattern (word boundary + min length, no more `task-`/`risk-` false positives), splits commit text on the last `@@SUBJECTS_END@@` sentinel so injected fake-diff tails cannot smuggle exempt-path cyrillic, reads project.json inside the python sandbox (fail-closed on malformed JSON) and skips lockfile added-lines in both diff modes; migration_gate covers staged deletions only via a roll-forward note naming each path, tightens the rollback regex to `down` inside `--` comments, reads `dry_run_cmd` from project.json instead of an env var, and binds deletions into the stamp hash which ship_commit now makes single-use; reviewer profile gains shared-checkout worktree isolation, an untrusted-PR-content rule, head-sha-bound verdict dismissal and PATH-first gh-askon resolution. Why: the issue #144 audit found fail-open paths convention-level rules could not close. (issue #144)
+
 ## [0.13.0] - 2026-11-11
 
 ### User-facing

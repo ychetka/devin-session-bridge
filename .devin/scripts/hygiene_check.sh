@@ -8,14 +8,11 @@ set -uo pipefail
 
 # .devin may sit outside the git toplevel - resolve it from the
 # script's own location so callers running from $TOP still find config.
+# project.json is read inside the python heredoc (path passed via env)
+# so a quote in $PJ can never break the inline -c string and silently
+# degrade to defaults - malformed JSON fails closed instead.
 DEVIN_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 PJ="$DEVIN_DIR/project.json"
-LANG="en"
-CYR_PATHS="[]"
-if [ -f "$PJ" ]; then
-  LANG=$(python3 -c "import json;print(json.load(open('$PJ')).get('text_language','en'))" 2>/dev/null || echo en)
-  CYR_PATHS=$(python3 -c "import json;print(json.dumps(json.load(open('$PJ')).get('cyrillic_paths',[])))" 2>/dev/null || echo '[]')
-fi
 
 MODE="stdin"
 if [ "${1:-}" = "--diff-base" ]; then
@@ -33,18 +30,51 @@ fi
 INPUT_FILE=$(mktemp)
 trap 'rm -f "$INPUT_FILE"' EXIT
 printf '%s' "$INPUT" > "$INPUT_FILE"
-HYGIENE_INPUT_FILE="$INPUT_FILE" HYGIENE_LANG="$LANG" HYGIENE_MODE="$MODE" \
-HYGIENE_CYR_PATHS="$CYR_PATHS" python3 - <<'PYEOF'
+HYGIENE_INPUT_FILE="$INPUT_FILE" HYGIENE_MODE="$MODE" \
+HYGIENE_PJ="$PJ" python3 - <<'PYEOF'
 import json, os, re, sys
-lang = os.environ.get("HYGIENE_LANG", "en")
 mode = os.environ.get("HYGIENE_MODE", "stdin")
 with open(os.environ["HYGIENE_INPUT_FILE"], encoding="utf-8",
           errors="replace") as fh:
     text = fh.read()
+# project.json drives language + cyrillic-path exemptions. Absent file
+# -> defaults (en, no extra paths). Present but malformed - bad JSON,
+# non-object root, or a wrong value type - -> fail closed: emit an
+# infra violation instead of silently defaulting.
+lang = "en"
 # Fleet convention: .devin/agents/ profiles are intentionally Russian
 # in every repo, so that path is exempt even without project.json.
-cyr_paths = list({".devin/agents/"} | set(
-    json.loads(os.environ.get("HYGIENE_CYR_PATHS", "[]"))))
+cyr_paths = {".devin/agents/"}
+pj = os.environ.get("HYGIENE_PJ", "")
+if pj and os.path.exists(pj):
+    try:
+        with open(pj, encoding="utf-8") as fh:
+            cfg = json.load(fh)
+        if not isinstance(cfg, dict):
+            raise ValueError("project.json is not a JSON object")
+        # Value types are validated before use - a wrong type is
+        # malformed config and must fail closed, never silently
+        # default: "text_language":null would disable the cyrillic
+        # gate, and "cyrillic_paths":"s" would coerce to {"s"} and
+        # exempt every path starting with "s".
+        tl = cfg.get("text_language", "en")
+        if not isinstance(tl, str):
+            raise ValueError(
+                "project.json text_language must be a string")
+        cp = cfg.get("cyrillic_paths", [])
+        if not isinstance(cp, list) or not all(
+                isinstance(p, str) for p in cp):
+            raise ValueError(
+                "project.json cyrillic_paths must be a list of strings")
+        lang = tl
+        cyr_paths |= set(cp)
+    except (OSError, ValueError) as exc:
+        print(json.dumps({"violations": [{
+            "class": "infra", "line": 0,
+            "hint": "project.json malformed - fail closed: %s" % exc}]},
+            indent=2))
+        sys.exit(1)
+cyr_paths = list(cyr_paths)
 violations = []
 
 def hit(cls, pattern, line_no, hint, path=None):
@@ -67,7 +97,7 @@ rules = [
      "private key material"),
     (r"(ghp_|gho_|ghu_|ghs_|ghr_|github_pat_)[A-Za-z0-9_]{20,}", "secret",
      "GitHub token pattern"),
-    (r"(s""k-|xox[baprs]-|AKIA[0-9A-Z]{16})", "secret",
+    (r"(\bs""k-[A-Za-z0-9_-]{20,}|xox[baprs]-|AKIA[0-9A-Z]{16})", "secret",
      "API key pattern"),
     (r"(?i)(password|passwd|secret|api[_-]?key)\s*[:=]\s*['\"]?[^\s'\"]{8,}", "secret",
      "credential assignment"),
@@ -79,10 +109,13 @@ def items():
     # In --diff-base mode INPUT is subjects + sentinel + raw diff. Subjects
     # are attacker-controlled text (commit messages) and must never feed the
     # diff state machine - a subject like "diff --git a/x b/x" could desync
-    # path tracking and smuggle exempted cyrillic. Split first.
+    # path tracking and smuggle exempted cyrillic. Split first - on the
+    # LAST sentinel: a message carrying its own fake sentinel + forged
+    # "diff --git"/"+++ b/..." lines must land in the subjects half, where
+    # it is scanned as plain text with no path exemptions.
     body = text
     if mode == "diff" and "\n@@SUBJECTS_END@@\n" in text:
-        subjects, body = text.split("\n@@SUBJECTS_END@@\n", 1)
+        subjects, body = text.rsplit("\n@@SUBJECTS_END@@\n", 1)
         for line in subjects.splitlines():
             yield line, None  # subjects scanned with no path context
     path = None
@@ -115,7 +148,21 @@ def items():
             continue
         yield line, None
 
+# Lockfiles are skipped entirely: generated content can contain
+# token-shaped strings and non-English identifiers, and reviewing them
+# line-by-line has no signal. --diff-base's ':(exclude)*.lock' pathspec
+# remains a generation-time perf filter; this python-side check is the
+# semantic one for both modes (--diff used by ship_commit has no
+# generation-side filter, and lockfiles that do not end in .lock like
+# package-lock.json are caught here too).
+LOCKFILE_NAMES = {"package-lock.json", "pnpm-lock.yaml", "yarn.lock",
+                  "go.sum", "poetry.lock", "composer.lock"}
+
 for i, (line, path) in enumerate(items(), 1):
+    if path:
+        base = os.path.basename(path)
+        if base.endswith(".lock") or base in LOCKFILE_NAMES:
+            continue
     for pattern, cls, hint in rules:
         if re.search(pattern, line, re.IGNORECASE):
             hit(cls, pattern, i, hint, path)

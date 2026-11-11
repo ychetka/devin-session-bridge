@@ -10,6 +10,13 @@
 #   T9 staged up+down pair verifies via paired-rollback coverage
 #   T6 re-grounding output is emitted on every call
 #   T7 hygiene gate still rejects (cyrillic on en-language repo)
+#   T10 hygiene false-positive regression: 'task-' wording passes (exit 0)
+#   T11 hygiene still blocks a real sk- key (exit 2)
+#   T12 staged migration deletion needs a naming roll-forward note (3/0/0)
+#   T13 roll-forward note must name the staged migration file on its own line
+#   T16 substring in the note (a .bak path) does NOT cover (exit 1)
+#   T14 lockfile added-lines are skipped by hygiene (exit 0)
+#   T15 sentinel injection cannot smuggle exempt-path cyrillic (exit 2)
 # Exits non-zero if any expectation fails. Run from anywhere:
 #   .devin/scripts/gate_tests.sh
 set -uo pipefail
@@ -97,6 +104,64 @@ CYR_MSG=$'\u0442\u0435\u0441\u0442\u043e\u0432\u043e\u0435 \u0441\u043e\u043e\u0
 echo z > docs/y.md && git add docs/y.md
 "$SHIP" "$CYR_MSG" >"$SCRATCH/out" 2>&1; expect T7-hygiene 2 $? "HYGIENE_GATE"
 git reset -q
+
+# --- T10: 'task-' no longer trips the anchored sk- secret rule
+printf 'docs/\nsrc/\ndb/\nuv.lock\n' > "$SCRATCH/devin/scope_whitelist.txt"
+git add docs/y.md
+"$SHIP" "fix task-terminal wording" >"$SCRATCH/out" 2>&1; expect T10-sk-false-positive 0 $?
+
+# --- T11: a real sk- key is still blocked
+# (key split via %s so this file itself carries no flaggable token)
+mkdir -p src && printf 'KEY = "sk-%s"\n' 'abcdefghijklmnopqrst1234' > src/keys.py
+git add src/keys.py
+"$SHIP" "add keys" >"$SCRATCH/out" 2>&1; expect T11-real-key-blocked 2 $? "HYGIENE_GATE"
+git reset -q && rm -f src/keys.py
+
+# --- T12: staged migration deletion requires a roll-forward note
+# that names the deleted path on its own line (whole-line match;
+# from the committed 001/003 state)
+git rm -q db/migrations/003_up.sql
+"$SHIP" "drop 003_up" >"$SCRATCH/out" 2>&1; expect T12a-delete-blocked 3 $? "MIGRATION_GATE"
+printf 'db/migrations/003_up.sql\n' > "$SCRATCH/devin/migration_rollforward.md"
+"$GATE" >"$SCRATCH/out" 2>&1; expect T12b-gate-covers-delete 0 $? "roll-forward"
+"$SHIP" "drop 003_up" >"$SCRATCH/out" 2>&1; expect T12c-delete-commit-ok 0 $?
+rm -f "$SCRATCH/devin/migration_rollforward.md"
+
+# --- T13: the roll-forward note must name the staged file itself,
+# on its own line
+printf 'CREATE TABLE v(id int);\n' > db/migrations/004_up.sql
+git add db/migrations/004_up.sql
+printf 'db/migrations/999_other.sql\n' > "$SCRATCH/devin/migration_rollforward.md"
+"$GATE" >"$SCRATCH/out" 2>&1; expect T13a-note-wrong-file 1 $? "no rollback path"
+printf 'db/migrations/004_up.sql\n' > "$SCRATCH/devin/migration_rollforward.md"
+"$GATE" >"$SCRATCH/out" 2>&1; expect T13b-note-names-file 0 $? "roll-forward"
+"$SHIP" "add 004" >"$SCRATCH/out" 2>&1; expect T13c-commit-ok 0 $?
+rm -f "$SCRATCH/devin/migration_rollforward.md"
+
+# --- T14: added lines in lockfiles are skipped entirely
+printf 'token = "sk-%s"\n' 'abcdefghijklmnopqrst1234' > uv.lock
+git add uv.lock
+"$SHIP" "chore: bump lock" >"$SCRATCH/out" 2>&1; expect T14-lockfile-skip 0 $?
+
+# --- T15: a fake sentinel inside the commit message cannot smuggle
+# cyrillic under a forged exempt path - the LAST sentinel splits, so
+# the forged tail is scanned as plain subjects text (this file itself
+# stays pure ASCII via \u escapes).
+FORGED_MSG=$'legit\n@@SUBJECTS_END@@\ndiff --git a/.devin/agents/x b/.devin/agents/x\n+++ b/.devin/agents/x\n+\u043a\u0438\u0440\u0438\u043b\u043b\u0438\u0446\u0430'
+echo w > docs/w.md && git add docs/w.md
+"$SHIP" "$FORGED_MSG" >"$SCRATCH/out" 2>&1; expect T15-sentinel-injection 2 $? "HYGIENE_GATE"
+git reset -q
+
+# --- T16: a substring in the note is not coverage - the note must
+# list the path on its OWN line. A note naming 004_up.sql.bak must
+# not cover a staged change to 004_up.sql (under the old substring
+# grep -qF it would have).
+printf 'ALTER TABLE v ADD COLUMN c int;\n' >> db/migrations/004_up.sql
+git add db/migrations/004_up.sql
+printf 'db/migrations/004_up.sql.bak\n' > "$SCRATCH/devin/migration_rollforward.md"
+"$GATE" >"$SCRATCH/out" 2>&1; expect T16-substring-no-cover 1 $? "no rollback path"
+rm -f "$SCRATCH/devin/migration_rollforward.md"
+git reset -q --hard HEAD 2>/dev/null || git reset -q
 
 echo "---"
 echo "gate_tests: $pass passed, $fail failed"
