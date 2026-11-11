@@ -38,6 +38,10 @@ __all__ = [
     "TaskKillRefused",
     "TaskKillVerdict",
     "TaskKilled",
+    "TaskWithdrawNotFound",
+    "TaskWithdrawRefused",
+    "TaskWithdrawVerdict",
+    "TaskWithdrawn",
     "UnregisterDeleted",
     "UnregisterNotFound",
     "UnregisterRefusedFreshHeartbeat",
@@ -180,6 +184,39 @@ class TaskKilled(_Verdict):
 
 TaskKillVerdict = Annotated[
     TaskKillNotFound | TaskKillRefused | TaskKilled,
+    Field(discriminator="kind"),
+]
+
+
+class TaskWithdrawNotFound(_Verdict):
+    """No task row with that id."""
+
+    kind: Literal["not_found"] = "not_found"
+
+
+class TaskWithdrawRefused(_Verdict):
+    """The task exists but is not withdrawable: it is already terminal
+    (``done``/``failed``) or already ``cancelled`` - a repeat withdraw
+    reports the current status instead of a duplicate event."""
+
+    kind: Literal["refused"] = "refused"
+    status: str
+
+
+class TaskWithdrawn(_Verdict):
+    """The task withdrew: status ``cancelled``, lease and step slot
+    cleared, ``task_withdrawn`` event journaled with actor+reason.
+    ``notice_id`` is the outbox row sent to the owning session -
+    ``None`` when it was not registered/active."""
+
+    kind: Literal["withdrawn"] = "withdrawn"
+    session_id: str
+    status_before: str
+    notice_id: int | None = None
+
+
+TaskWithdrawVerdict = Annotated[
+    TaskWithdrawNotFound | TaskWithdrawRefused | TaskWithdrawn,
     Field(discriminator="kind"),
 ]
 

@@ -620,3 +620,102 @@ def verify_sessions(
                 sock.close()
             except OSError:
                 pass
+
+
+# Grace between writing session/cancel and the confirmation re-list.
+# The empirical probe (issue #137) saw a live turn collapse ~3s after
+# the notification; the re-list exists to UPGRADE the report to
+# "confirmed", never to block on it - after the window the outcome is
+# honestly "requested".
+_CANCEL_CONFIRM_SECONDS = 3.0
+
+
+def cancel_turn(
+    session_id: str,
+    *,
+    lock_data: dict | None = None,
+    lock_dir: str | None = None,
+    agent_id: str = DEFAULT_AGENT_ID,
+    confirm_timeout: float = _CANCEL_CONFIRM_SECONDS,
+) -> str:
+    """Best-effort ``session/cancel`` for ``bridge withdraw --stop-turn``.
+
+    Empirically proven on a live busy session (issue #137): the host
+    honours a foreign attach's cancel notification and the turn ends
+    with ``stopReason=cancelled`` ~3s later. The notification carries
+    no response id, so the outcome is reported honestly:
+
+    - ``"idle"`` - the session was listed but not busy; nothing to
+      cancel (also the no-op verdict for a repeat stop request).
+    - ``"confirmed"`` - it WAS busy, the cancel was written, and a
+      re-list after ``confirm_timeout`` shows it idle: the turn is
+      observed stopped, which is all the host can certify - this is
+      never a process-exit or session-death claim.
+    - ``"requested"`` - the cancel was written but the session still
+      reports busy after the window; the request was delivered, the
+      outcome is unconfirmed.
+
+    Raises ``WakeError`` (``no_session`` for a sid absent from
+    session/list, host/attach reasons otherwise) - a transport
+    failure means nothing was requested.
+    """
+    if lock_data is None:
+        lock_data = find_lockfile(lock_dir)
+    if lock_data is None:
+        raise WakeError("wake_host_down", "no acp-host lockfile found")
+
+    with ATTACH_LOCK:
+        chan = _attach(lock_data, agent_id)
+        sock = chan._sock
+        try:
+            req = 0
+
+            def call(method, params=None, timeout=_REQUEST_TIMEOUT, cap=256):
+                nonlocal req
+                req += 1
+                _rpc(chan, req, method, params)
+                return _await_response(chan, req, timeout, cap)
+
+            try:
+                call("initialize", _initialize_params(1))
+                chan.send({"jsonrpc": "2.0", "method": "initialized", "params": {}})
+                listing = call("session/list", {})
+            except WakeError as e:
+                if e.reason == "rpc_error":
+                    raise WakeError("attach_failed", str(e)) from e
+                raise
+            entry = None
+            for item in listing.get("sessions", []):
+                if item.get("sessionId") == session_id:
+                    entry = item
+                    break
+            if entry is None:
+                raise WakeError("no_session", f"{session_id} not in session/list")
+            if not _is_busy(entry):
+                return "idle"
+            chan.send(
+                {
+                    "jsonrpc": "2.0",
+                    "method": "session/cancel",
+                    "params": {"sessionId": session_id},
+                }
+            )
+            deadline = time.monotonic() + confirm_timeout
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return "requested"
+                listing = call("session/list", {}, timeout=remaining)
+                still_busy = False
+                for item in listing.get("sessions", []):
+                    if item.get("sessionId") == session_id:
+                        still_busy = _is_busy(item)
+                        break
+                if not still_busy:
+                    return "confirmed"
+                time.sleep(min(0.25, deadline - time.monotonic()))
+        finally:
+            try:
+                sock.close()
+            except OSError:
+                pass

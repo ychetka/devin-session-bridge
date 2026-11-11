@@ -50,7 +50,7 @@ MAX_ATTEMPTS: Final[int] = 2  # one auto-requeue, then terminal failed
 
 class TaskStatus(str, Enum):
     """Task lifecycle status. Live: queued, dispatch_decided, running,
-    awaiting_user. Terminal: done, failed."""
+    awaiting_user. Terminal: done, failed, cancelled."""
 
     QUEUED = "queued"
     DISPATCH_DECIDED = "dispatch_decided"
@@ -58,6 +58,7 @@ class TaskStatus(str, Enum):
     AWAITING_USER = "awaiting_user"
     DONE = "done"
     FAILED = "failed"
+    CANCELLED = "cancelled"
     PAUSED = "paused"
 
 
@@ -69,7 +70,9 @@ LIVE_STATUSES: Final[frozenset] = frozenset(
         TaskStatus.AWAITING_USER,
     }
 )
-TERMINAL_STATUSES: Final[frozenset] = frozenset({TaskStatus.DONE, TaskStatus.FAILED})
+TERMINAL_STATUSES: Final[frozenset] = frozenset(
+    {TaskStatus.DONE, TaskStatus.FAILED, TaskStatus.CANCELLED}
+)
 
 
 class StepState(str, Enum):
@@ -125,15 +128,21 @@ TRANSITIONS: Final[dict] = {
     TaskStatus.PAUSED: frozenset(),
     TaskStatus.DONE: frozenset(),
     TaskStatus.FAILED: frozenset(),
+    TaskStatus.CANCELLED: frozenset(),
 }
 
-# Edges reserved for explicit operator commands (unpark, retry, pause).
-# The only exit from FAILED lives here: manual retry > queued.
+# Edges reserved for explicit operator commands (unpark, retry, pause,
+# withdraw). The only exit from FAILED lives here: manual retry >
+# queued. CANCELLED is the withdraw target (issue #142): the benign
+# operator scope-pull - terminal like done/failed but journaled with
+# actor+reason instead of a failure verdict.
 MANUAL_TRANSITIONS: Final[dict] = {
     TaskStatus.FAILED: frozenset({TaskStatus.QUEUED}),
-    TaskStatus.AWAITING_USER: frozenset({TaskStatus.QUEUED}),
-    TaskStatus.PAUSED: frozenset({TaskStatus.QUEUED}),
-    TaskStatus.QUEUED: frozenset({TaskStatus.PAUSED}),
+    TaskStatus.AWAITING_USER: frozenset({TaskStatus.QUEUED, TaskStatus.CANCELLED}),
+    TaskStatus.PAUSED: frozenset({TaskStatus.QUEUED, TaskStatus.CANCELLED}),
+    TaskStatus.QUEUED: frozenset({TaskStatus.PAUSED, TaskStatus.CANCELLED}),
+    TaskStatus.DISPATCH_DECIDED: frozenset({TaskStatus.CANCELLED}),
+    TaskStatus.RUNNING: frozenset({TaskStatus.CANCELLED}),
 }
 
 

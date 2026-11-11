@@ -36,6 +36,8 @@ from session_bridge.state.verdict import (
     KillNotFound,
     TaskKillNotFound,
     TaskKillRefused,
+    TaskWithdrawNotFound,
+    TaskWithdrawRefused,
     UnregisterNotFound,
     UnregisterRefusedFreshHeartbeat,
     UnregisterRefusedLiveTask,
@@ -43,6 +45,7 @@ from session_bridge.state.verdict import (
 from session_bridge.wake import (
     SESSION_ABSENT,
     WakeError,
+    cancel_turn,
     find_lockfile,
     verify_sessions,
     wake_session,
@@ -695,6 +698,83 @@ def _cmd_kill_session(args) -> int:
         f" {verdict.staged_folded} staged folded,"
         f" heartbeat {'removed' if verdict.heartbeat_removed else 'absent'}"
     )
+    return _emit(args, resp, ExitCode.OK, human)
+
+
+def _cmd_withdraw(args) -> int:
+    """``bridge withdraw <task_id>``: audited orchestrator scope-pull
+    (issue #142).
+
+    The benign counterpart of ``bridge kill <task_id>``: every
+    still-actionable state (queued, dispatch_decided, running,
+    awaiting_user, paused) folds to terminal ``cancelled`` with
+    actor+reason journaled into ``task_withdrawn`` - the audit is
+    authored by the withdrawing side, never impersonating the worker.
+    Terminal rows (done/failed/cancelled) are refused, so a task that
+    finished between read and write keeps its real outcome and a
+    repeat withdraw reports the status instead of a duplicate event.
+    The lease/step/quota slots clear in the same transaction - the
+    session's live-task index slot frees atomically (no ghost slot).
+
+    ``--stop-turn`` is an explicit, separate action: after the CAS
+    commits, a best-effort ``session/cancel`` goes to the owning
+    session via acp-host (empirically proven, issue #137). The reply
+    distinguishes ``idle`` (nothing to stop), ``confirmed`` (turn
+    observed stopped) and ``requested`` (delivered, unconfirmed) -
+    it never claims the process died. A transport failure is
+    reported, not hidden: the task is already cancelled, only the
+    optional interrupt failed.
+    """
+    task_id = args.task_id
+    verdict = db.withdraw_task(
+        task_id,
+        actor=args.actor,
+        reason=args.reason,
+        stop_turn=args.stop_turn,
+        path=args.db,
+    )
+    if isinstance(verdict, TaskWithdrawNotFound):
+        resp = JsonResponse(
+            session=None,
+            status="not_found",
+            error=f"no task {task_id}",
+        )
+        return _emit(args, resp, ExitCode.NOT_FOUND, f"not found: task {task_id}")
+    if isinstance(verdict, TaskWithdrawRefused):
+        resp = JsonResponse(
+            session=None,
+            status="refused",
+            error=f"task {task_id} is already {verdict.status}",
+            agent_instruction=(
+                "terminal tasks need no withdraw; a repeat withdraw of a"
+                " cancelled task is this same refusal - the audit row from"
+                " the first call stands"
+            ),
+        )
+        return _emit(
+            args,
+            resp,
+            ExitCode.CONFLICT,
+            f"refused: task {task_id} is {verdict.status}",
+        )
+    sid = verdict.session_id
+    data = {
+        "withdrawn": True,
+        "task_id": task_id,
+        "status_before": verdict.status_before,
+        "notification_id": verdict.notice_id,
+    }
+    human = f"withdrew task {task_id}: status {verdict.status_before}->cancelled" + (
+        f", notice {verdict.notice_id} queued for {sid}" if verdict.notice_id else ""
+    )
+    if args.stop_turn:
+        try:
+            outcome = cancel_turn(sid) if sid else "idle"
+        except WakeError as e:
+            outcome = f"failed:{e.reason}"
+        data["stop_turn"] = outcome
+        human += f", turn-stop {outcome}"
+    resp = JsonResponse(session=sid, status="ok", data=data)
     return _emit(args, resp, ExitCode.OK, human)
 
 

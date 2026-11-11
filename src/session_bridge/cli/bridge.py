@@ -86,6 +86,7 @@ from session_bridge.cli.commands.sessions import (
     _cmd_resume,
     _cmd_unregister,
     _cmd_wake,
+    _cmd_withdraw,
 )
 from session_bridge.cli.commands.tasks import (
     _cmd_claim,
@@ -262,6 +263,36 @@ def _parse_args(argv) -> argparse.Namespace:
         ),
     )
     sp.add_argument("session_id")
+    _add_json(sp)
+
+    # issue #142: audited orchestrator scope-pull - the benign
+    # counterpart of `kill <task_id>` (which force-FAILS only
+    # running/dispatch_decided); withdraw covers every
+    # still-actionable state, journals actor+reason, and never
+    # claims the worker process died.
+    sp = sub.add_parser(
+        "withdraw",
+        help="withdraw a task's scope: terminal cancelled, audited",
+    )
+    sp.add_argument("task_id", type=int)
+    sp.add_argument(
+        "--actor",
+        default="operator",
+        help="who is pulling the scope (journaled verbatim)",
+    )
+    sp.add_argument(
+        "--reason",
+        default="",
+        help="why the scope is pulled (journaled verbatim)",
+    )
+    sp.add_argument(
+        "--stop-turn",
+        action="store_true",
+        help=(
+            "also send session/cancel to the owning session -"
+            " best-effort turn interrupt, never a process-death claim"
+        ),
+    )
     _add_json(sp)
 
     # supervisor daemon (item_13d); literal command name like
@@ -658,6 +689,7 @@ _HANDLERS = {
     "resume": _cmd_resume,
     "unregister": _cmd_unregister,
     "kill": _cmd_kill,
+    "withdraw": _cmd_withdraw,
     "daemon": _cmd_daemon,
     "register": _cmd_register,
     "ask": _cmd_ask,

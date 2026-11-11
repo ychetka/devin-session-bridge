@@ -305,6 +305,10 @@ def pump(args) -> dict:
     # live task. Refreshed per pass and updated in-place on every
     # successful dispatch so intra-pass ordering sees the real count.
     active_sids = db.active_session_ids(path=args.db)
+    # issue #142: the cap is the durable daemon-published value, not
+    # this process's import-time env read - a pump running without
+    # SB_MAX_ACTIVE_SESSIONS must see the same limit the daemon set.
+    max_active = db.effective_max_active_sessions(path=args.db)
 
     last_id = 0
     while True:
@@ -320,9 +324,9 @@ def pump(args) -> dict:
             tid = task["id"]
             sid = task["session_id"]
             if (
-                MAX_ACTIVE_SESSIONS
+                max_active
                 and sid not in active_sids
-                and len(active_sids) >= MAX_ACTIVE_SESSIONS
+                and len(active_sids) >= max_active
             ):
                 # session-slot cap (issue #121): dispatching to an
                 # inactive sid would spend a new slot the operator

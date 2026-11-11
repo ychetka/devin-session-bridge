@@ -2310,6 +2310,19 @@ def run(
         "daemon_start",
         detail=f"pid={os.getpid()} once={once} interval={interval}",
     )
+    # issue #142: persist the env-resolved session-slot cap so
+    # worker-spawned bridge subprocesses - which never inherit the
+    # daemon's environment - enforce the same limit as the daemon's
+    # own claim CAS. A write failure must not stop the loop: the
+    # import-time constant still gates this process.
+    try:
+        db.set_max_active_sessions(db.MAX_ACTIVE_SESSIONS, path=db_path)
+    except Exception as e:
+        _decision(
+            state_directory,
+            "cap_persist_failed",
+            detail=f"error={type(e).__name__}: {e}",
+        )
     try:
         if not once and jitter > 0:
             stop.wait(random.uniform(0, jitter))
