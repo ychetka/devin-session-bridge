@@ -519,10 +519,12 @@ def _cmd_wait(args) -> int:
     External-wait signal: the claiming managed session declares "still
     alive, blocked on something out-of-band" - CI, a PR review, a
     partner consult. Lease-owner CAS extends the lease by one
-    LEASE_SECONDS and lands the reason in the task note. Without it a
-    long wait reads exactly like a dead worker: task 87 failed on
-    ``lease expired`` mid review-cycle. Repeat the call while waiting;
-    a dead claimer simply stops renewing and the task requeues.
+    LEASE_SECONDS and lands the reason in the task's ``wait_reason``
+    column (mirrored into ``note`` for compatibility; a reason-less
+    call clears the declared reason). Without it a long wait reads
+    exactly like a dead worker: task 87 failed on ``lease expired``
+    mid review-cycle. Repeat the call while waiting; a dead claimer
+    simply stops renewing and the task requeues.
     """
     tid = args.task_id
     sid = args.session

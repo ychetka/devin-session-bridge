@@ -99,10 +99,12 @@ def _session_views(args) -> tuple[list[dict], list[Event], int]:
             if _external_wait_fresh(live["wait_until"], now):
                 # `bridge wait` parked the claimer on an out-of-band
                 # answer - observability only, the lifecycle stays
-                # running (issue #151)
+                # running (issue #151). The reason reads from the
+                # dedicated wait_reason column - a stale lifecycle
+                # note ('lease expired') can never pose as the cause.
                 state = STATE_PARKED
-                note = (live["note"] or "").strip()
-                action = _cut(f"external wait: {note}" if note else "external wait", 48)
+                reason = (live["wait_reason"] or "").strip()
+                action = _cut(f"external wait: {reason}" if reason else "external wait", 48)
             else:
                 state, action = STATE_RUNNING, "-"
         elif live is not None and live["status"] == TaskStatus.DISPATCH_DECIDED.value:
@@ -159,7 +161,9 @@ def _session_views(args) -> tuple[list[dict], list[Event], int]:
                 "action": action,
                 "wait_until": wait_until,
                 "wait_reason": (
-                    live["note"] if live is not None and live["wait_until"] is not None else None
+                    live["wait_reason"]
+                    if live is not None and live["wait_until"] is not None
+                    else None
                 ),
                 "log_path": log_path,
                 "stderr_tail": stderr_tail,
@@ -255,7 +259,7 @@ def _external_wait_fresh(wait_until, now=None) -> bool:
     return int(wait_until) > now
 
 
-def _fleet_state(session_status, task) -> str:
+def _fleet_state(session_status, task, now=None) -> str:
     """The one-word state cell for a fleet row.
 
     Dead sessions show ``dead`` (the compact marker - a dead row stays
@@ -266,7 +270,9 @@ def _fleet_state(session_status, task) -> str:
     deliberately asleep until the provider's reset, which is neither
     running nor idle. A fresh ``wait_until`` stamp reads ``waiting``:
     the claimer is parked on an out-of-band answer, distinct from a
-    session that is actually running (issue #151).
+    session that is actually running (issue #151). ``now`` is the
+    snapshot clock the caller resolved - passing it keeps every cell
+    of one render on the same freshness boundary.
     """
     if session_status == SessionStatus.DEAD.value:
         return "dead"
@@ -274,7 +280,7 @@ def _fleet_state(session_status, task) -> str:
         return "idle"
     if task["step_state"] == "waiting_quota":
         return "quota"
-    if task["status"] == TaskStatus.RUNNING.value and _external_wait_fresh(task["wait_until"]):
+    if task["status"] == TaskStatus.RUNNING.value and _external_wait_fresh(task["wait_until"], now):
         return "waiting"
     return _FLEET_STATE_ALIAS.get(task["status"], task["status"])
 
@@ -353,11 +359,14 @@ def _status_snapshot(args) -> dict:
                     (AuditEventKind.ESCALATION.value, cutoff),
                 ).fetchone()["c"]
             ),
-            # item_2/issue #151: lease-expiry pressure - recover_stale
-            # stamps exactly this note on every requeue/fail fold
+            # item_2/issue #151: lease-expiry pressure - counted on the
+            # dedicated lease_expired_at stamp requeue_or_fail writes on
+            # every fold (the old 'lease expired' note proxy overcounted
+            # any post-fold write and undercounted on note overwrite)
             "lease_expired": int(
                 con.execute(
-                    "SELECT COUNT(*) AS c FROM tasks WHERE note='lease expired' AND updated_at>=?",
+                    "SELECT COUNT(*) AS c FROM tasks"
+                    " WHERE lease_expired_at IS NOT NULL AND lease_expired_at>=?",
                     (cutoff,),
                 ).fetchone()["c"]
             ),
@@ -402,7 +411,9 @@ def _status_snapshot(args) -> dict:
             "step_state": t["step_state"] if t is not None else None,
             "quota_reset_at": t["quota_reset_at"] if t is not None else None,
             "wait_until": t["wait_until"] if t is not None else None,
-            "wait_reason": (t["note"] if t is not None and t["wait_until"] is not None else None),
+            "wait_reason": (
+                t["wait_reason"] if t is not None and t["wait_until"] is not None else None
+            ),
             "attempt": t["attempt"] if t is not None else None,
             "questions": qcounts.get(t["id"], 0) if t is not None else None,
             "heartbeat_age_seconds": _age(now, r["seen"]),
@@ -413,7 +424,7 @@ def _status_snapshot(args) -> dict:
             "wake_escalated": bool(r["wake_escalated"]),
             "mail_age_seconds": _age(now, r["mail_oldest"]),
         }
-        row["state"] = _fleet_state(r["status"], t)
+        row["state"] = _fleet_state(r["status"], t, now)
         fleet.append(row)
         if r["role"] == SessionRole.ORCHESTRATOR.value:
             # the register CAS keeps at most one orchestrator holder
@@ -432,7 +443,7 @@ def _status_snapshot(args) -> dict:
             "step_state": t["step_state"],
             "quota_reset_at": t["quota_reset_at"],
             "wait_until": t["wait_until"],
-            "wait_reason": t["note"] if t["wait_until"] is not None else None,
+            "wait_reason": t["wait_reason"] if t["wait_until"] is not None else None,
             "attempt": t["attempt"],
             "questions": qcounts.get(t["id"], 0),
             "heartbeat_age_seconds": None,
@@ -442,7 +453,7 @@ def _status_snapshot(args) -> dict:
             "wake_streak": 0,
             "wake_escalated": False,
             "mail_age_seconds": None,
-            "state": _fleet_state(None, t),
+            "state": _fleet_state(None, t, now),
         }
         fleet.append(row)
     fleet.sort(
@@ -489,6 +500,10 @@ def _status_snapshot(args) -> dict:
 
     sdir = _state_dir(args)
     return {
+        # one render reads one clock: _fleet_row_line/_task_state_cell
+        # resolve wait freshness against this same `now`, never a
+        # second time.time() taken mid-render
+        "now": now,
         "attention": attention,
         "vitals": {
             "daemon": {
@@ -565,26 +580,28 @@ def _wake_cell(r) -> str:
     return _cut(cell, 7)
 
 
-def _task_state_cell(r) -> str:
+def _task_state_cell(r, now=None) -> str:
     """Compact lifecycle of the latest task for TSTAT (item_23).
 
     A ``waiting_quota`` park overrides the lifecycle word - "the step
     is asleep until reset" is the answer the column must give, and the
     raw status stays one ``inspect`` away. A fresh ``wait_until`` stamp
     overrides a bare ``run`` likewise: ``ewait`` marks the claimer
-    parked on an out-of-band answer (issue #151).
+    parked on an out-of-band answer (issue #151). ``now`` is the
+    snapshot clock the caller resolved - passing it keeps one render
+    from splitting cells across the freshness boundary.
     """
     st = r.get("task_status")
     if not st:
         return "-"
     if r.get("step_state") == "waiting_quota":
         return "quota"
-    if st == TaskStatus.RUNNING.value and _external_wait_fresh(r.get("wait_until")):
+    if st == TaskStatus.RUNNING.value and _external_wait_fresh(r.get("wait_until"), now):
         return "ewait"
     return _TASK_STATE_CELL.get(st, _cut(st, 6))
 
 
-def _fleet_row_line(r) -> str:
+def _fleet_row_line(r, now=None) -> str:
     # a leading "*" marks a session that never registered on the bus
     # (seen only through a pushed task)
     sid = r["session_id"] if r["registered"] else f"*{r['session_id']}"
@@ -596,7 +613,7 @@ def _fleet_row_line(r) -> str:
     fail = "-" if r["attempt"] is None else f"{r['attempt']}/{MAX_ATTEMPTS}"
     return (
         f"{_cut(sid, 16):<16} {_cut(r['repo'], 16):<16} {_cut(task, 20):<20}"
-        f" {_task_state_cell(r):<6} {_cut(r['state'], 8):<8} {q:>4} {fail:>4}"
+        f" {_task_state_cell(r, now):<6} {_cut(r['state'], 8):<8} {q:>4} {fail:>4}"
         f" {_fmt_age(_fleet_seen_age(r)):>5} {_wake_cell(r):<7}"
         f" {_fmt_age(r['mail_age_seconds']):>5}"
     )
@@ -613,6 +630,7 @@ def _render_status(snap) -> str:
     for the overflow - and by a final defensive slice.
     """
     lines = _attention_lines(snap)
+    now = snap.get("now")
     d = snap["vitals"]["daemon"]
     if d["running"]:
         pid = d["pid"] if d["pid"] is not None else "-"
@@ -646,10 +664,10 @@ def _render_status(snap) -> str:
         if len(fleet) > avail:
             shown = fleet[: max(1, avail - 1)]
             hidden = len(fleet) - len(shown)
-            lines.extend(_fleet_row_line(r) for r in shown)
+            lines.extend(_fleet_row_line(r, now) for r in shown)
             lines.append(f"+{hidden} more session(s) - see --json")
         else:
-            lines.extend(_fleet_row_line(r) for r in shown)
+            lines.extend(_fleet_row_line(r, now) for r in shown)
     g = snap["digest"]
     footer = (
         f"24h: done {g['done']} | auto-decisions {g['auto_decisions']}"

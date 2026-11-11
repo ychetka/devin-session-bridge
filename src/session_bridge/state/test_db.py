@@ -2049,6 +2049,15 @@ def test_item139_gwt1_wait_task_stamps_wait_until(db_path):
     task = db.get_task(tid, path=db_path)
     assert task["wait_until"] == task["lease_expires_at"]
     assert task["wait_until"] >= before + db.LEASE_SECONDS - 2
+    # issue #151: the declared reason lands in the dedicated column
+    assert task["wait_reason"] == "waiting on CI"
+
+    # a reason-less wait clears the declared reason (none was
+    # declared now); the note keeps its lifecycle history
+    assert db.wait_task(tid, "w1", path=db_path)
+    task = db.get_task(tid, path=db_path)
+    assert task["wait_reason"] is None
+    assert task["note"] == "waiting on CI"
 
 
 def test_item139_gwt2_sessions_with_undrained_mail(db_path):

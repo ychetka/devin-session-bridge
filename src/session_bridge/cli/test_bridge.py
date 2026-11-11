@@ -2008,6 +2008,7 @@ def test_item22_gwt1_wait_renews_own_lease_with_reason(env, capsys):
     row = db.get_task(tid, path=env.db)
     assert row["lease_expires_at"] > 1
     assert row["note"] == "PR review"
+    assert row["wait_reason"] == "PR review"
     assert row["lease_renewed_at"] is not None
 
 
@@ -2100,6 +2101,8 @@ def test_issue151_gwt1_wait_stamp_renders_parked_phase(env, capsys):
     parked with its declared reason - per-session view, fleet cells
     and --json fields all expose the phase."""
     tid = _wait_stamped_running(env, capsys)
+    # the declared reason lives in the dedicated column (issue #151)
+    assert db.get_task(tid, path=env.db)["wait_reason"] == "PR review"
 
     rc, out = _run(["status", "--json"], capsys)
     assert rc == ExitCode.OK
@@ -2127,6 +2130,7 @@ def test_issue151_gwt2_wait_phase_decay_and_empty_reason(env, capsys):
     wait' action, and a stamp already past now decays back to plain
     running with no clearing write."""
     tid = _wait_stamped_running(env, capsys, reason=None)
+    assert db.get_task(tid, path=env.db)["wait_reason"] is None
     rc, out = _run(["status", "--json"], capsys)
     assert rc == ExitCode.OK
     view = next(v for v in out["data"]["sessions"] if v["session"] == SID)
@@ -2152,10 +2156,45 @@ def test_issue151_gwt2_wait_phase_decay_and_empty_reason(env, capsys):
     assert row["wait_reason"] is None  # this wait was declared without a reason
 
 
+def test_issue151_gwt2b_reasonless_wait_never_renders_stale_note(env, capsys):
+    """[ISSUE-151.GWT-2b] the reported bleed: a lease-expired fold
+    leaves note='lease expired' on the task; reclaim + a reason-less
+    `bridge wait` must render the bare 'external wait' action - the
+    stale note can never pose as the declared reason."""
+    _managed(env)
+    tid = _task(env)
+    assert _run(["claim", str(tid), "--session", SID, "--json"], capsys)[0] == ExitCode.OK
+    con = db.connect(env.db)
+    try:
+        con.execute("UPDATE tasks SET lease_expires_at=? WHERE id=?", (1, tid))
+        con.commit()
+    finally:
+        con.close()
+    assert db.requeue_or_fail(tid, note="lease expired", path=env.db) == TaskStatus.QUEUED
+    assert db.get_task(tid, path=env.db)["note"] == "lease expired"
+    # reclaim through the managed path, then wait without a reason
+    assert _run(["claim", str(tid), "--session", SID, "--json"], capsys)[0] == ExitCode.OK
+    assert _run(["wait", str(tid), "--session", SID, "--json"], capsys)[0] == ExitCode.OK
+    row = db.get_task(tid, path=env.db)
+    # lifecycle history keeps the note; the declared reason is cleared
+    # (a reason-less wait declares no reason - it does not inherit one)
+    assert row["note"] == "lease expired"
+    assert row["wait_reason"] is None
+
+    rc, out = _run(["status", "--json"], capsys)
+    assert rc == ExitCode.OK
+    view = next(v for v in out["data"]["sessions"] if v["session"] == SID)
+    assert view["state"] == status_mod.STATE_PARKED
+    assert view["action"] == "external wait"  # NOT 'external wait: lease expired'
+    assert view["wait_reason"] is None
+
+
 def test_issue151_gwt3_lease_expired_digest_counts_window(env, capsys):
-    """[ISSUE-151.GWT-3] lease_expired counts requeue_or_fail('lease
-    expired') folds inside the 24h window only - older stamps and
-    other notes are ignored."""
+    """[ISSUE-151.GWT-3] lease_expired counts requeue_or_fail folds
+    inside the 24h window via the dedicated lease_expired_at stamp -
+    a sticky 'lease expired' note on a fresh row (the old overcount
+    case) and a stamp aged past the window both stay out, while a
+    note overwrite after the fold can no longer lose the count."""
     t1 = _task(env)
     o1 = _claim_acp(env, t1)
     con = db.connect(env.db)
@@ -2165,17 +2204,22 @@ def test_issue151_gwt3_lease_expired_digest_counts_window(env, capsys):
     finally:
         con.close()
     assert db.requeue_or_fail(t1, note="lease expired", path=env.db) is not None
-    # noise: a different fresh note and a stale lease-expired stamp
+    assert db.get_task(t1, path=env.db)["lease_expired_at"] is not None
+    # noise: the old proxy shape - a sticky 'lease expired' note on a
+    # freshly-written row must NOT count, and neither does a real fold
+    # stamp aged past the window; the fold itself survives a later
+    # note overwrite (the old undercount case)
     t2 = _task(env, sid="s2")
     t3 = _task(env, sid="s3")
     stale = int(time.time()) - 25 * 3600
     con = db.connect(env.db)
     try:
-        con.execute("UPDATE tasks SET note=? WHERE id=?", ("some other note", t2))
+        con.execute("UPDATE tasks SET note=? WHERE id=?", ("lease expired", t2))
         con.execute(
-            "UPDATE tasks SET note=?, updated_at=? WHERE id=?",
-            ("lease expired", stale, t3),
+            "UPDATE tasks SET lease_expired_at=?, note=? WHERE id=?",
+            (stale, "lease expired", t3),
         )
+        con.execute("UPDATE tasks SET note=? WHERE id=?", ("requeued elsewhere", t1))
         con.commit()
     finally:
         con.close()
