@@ -41,6 +41,9 @@ from session_bridge.state.verdict import (
     TaskKilled,
     TaskKillNotFound,
     TaskKillRefused,
+    TaskWithdrawn,
+    TaskWithdrawNotFound,
+    TaskWithdrawRefused,
     UnregisterDeleted,
     UnregisterNotFound,
     UnregisterRefusedFreshHeartbeat,
@@ -2620,6 +2623,254 @@ def test_item113_gwt3_kill_task_refuses_other_statuses(db_path):
     v3 = db.kill_task(live, path=db_path)
     assert isinstance(v3, TaskKillRefused) and v3.status == "failed"
     assert len(db.list_events(session_id="w3", kind="task_killed", path=db_path)) == 1
+
+
+# --- issue #142: audited orchestrator withdraw ------------------------------
+
+
+def test_issue142_gwt1_withdraw_covers_all_actionable_states(db_path):
+    """[ISSUE-142.GWT-1] withdraw_task folds every still-actionable
+    status - queued, dispatch_decided, running, awaiting_user, paused -
+    to terminal cancelled with lease+step cleared and finished_at
+    stamped; each writes a task_withdrawn event naming actor/reason."""
+    assert isinstance(db.withdraw_task(999, "op", "r", path=db_path), TaskWithdrawNotFound)
+
+    cases = {
+        TaskStatus.QUEUED: None,
+        TaskStatus.DISPATCH_DECIDED: "stager",
+        TaskStatus.RUNNING: "worker",
+        TaskStatus.AWAITING_USER: "worker",
+        TaskStatus.PAUSED: None,
+    }
+    for i, (status, owner) in enumerate(cases.items()):
+        sid = f"w{i}"
+        db.register(sid, f"/repo/{sid}", path=db_path)
+        tid = db.enqueue(sid, "pull me", path=db_path)
+        if status is TaskStatus.DISPATCH_DECIDED:
+            assert db.dispatch_managed(tid, owner, path=db_path)
+        elif status is TaskStatus.RUNNING:
+            assert db.claim_queued(tid, owner, Transport.ACP_PUSH, path=db_path)
+            assert db.mark_running(tid, owner, path=db_path)
+        elif status is TaskStatus.AWAITING_USER:
+            assert db.claim_queued(tid, owner, Transport.ACP_PUSH, path=db_path)
+            assert db.mark_running(tid, owner, path=db_path)
+            db.set_awaiting_user(tid, owner, path=db_path)
+        elif status is TaskStatus.PAUSED:
+            assert db.pause(tid, path=db_path)
+
+        v = db.withdraw_task(tid, actor="orch", reason="scope pulled", path=db_path)
+        assert isinstance(v, TaskWithdrawn), status
+        assert v.session_id == sid and v.status_before == status.value
+        t = db.get_task(tid, path=db_path)
+        assert t["status"] == TaskStatus.CANCELLED.value
+        assert t["lease_owner"] is None and t["lease_expires_at"] is None
+        assert t["finished_at"] is not None
+        ev = db.list_events(session_id=sid, kind="task_withdrawn", path=db_path)
+        assert len(ev) == 1
+        assert "actor=orch" in ev[0]["body"] and "scope pulled" in ev[0]["body"]
+
+
+def test_issue142_gwt2_withdraw_refuses_terminal_and_idempotent(db_path):
+    """[ISSUE-142.GWT-2] done/failed/cancelled rows answer
+    TaskWithdrawRefused with the current status and write nothing -
+    a repeat withdraw neither duplicates the event nor overwrites
+    the real outcome of a task that finished first."""
+    db.register("w1", "/repo/w1", path=db_path)
+    tid = db.enqueue("w1", "done first", path=db_path)
+    assert db.claim_queued(tid, "w", Transport.ACP_PUSH, path=db_path)
+    assert db.mark_running(tid, "w", path=db_path)
+    assert db.finish_task(tid, "w", ok=True, path=db_path)
+
+    v = db.withdraw_task(tid, "orch", "late", path=db_path)
+    assert isinstance(v, TaskWithdrawRefused) and v.status == "done"
+    assert db.get_task(tid, path=db_path)["status"] == "done"
+    assert db.list_events(session_id="w1", kind="task_withdrawn", path=db_path) == []
+
+    db.register("w2", "/repo/w2", path=db_path)
+    tid2 = db.enqueue("w2", "x", path=db_path)
+    assert isinstance(db.withdraw_task(tid2, "orch", "pull", path=db_path), TaskWithdrawn)
+    v2 = db.withdraw_task(tid2, "orch", "pull again", path=db_path)
+    assert isinstance(v2, TaskWithdrawRefused) and v2.status == "cancelled"
+    assert len(db.list_events(session_id="w2", kind="task_withdrawn", path=db_path)) == 1
+
+
+def test_issue142_gwt3_late_finish_and_renew_refused(db_path):
+    """[ISSUE-142.GWT-3] a worker that never saw the withdraw notice
+    cannot resurrect the row: finish_task and renew_lease CAS on
+    status=running AND lease_owner=owner - a cancelled row matches
+    neither predicate."""
+    db.register("w1", "/repo/w1", path=db_path)
+    tid = db.enqueue("w1", "yanked", path=db_path)
+    assert db.claim_queued(tid, "w1-owner", Transport.ACP_PUSH, path=db_path)
+    assert db.mark_running(tid, "w1-owner", path=db_path)
+
+    assert isinstance(db.withdraw_task(tid, "orch", "scope gone", path=db_path), TaskWithdrawn)
+    assert not db.finish_task(tid, "w1-owner", ok=True, path=db_path)
+    assert not db.renew_lease(tid, "w1-owner", path=db_path)
+    assert db.get_task(tid, path=db_path)["status"] == TaskStatus.CANCELLED.value
+
+
+def test_issue142_gwt4_withdraw_frees_live_slot(db_path):
+    """[ISSUE-142.GWT-4] the live-task index slot frees in the same
+    write: ux_tasks_live_session lets the session take a new task the
+    moment the old one cancels - no ghost slot."""
+    db.register("w1", "/repo/w1", path=db_path)
+    tid = db.enqueue("w1", "old scope", path=db_path)
+    assert db.enqueue("w1", "blocked", path=db_path) is None  # slot held
+
+    assert isinstance(db.withdraw_task(tid, "orch", "pull", path=db_path), TaskWithdrawn)
+    tid2 = db.enqueue("w1", "new scope", path=db_path)
+    assert tid2 is not None
+    assert db.active_session_ids(path=db_path) == set()  # nothing running yet
+
+
+def test_issue142_gwt5_audit_notice_and_stop_turn_flag(db_path):
+    """[ISSUE-142.GWT-5] the durable event carries actor, reason,
+    status_before and the stop_turn intent verbatim; a NOTICE lands in
+    the owning session's outbox in the same transaction - an
+    unregistered owner gets the event but no outbox row."""
+    db.register("w1", "/repo/w1", path=db_path)
+    tid = db.enqueue("w1", "with turn", path=db_path)
+    v = db.withdraw_task(
+        tid, actor="buttered-tilapia", reason="higher priority", stop_turn=True, path=db_path
+    )
+    assert isinstance(v, TaskWithdrawn) and v.notice_id is not None
+    ev = db.list_events(session_id="w1", kind="task_withdrawn", path=db_path)
+    body = ev[0]["body"]
+    assert "actor=buttered-tilapia" in body
+    assert "higher priority" in body
+    assert "status_before=queued" in body
+    assert "stop_turn=1" in body
+    rows = db.unrelayed_notifications("w1", path=db_path)
+    assert rows[0]["id"] == v.notice_id
+    assert "withdrawn by buttered-tilapia" in rows[0]["body"]
+
+    # unregistered owner: event written, no outbox row
+    tid2 = db.enqueue("ghost", "no session row", path=db_path)
+    v2 = db.withdraw_task(tid2, "orch", "pull", path=db_path)
+    assert isinstance(v2, TaskWithdrawn) and v2.notice_id is None
+    assert db.unrelayed_notifications("ghost", path=db_path) == []
+    assert len(db.list_events(session_id="ghost", kind="task_withdrawn", path=db_path)) == 1
+
+
+def test_issue142_gwt6_durable_session_cap(db_path, monkeypatch):
+    """[ISSUE-142.GWT-6] the session-slot cap persists in
+    bridge_settings: once the daemon publishes it, every claim CAS
+    and effective read honours the stored value - a subprocess that
+    never inherited SB_MAX_ACTIVE_SESSIONS enforces the same limit.
+    A malformed stored value degrades to the env constant."""
+    monkeypatch.setattr(db, "MAX_ACTIVE_SESSIONS", 0)  # env-free reader
+    # no row yet -> env fallback
+    assert db.effective_max_active_sessions(path=db_path) == 0
+
+    db.set_max_active_sessions(1, path=db_path)
+    assert db.effective_max_active_sessions(path=db_path) == 1
+
+    t1 = db.enqueue("s1", "a", path=db_path)
+    assert db.claim_queued(t1, "w1", Transport.ACP_PUSH, path=db_path)
+    assert db.mark_running(t1, "w1", path=db_path)
+    t2 = db.enqueue("s2", "b", path=db_path)
+    assert not db.claim_queued(t2, "w2", Transport.ACP_PUSH, path=db_path)
+    assert db.get_task(t2, path=db_path)["status"] == "queued"
+
+    # republish (daemon restart) replaces, not accumulates
+    db.set_max_active_sessions(3, path=db_path)
+    assert db.effective_max_active_sessions(path=db_path) == 3
+
+    # a corrupt row degrades to the env constant instead of wedging
+    _exec(
+        db_path,
+        "UPDATE bridge_settings SET value='not-a-number' WHERE key=?",
+        (db.SETTING_MAX_ACTIVE_SESSIONS,),
+    )
+    assert db.effective_max_active_sessions(path=db_path) == 0
+
+
+def test_issue142_gwt7_stored_cap_beats_env_in_subprocess(db_path, monkeypatch):
+    """[ISSUE-142.GWT-7] the durable value is authoritative for claim
+    CAS even when this process's env resolves differently - the
+    worker CLI cannot see a looser cap than the daemon published."""
+    db.set_max_active_sessions(1, path=db_path)
+    monkeypatch.setattr(db, "MAX_ACTIVE_SESSIONS", 99)  # loose env read
+    t1 = db.enqueue("s1", "a", path=db_path)
+    assert db.claim_queued(t1, "w1", Transport.ACP_PUSH, path=db_path)
+    assert db.mark_running(t1, "w1", path=db_path)
+    t2 = db.enqueue("s2", "b", path=db_path)
+    assert not db.claim_queued(t2, "w2", Transport.ACP_PUSH, path=db_path)
+    assert not db.dispatch_managed(t2, "dm", path=db_path)
+    assert not db.claim_managed(t2, "s2", "w2", path=db_path)
+
+
+def test_issue142_gwt8_busy_wake_is_deferral_not_verdict(db_path):
+    """[ISSUE-142.GWT-8] a task withdrawn while its worker is ACP-busy
+    still cancels cleanly: the row's terminal state never depended on
+    turn delivery - busy is a transport deferral, and the cancelled
+    row is already durable before any wake outcome exists."""
+    db.register("busy-sess", "/repo/b", path=db_path)
+    tid = db.enqueue("busy-sess", "mid-turn work", path=db_path)
+    assert db.claim_queued(tid, "w", Transport.ACP_PUSH, path=db_path)
+    assert db.mark_running(tid, "w", path=db_path)
+
+    # worker busy on the host -> wake defers; withdraw does not wait
+    v = db.withdraw_task(tid, "orch", "pulled mid-turn", stop_turn=True, path=db_path)
+    assert isinstance(v, TaskWithdrawn)
+    assert db.get_task(tid, path=db_path)["status"] == "cancelled"
+    # and the parked/awaiting variant cancels the same way
+    db.register("halted-sess", "/repo/h", path=db_path)
+    tid2 = db.enqueue("halted-sess", "parked work", path=db_path)
+    db.set_session_halted("halted-sess", True, path=db_path)
+    v2 = db.withdraw_task(tid2, "orch", "halt + pull", path=db_path)
+    assert isinstance(v2, TaskWithdrawn)
+
+
+def test_issue142_gwt9_parent_child_independence_documented(db_path):
+    """[ISSUE-142.GWT-9] there is no parent_task_id linkage: a
+    withdrawn parent leaves any sibling task rows untouched - the
+    fleet cap counts registered sessions with live tasks only, which
+    is the honest documented limit of the cap."""
+    db.register("parent", "/repo/p", path=db_path)
+    db.register("child-like", "/repo/c", path=db_path)
+    parent = db.enqueue("parent", "parent scope", path=db_path)
+    child = db.enqueue("child-like", "spawned work", path=db_path)
+
+    assert isinstance(db.withdraw_task(parent, "orch", "scope gone", path=db_path), TaskWithdrawn)
+    # the other session's task is unaffected - no cascade exists
+    assert db.get_task(child, path=db_path)["status"] == "queued"
+    con = db.connect(db_path)
+    try:
+        cols = {r[1] for r in con.execute("PRAGMA table_info(tasks)")}
+    finally:
+        con.close()
+    assert "parent_task_id" not in cols
+
+
+def test_issue142_gwt10_withdraw_expires_open_questions(db_path):
+    """[ISSUE-142.GWT-10] withdrawing an awaiting_user task expires
+    its pending/claimed questions in the same transaction - the
+    orchestrator keeps no live deliberation and the janitor ships no
+    re-ask notice for a terminal task (PR #143 review)."""
+    db.register("orch", "/repo/o", role="orchestrator", path=db_path)
+    db.register("w1", "/repo/w1", path=db_path)
+    tid = db.enqueue("w1", "work with a question", path=db_path)
+    assert db.claim_queued(tid, "w", Transport.ACP_PUSH, path=db_path)
+    assert db.mark_running(tid, "w", path=db_path)
+    res = db.ask("w1", tid, "which way?", path=db_path)
+    assert res.accepted
+    qid = res.question_id
+    # one pending slot per task: claim the first question so a second
+    # ask can land - withdraw must expire BOTH states.
+    assert db.claim_question(qid, "orch", path=db_path)
+    res2 = db.ask("w1", tid, "and which file?", path=db_path)
+    assert res2.accepted
+    qid2 = res2.question_id
+    db.set_awaiting_user(tid, "w", path=db_path)
+
+    v = db.withdraw_task(tid, "orch", "scope pulled", path=db_path)
+    assert isinstance(v, TaskWithdrawn)
+    assert db.get_question(qid, path=db_path)["state"] == "expired"
+    assert db.get_question(qid2, path=db_path)["state"] == "expired"
+    ev = db.list_events(session_id="w1", kind="task_withdrawn", path=db_path)
+    assert "questions_expired=2" in ev[0]["body"]
 
 
 # --- task #216: waiting_quota step state ------------------------------------

@@ -31,6 +31,7 @@ from session_bridge.wake import (
     SESSION_ABSENT,
     WakeError,
     WakePolicy,
+    cancel_turn,
     find_lockfile,
     nudge_text,
     pid_alive,
@@ -60,6 +61,7 @@ class FakeAcpHost:
         protocol_version=1,
         resume_error=None,
         reject_above=None,
+        on_notification=None,
     ):
         self.sessions = list(sessions)
         self.hello_error = hello_error
@@ -71,8 +73,10 @@ class FakeAcpHost:
         self.protocol_version = protocol_version
         self.resume_error = resume_error
         self.reject_above = reject_above
+        self.on_notification = on_notification
         self.hellos: list[dict] = []
         self.calls: list[tuple[str, dict]] = []
+        self.notifications: list[dict] = []
         self.errors: list[str] = []
         self._stop = threading.Event()
         self._sock = socket.socket()
@@ -120,7 +124,13 @@ class FakeAcpHost:
                 method = msg.get("method")
                 params = msg.get("params") or {}
                 if "id" not in msg:
-                    continue  # notification (initialized)
+                    # notification (initialized, session/cancel) -
+                    # recorded so tests can assert on fire-and-forget
+                    # methods like the turn-stop path (issue #142)
+                    self.notifications.append(msg)
+                    if self.on_notification is not None:
+                        self.on_notification(msg)
+                    continue
                 self.calls.append((method, params))
                 out = {"jsonrpc": "2.0", "id": msg["id"]}
                 if method == "initialize":
@@ -1179,3 +1189,68 @@ def test_item139_gwt3_explicit_busy_status_still_skipped(env, tmp_path, monkeypa
     assert "session/prompt" not in host.methods()
     events = [d["event"] for d in _decisions(env)]
     assert "wake_skipped_busy" in events
+
+
+# --- issue #142: turn-stop transport for bridge withdraw --stop-turn ---------
+
+
+def _flip_busy_to_idle(host):
+    """Fake the empirical cancel outcome (issue #137): the host ends
+    the turn on session/cancel and the next session/list reports
+    idle."""
+
+    def _on_note(msg):
+        if msg.get("method") != "session/cancel":
+            return
+        sid = (msg.get("params") or {}).get("sessionId")
+        for entry in host.sessions:
+            if entry.get("sessionId") == sid:
+                entry["_meta"]["cognition.ai/statusEnum"] = "idle"
+
+    return _on_note
+
+
+def test_issue142_gwt_cancel_turn_idle_noop():
+    """An already-idle session gets no cancel - the report is the
+    honest 'idle', not a phantom stop."""
+    host = FakeAcpHost(sessions=[IDLE_SESSION])
+    out = cancel_turn(SID, lock_data=host.lock_data())
+    assert out == "idle"
+    cancels = [m for m in host.notifications if m.get("method") == "session/cancel"]
+    assert cancels == []
+
+
+def test_issue142_gwt_cancel_turn_confirmed():
+    """Busy session + cancel honoured: the notification goes out with
+    no id (fire-and-forget), the re-list sees the session idle, and
+    the report upgrades to 'confirmed' - observed stopped, never a
+    process-death claim."""
+    host = FakeAcpHost(sessions=[json.loads(json.dumps(BUSY_SESSION))])
+    host.on_notification = _flip_busy_to_idle(host)
+    out = cancel_turn(SID, lock_data=host.lock_data(), confirm_timeout=2.0)
+    assert out == "confirmed"
+    cancels = [m for m in host.notifications if m.get("method") == "session/cancel"]
+    assert len(cancels) == 1
+    assert cancels[0]["params"] == {"sessionId": SID}
+    assert "id" not in cancels[0]
+
+
+def test_issue142_gwt_cancel_turn_requested_unconfirmed():
+    """Busy session that stays busy past the window: the cancel WAS
+    delivered - the report is 'requested', honestly unconfirmed."""
+    host = FakeAcpHost(sessions=[json.loads(json.dumps(BUSY_SESSION))])
+    out = cancel_turn(SID, lock_data=host.lock_data(), confirm_timeout=0.3)
+    assert out == "requested"
+    cancels = [m for m in host.notifications if m.get("method") == "session/cancel"]
+    assert len(cancels) == 1
+
+
+def test_issue142_gwt_cancel_turn_no_session():
+    """A sid absent from session/list raises WakeError no_session -
+    nothing was requested."""
+    host = FakeAcpHost(sessions=[])
+    with pytest.raises(WakeError) as exc:
+        cancel_turn("ghost", lock_data=host.lock_data())
+    assert exc.value.reason == "no_session"
+    cancels = [m for m in host.notifications if m.get("method") == "session/cancel"]
+    assert cancels == []

@@ -19,7 +19,11 @@ only managed sessions participate in task claims and auto-renew.
 
 `bridge halt` SHALL stamp `halted_at` on the target session(s) so that
 wakes, quota sweeps and escalations stop until `bridge resume` clears
-it - HALT is senior to every automatic path.
+it - HALT is senior to every automatic path. HALT is a fleet-control
+flag only: it SHALL NOT be reported as task termination or process
+cancellation - an acknowledged halt leaves the task's real lifecycle
+status untouched (requested, delivered, acknowledged and terminal
+are distinct states).
 
 #### Scenario: halted session keeps its lease and work
 
@@ -27,6 +31,14 @@ it - HALT is senior to every automatic path.
 - **THEN** its task stays parked untouched (no recovery, no requeue)
 - **AND** after `bridge resume` the ordinary lifecycle resumes exactly
   where it stopped
+
+#### Scenario: halt never certifies cancellation
+
+- **WHEN** a halt is requested, delivered or acknowledged on a
+  session whose worker is mid-turn
+- **THEN** no task row flips to a terminal status on that fact
+  alone - only `bridge withdraw`/`kill` or the worker's own
+  finish/fail write the terminal verdict
 
 ### Requirement: kill removes the session, not its work
 

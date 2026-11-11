@@ -88,6 +88,10 @@ from .verdict import (
     TaskKillNotFound,
     TaskKillRefused,
     TaskKillVerdict,
+    TaskWithdrawn,
+    TaskWithdrawNotFound,
+    TaskWithdrawRefused,
+    TaskWithdrawVerdict,
     UnregisterDeleted,
     UnregisterNotFound,
     UnregisterRefusedFreshHeartbeat,
@@ -130,6 +134,13 @@ LEASE_SECONDS: Final[int] = max(600, _env_int("SB_LEASE_TTL_S", contract.LEASE_S
 #: claim edges (hooks, managed claim, user kick) can never
 #: over-admit - a per-process snapshot gate would be racy.
 MAX_ACTIVE_SESSIONS: Final[int] = max(0, _env_int("SB_MAX_ACTIVE_SESSIONS", 0))
+
+#: Settings key holding the durable session-slot cap (issue #142).
+#: The env constant is the daemon's authority - it persists the value
+#: to ``bridge_settings`` at startup so worker-spawned ``bridge``
+#: subprocesses (which import this module without the daemon's env)
+#: enforce the same cap instead of silently seeing 0 = unlimited.
+SETTING_MAX_ACTIVE_SESSIONS: Final[str] = "max_active_sessions"
 
 #: Session-slot admission predicate for CAS writes that move a
 #: queued task toward running (issue #121). Takes the cap twice as
@@ -416,6 +427,19 @@ CREATE TABLE IF NOT EXISTS allocations (
 CREATE INDEX IF NOT EXISTS ix_allocations_project
   ON allocations(project_id);
 
+-- Durable operator/daemon settings (issue #142): small key/value
+-- store for configuration that must be consistent across every
+-- bridge process, not just the one that resolved an env var at
+-- import. The daemon persists the session-slot cap here at startup;
+-- every claim CAS reads it via _effective_max_active so a
+-- worker-spawned subprocess cannot see a different limit than the
+-- daemon.
+CREATE TABLE IF NOT EXISTS bridge_settings (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+
 PRAGMA user_version=1;
 """
 
@@ -652,6 +676,63 @@ def enqueue(
     return _retry(op)
 
 
+def _effective_max_active(con) -> int:
+    """Session-slot cap for the open transaction (issue #142).
+
+    The durable ``bridge_settings`` value wins when present - the
+    daemon persists its env-resolved cap at startup so every process
+    reads the same limit. The import-time ``MAX_ACTIVE_SESSIONS``
+    stays the fallback for a database no daemon ever wrote to
+    (pre-migration files, tests). Malformed stored values degrade to
+    the env constant rather than corrupting the gate.
+    """
+    row = con.execute(
+        "SELECT value FROM bridge_settings WHERE key=?",
+        (SETTING_MAX_ACTIVE_SESSIONS,),
+    ).fetchone()
+    if row is None:
+        return MAX_ACTIVE_SESSIONS
+    try:
+        return max(0, int(row["value"]))
+    except (TypeError, ValueError):
+        return MAX_ACTIVE_SESSIONS
+
+
+def effective_max_active_sessions(*, path=None) -> int:
+    """Public read of the durable session-slot cap (status reporting)."""
+    con = connect(path)
+    try:
+        return _effective_max_active(con)
+    finally:
+        con.close()
+
+
+def set_max_active_sessions(value: int, *, path=None) -> None:
+    """Persist the session-slot cap (daemon startup, issue #142).
+
+    Upsert so each daemon boot re-asserts the env-resolved value -
+    the env stays the operator interface, the row only mirrors it
+    for subprocesses that never inherit the daemon's environment.
+    """
+    ts = _now()
+
+    def op():
+        con = connect(path)
+        try:
+            con.execute(
+                "INSERT INTO bridge_settings(key,value,updated_at)"
+                " VALUES(?,?,?)"
+                " ON CONFLICT(key) DO UPDATE SET value=excluded.value,"
+                " updated_at=excluded.updated_at",
+                (SETTING_MAX_ACTIVE_SESSIONS, str(max(0, int(value))), ts),
+            )
+            con.commit()
+        finally:
+            con.close()
+
+    return _retry(op)
+
+
 def dispatch_managed(task_id: int, owner: str, *, path=None) -> bool:
     """CAS ``queued > dispatch_decided`` + lease for a managed task.
 
@@ -669,14 +750,15 @@ def dispatch_managed(task_id: int, owner: str, *, path=None) -> bool:
     contract is that queued tasks persist until ``bridge resume``.
 
     The session-slot predicate (``_SLOT_SQL``, issue #121) makes
-    admission atomic: racing pumps cannot stage past
-    ``MAX_ACTIVE_SESSIONS`` even between their snapshot checks.
+    admission atomic: racing pumps cannot stage past the effective
+    cap even between their snapshot checks.
     """
     ts = _now()
 
     def op():
         con = connect(path)
         try:
+            cap = _effective_max_active(con)
             cur = con.execute(
                 "UPDATE tasks SET status=?, lease_owner=?,"
                 " lease_expires_at=?, lease_renewed_at=?, updated_at=?"
@@ -695,8 +777,8 @@ def dispatch_managed(task_id: int, owner: str, *, path=None) -> bool:
                     ts,
                     task_id,
                     TaskStatus.QUEUED.value,
-                    MAX_ACTIVE_SESSIONS,
-                    MAX_ACTIVE_SESSIONS,
+                    cap,
+                    cap,
                 ),
             )
             return cur.rowcount == 1
@@ -734,6 +816,7 @@ def claim_managed(task_id: int, session_id: str, owner: str, *, path=None) -> bo
     def op():
         con = connect(path)
         try:
+            cap = _effective_max_active(con)
             cur = con.execute(
                 "UPDATE tasks SET status=?, lease_owner=?,"
                 " lease_expires_at=?, lease_renewed_at=?, updated_at=?"
@@ -756,8 +839,8 @@ def claim_managed(task_id: int, session_id: str, owner: str, *, path=None) -> bo
                     TaskStatus.QUEUED.value,
                     TaskStatus.DISPATCH_DECIDED.value,
                     owner,
-                    MAX_ACTIVE_SESSIONS,
-                    MAX_ACTIVE_SESSIONS,
+                    cap,
+                    cap,
                 ),
             )
             return cur.rowcount == 1
@@ -784,12 +867,20 @@ def claim_queued(task_id: int, owner: str, transport, *, path=None) -> bool:
     direct claim edges (Stop hook, user kick, managed claim) refuse
     a ``queued`` task once the cap is held, exactly like the pump's
     own dispatch legs.
+
+    The cap value is read per-transaction via
+    ``_effective_max_active`` (issue #142): the daemon persists its
+    env-resolved value to ``bridge_settings`` at startup, so a
+    worker-spawned ``bridge`` subprocess - which never inherits the
+    daemon's env - enforces the stored limit instead of the
+    import-time default 0 = unlimited.
     """
     ts = _now()
 
     def op():
         con = connect(path)
         try:
+            cap = _effective_max_active(con)
             cur = con.execute(
                 "UPDATE tasks SET status=?, transport=?, lease_owner=?,"
                 " lease_expires_at=?, lease_renewed_at=?, updated_at=?"
@@ -807,8 +898,8 @@ def claim_queued(task_id: int, owner: str, transport, *, path=None) -> bool:
                     ts,
                     task_id,
                     TaskStatus.QUEUED.value,
-                    MAX_ACTIVE_SESSIONS,
-                    MAX_ACTIVE_SESSIONS,
+                    cap,
+                    cap,
                 ),
             )
             return cur.rowcount == 1
@@ -2382,6 +2473,154 @@ def kill_task(task_id: int, note: str | None = None, *, path=None) -> TaskKillVe
                     ).lastrowid
                 con.execute("COMMIT")
                 return TaskKilled(
+                    session_id=row["session_id"],
+                    status_before=status_before,
+                    notice_id=notice_id,
+                )
+            except BaseException:
+                if con.in_transaction:
+                    con.execute("ROLLBACK")
+                raise
+        finally:
+            con.close()
+
+    return _retry(op)
+
+
+def withdraw_task(
+    task_id: int,
+    actor: str,
+    reason: str,
+    *,
+    stop_turn: bool = False,
+    path=None,
+) -> TaskWithdrawVerdict:
+    """Audited orchestrator withdraw of a task (issue #142).
+
+    The benign scope-pull ``bridge kill`` cannot express: kill is a
+    force-FAIL verdict for wedged work and only reaches
+    ``running``/``dispatch_decided``, while withdraw covers every
+    still-actionable state - ``queued``, ``dispatch_decided``,
+    ``running``, ``awaiting_user`` and ``paused`` - and folds the row
+    to terminal ``cancelled``. Terminal rows (``done``, ``failed``,
+    ``cancelled``) are refused, so a task that finished between the
+    operator's read and this write keeps its real outcome - a second
+    withdraw reports the current status instead of a duplicate event
+    (idempotent for audit as well as state).
+
+    The CAS, the durable ``task_withdrawn`` ``decision_events`` row
+    (actor + reason, written by the withdrawing side - never a worker
+    impersonation), the NOTICE outbox row for the owning session when
+    registered, the lease clear and the step/quota slot clear all land
+    inside one ``BEGIN IMMEDIATE`` - the session's live-task index
+    slot frees in the same write, so no ghost slot can hold the fleet
+    cap or ``ux_tasks_live_session``.
+
+    Late worker writes cannot resurrect it: ``finish_task`` and
+    ``renew_lease`` CAS on ``status=running AND lease_owner=owner``
+    and a cancelled row matches neither predicate.
+
+    ``stop_turn`` is recorded as the operator's intent to also
+    interrupt the live ACP turn (the CLI emits a best-effort
+    ``session/cancel`` after this call) - the journal states what was
+    requested, not whether the backend confirmed the turn stopped.
+
+    Open questions die with the task: pending and claimed questions
+    fold to terminal ``expired`` inside the same transaction (a
+    janitor edge), so no live deliberation or later re-ask notice
+    survives a cancelled task.
+    """
+    validate_question_transition(QuestionState.PENDING, QuestionState.EXPIRED, janitor=True)
+    validate_question_transition(QuestionState.CLAIMED, QuestionState.EXPIRED, janitor=True)
+    ts = _now()
+
+    def op():
+        con = connect(path)
+        try:
+            con.execute("BEGIN IMMEDIATE")
+            try:
+                row = con.execute(
+                    "SELECT session_id, status FROM tasks WHERE id=?",
+                    (task_id,),
+                ).fetchone()
+                if row is None:
+                    con.rollback()
+                    return TaskWithdrawNotFound()
+                status_before = row["status"]
+                cur = con.execute(
+                    "UPDATE tasks SET status=?, finished_at=?,"
+                    " lease_owner=NULL, lease_expires_at=NULL,"
+                    " lease_renewed_at=NULL,"
+                    " note=?, updated_at=?" + _STEP_CLEAR_SQL + " WHERE id=?"
+                    " AND status IN (?,?,?,?,?)",
+                    (
+                        TaskStatus.CANCELLED.value,
+                        ts,
+                        f"withdrawn by {actor}" + (f": {reason}" if reason else ""),
+                        ts,
+                        task_id,
+                        TaskStatus.QUEUED.value,
+                        TaskStatus.DISPATCH_DECIDED.value,
+                        TaskStatus.RUNNING.value,
+                        TaskStatus.AWAITING_USER.value,
+                        TaskStatus.PAUSED.value,
+                    ),
+                )
+                if cur.rowcount != 1:
+                    con.rollback()
+                    return TaskWithdrawRefused(status=status_before)
+                # a withdrawn awaiting_user task must not keep its
+                # pending/claimed question alive - the orchestrator
+                # would keep deliberating and the janitor would later
+                # ship a re-ask notice for a row that is already
+                # terminal (PR #143 review)
+                qexp = con.execute(
+                    "UPDATE questions SET state=? WHERE task_id=? AND state IN (?,?)",
+                    (
+                        QuestionState.EXPIRED.value,
+                        task_id,
+                        QuestionState.PENDING.value,
+                        QuestionState.CLAIMED.value,
+                    ),
+                ).rowcount
+                con.execute(
+                    "INSERT INTO decision_events(session_id,kind,body,task_id,created_at)"
+                    " VALUES (?,?,?,?,?)",
+                    (
+                        row["session_id"],
+                        "task_withdrawn",
+                        f"task_id={task_id} status_before={status_before}"
+                        f" actor={actor} stop_turn={int(stop_turn)}"
+                        f" questions_expired={qexp}"
+                        f" reason={reason}",
+                        task_id,
+                        ts,
+                    ),
+                )
+                notice_id = None
+                active = con.execute(
+                    "SELECT 1 FROM sessions WHERE session_id=? AND status='active'",
+                    (row["session_id"],),
+                ).fetchone()
+                if active:
+                    notice_id = con.execute(
+                        "INSERT INTO notifications"
+                        "(session_id,kind,body,task_id,question_id,created_at)"
+                        " VALUES(?,?,?,?,?,?)",
+                        (
+                            row["session_id"],
+                            NotificationKind.NOTICE.value,
+                            f"task {task_id} was withdrawn by {actor}"
+                            + (f": {reason}" if reason else "")
+                            + " - the scope is pulled, the row is already"
+                            " terminal; do not finish, renew or retry it",
+                            task_id,
+                            None,
+                            ts,
+                        ),
+                    ).lastrowid
+                con.execute("COMMIT")
+                return TaskWithdrawn(
                     session_id=row["session_id"],
                     status_before=status_before,
                     notice_id=notice_id,

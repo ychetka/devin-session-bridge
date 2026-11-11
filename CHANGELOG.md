@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.13.0] - 2026-11-11
+
+### User-facing
+
+#### feat
+- New `bridge withdraw` command marks tasks `cancelled` with an audited actor/reason event - the orchestrator's benign scope-pull that `bridge kill` (a failure verdict) could not express. `cli,state,daemon,wake` (issue #142, task 267, issue #137)
+
+### Codebase
+
+#### cli,state,daemon,wake
+- [feat] Audited orchestrator withdraw (`cancelled` status + `bridge withdraw` with optional `--stop-turn` session/cancel) and durable `bridge_settings` persistence of the session-slot cap. Why: Task 264 stayed `running` after a HALT/withdrawal acknowledgment because nothing in the model could terminally close a scope-pull: HALT parks claims without touching the task row, and `kill` is a force-fail verdict for wedged work only. `withdraw` writes the audited terminal cancellation, frees the live-task index slot atomically and refuses late worker finish/renew via their own CAS. `--stop-turn` uses the empirically proven session/cancel (issue #137) and reports idle/confirmed/requested honestly - never a process-death claim. The cap is now daemon-published so worker CLIs, which never inherit the daemon env, enforce the same limit. (issue #142, task 267, issue #137)
+
+## [0.12.1] - 2026-11-11
+
+### Codebase
+
+#### tooling
+- [chore] Canonical fleet quality gates rollout - hazards docs, writer/reviewer/judge profiles, and commit-wrapper gates with negative tests. Why: Shared language-neutral reliability rules and mechanical enforcement (precommit re-grounding, whitelist scope, migration gate) replace drifting per-repo prompt lists; canonical source lives in ai_controller templates. (issue #140)
+
 ## [0.12.0] - 2026-11-11
 
 ### User-facing

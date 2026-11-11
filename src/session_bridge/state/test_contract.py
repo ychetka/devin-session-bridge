@@ -44,6 +44,7 @@ R = TaskStatus.RUNNING
 AU = TaskStatus.AWAITING_USER
 DONE = TaskStatus.DONE
 FAILED = TaskStatus.FAILED
+CANCELLED = TaskStatus.CANCELLED
 PAUSED = TaskStatus.PAUSED
 
 
@@ -66,10 +67,11 @@ def test_item02_gwt1_task_status_lists_full_set() -> None:
         "awaiting_user",
         "done",
         "failed",
+        "cancelled",
         "paused",
     }
     assert LIVE_STATUSES == frozenset({Q, DD, R, AU})
-    assert TERMINAL_STATUSES == frozenset({DONE, FAILED})
+    assert TERMINAL_STATUSES == frozenset({DONE, FAILED, CANCELLED})
 
 
 def test_item02_gwt1_transition_map_declares_lifecycle() -> None:
@@ -81,6 +83,7 @@ def test_item02_gwt1_transition_map_declares_lifecycle() -> None:
     assert set(TRANSITIONS) == set(TaskStatus)
     assert TRANSITIONS[DONE] == frozenset()
     assert TRANSITIONS[FAILED] == frozenset()
+    assert TRANSITIONS[CANCELLED] == frozenset()
     # each declared edge validates on the automatic path
     for src, targets in TRANSITIONS.items():
         for dst in targets:
@@ -205,6 +208,23 @@ def test_item02_gwt4_auto_retry_after_failed_not_expressible() -> None:
     with pytest.raises(ValidationError):
         validate_transition(FAILED, Q)
     validate_transition(FAILED, Q, manual=True)
+
+
+def test_issue142_gwt_withdraw_edges_manual_only() -> None:
+    """[ISSUE-142.GWT] cancelled is reachable from every
+    still-actionable status - and only on the manual path: no
+    automatic writer may silently cancel a task."""
+    for src in (Q, DD, R, AU, PAUSED):
+        assert CANCELLED not in TRANSITIONS[src]
+        assert CANCELLED in MANUAL_TRANSITIONS.get(src, frozenset())
+        with pytest.raises(ValidationError):
+            validate_transition(src, CANCELLED)
+        validate_transition(src, CANCELLED, manual=True)
+    # terminal statuses cannot be cancelled again and cancelled has
+    # no outgoing edges anywhere
+    for src in (DONE, FAILED, CANCELLED):
+        assert not is_valid_transition(src, CANCELLED, manual=True)
+        assert CANCELLED not in MANUAL_TRANSITIONS.get(src, frozenset())
 
 
 def test_item02_gwt4_requeue_or_fail_attempt_budget() -> None:

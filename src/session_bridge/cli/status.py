@@ -16,7 +16,6 @@ from session_bridge.cli.contract import (
 )
 from session_bridge.cli.dispatch import (
     _LIVE_VALUES,
-    MAX_ACTIVE_SESSIONS,
     SEMAPHOR,
     STATE_DISPATCHING,
     STATE_FAILED,
@@ -75,7 +74,12 @@ def _session_views(args) -> tuple[list[dict], list[Event], int]:
             (
                 t
                 for t in session_tasks
-                if t["status"] in (TaskStatus.DONE.value, TaskStatus.FAILED.value)
+                if t["status"]
+                in (
+                    TaskStatus.DONE.value,
+                    TaskStatus.FAILED.value,
+                    TaskStatus.CANCELLED.value,
+                )
             ),
             None,
         )
@@ -162,8 +166,9 @@ STATUS_DIGEST_SECONDS = 24 * 3600
 #: task statuses that never make a session row "idle" - the fleet row
 #: resolves its task cell on the latest task regardless of status, but
 #: the state column only inherits non-terminal ones (done -> idle is
-#: misleading: the worker finished, it is idle carrying a done task).
-_IDLE_TASK_STATUSES = frozenset({TaskStatus.DONE.value})
+#: misleading: the worker finished, it is idle carrying a done task;
+#: cancelled -> idle likewise, issue #142).
+_IDLE_TASK_STATUSES = frozenset({TaskStatus.DONE.value, TaskStatus.CANCELLED.value})
 
 #: display aliases for statuses longer than the STATE column.
 _FLEET_STATE_ALIAS = {
@@ -182,6 +187,7 @@ _TASK_STATE_CELL = {
     TaskStatus.AWAITING_USER.value: "wait",
     TaskStatus.DONE.value: "done",
     TaskStatus.FAILED.value: "fail",
+    TaskStatus.CANCELLED.value: "cncl",
     TaskStatus.PAUSED.value: "paus",
 }
 
@@ -619,10 +625,11 @@ def _cmd_status(args) -> int:
         },
         # issue #121: optional session-slot cap; max 0 = unlimited.
         # slot_wait is the backlog this pass left queued only because
-        # a fresh session slot was unavailable
+        # a fresh session slot was unavailable. issue #142: report the
+        # durable effective value, not this process's env read.
         "session_slots": {
             "active": len(db.active_session_ids(path=args.db)),
-            "max": MAX_ACTIVE_SESSIONS,
+            "max": db.effective_max_active_sessions(path=args.db),
         },
         "slot_wait": len(result["slot_wait"]),
         # item_13e2 fleet view: the human render below reads only

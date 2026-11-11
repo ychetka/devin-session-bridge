@@ -8,7 +8,9 @@ lease-owner CAS: exactly one claimant owns a live task at a time.
 The bridge SHALL move tasks only along `TRANSITIONS`: `queued` >
 `dispatch_decided` > `running` > `done`/`failed`, plus `awaiting_user`
 and the manual `paused` park. `failed` is terminal - the only exit is
-the manual `retry` command.
+the manual `retry` command. `cancelled` is terminal likewise: it is
+reachable from every still-actionable status but only via the manual
+`withdraw` edge - no automatic writer may silently cancel a task.
 
 #### Scenario: failed never auto-requeues
 
@@ -93,6 +95,50 @@ work.
 - **THEN** the command refuses with the current status
 - **AND** no state or event row is written
 
+### Requirement: orchestrator withdraw marks tasks cancelled
+
+`bridge withdraw <task_id>` SHALL CAS any still-actionable status
+(`queued`, `dispatch_decided`, `running`, `awaiting_user`, `paused`)
+to terminal `cancelled` - the benign scope-pull `bridge kill` cannot
+express: kill is a force-FAIL verdict for wedged work and reaches
+only `running|dispatch_decided`. The withdraw SHALL journal a
+`task_withdrawn` decision event naming actor and reason (the audit
+is authored by the withdrawing side, never impersonating the
+worker), clear the lease and step/quota slots, stamp `finished_at`,
+and enqueue a NOTICE to the owning session - all inside one
+`BEGIN IMMEDIATE`, so the session's live-task index slot frees in
+the same write (no ghost slot). Late `finish`/`renew` from a worker
+that never saw the notice SHALL be refused by their own CAS
+predicates. Terminal rows (`done`, `failed`, `cancelled`) SHALL be
+refused, which makes a repeat withdraw idempotent - no duplicate
+event or notice. `--stop-turn` is an explicit optional extra that
+emits a best-effort `session/cancel` over acp-host and reports the
+outcome honestly (`idle`/`confirmed`/`requested`/`failed:<reason>`)
+- it never claims the worker process or session died.
+
+#### Scenario: running task is pulled mid-work
+
+- **WHEN** the orchestrator withdraws a `running` task
+- **THEN** the row is `cancelled` with lease cleared and
+  `finished_at` stamped in the same transaction as the
+  `task_withdrawn` event
+- **AND** a late `bridge finish` or `bridge wait` by the worker
+  fails its CAS and changes nothing
+
+#### Scenario: withdrawal is idempotent
+
+- **WHEN** a task is already `cancelled` (or any terminal status)
+- **THEN** a further `bridge withdraw` refuses with the current
+  status and writes no second event or notice
+
+#### Scenario: halt plus withdraw is consistent
+
+- **WHEN** a task is withdrawn while its session is halted or its
+  turn is busy on the host
+- **THEN** the row still reaches `cancelled` - task state never
+  depended on turn delivery, and `--stop-turn` merely requests the
+  backend interrupt without certifying the process stopped
+
 ### Requirement: optional cap on concurrently active sessions
 
 When `SB_MAX_ACTIVE_SESSIONS` is set above zero, a `queued` task
@@ -106,6 +152,16 @@ at stage time. A task refused by the cap stays `queued` and is
 counted as slot-waiting in `bridge status`, which SHALL report the
 active session count, the configured cap, and the backlog. A
 default of `0` means unlimited.
+
+The configured value SHALL be durable: the daemon persists its
+env-resolved cap to `bridge_settings` at startup, and every claim
+CAS, the pump pre-filter, and the status report read that stored
+value - a `bridge` subprocess that never inherited the daemon's
+environment enforces the same limit, falling back to its own env
+read only when no daemon has ever published one. The cap counts
+registered sessions holding live tasks only; it declares no bound
+on child-agent concurrency inside a session, which the bridge
+schema does not track at all.
 
 #### Scenario: queued task waits for a free session slot
 

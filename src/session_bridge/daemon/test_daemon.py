@@ -3112,3 +3112,20 @@ def test_item249_gwt9_busy_hold_lost_cas_journaled(env, monkeypatch):
     events = [e["kind"] for e in db.list_events(session_id=SID, path=env.db)]
     assert "quota_probe_hold_lost" in events
     assert "quota_probe_gave_up" not in events
+
+
+def test_issue142_daemon_persists_session_cap(env, monkeypatch):
+    """[ISSUE-142] the daemon publishes its env-resolved
+    SB_MAX_ACTIVE_SESSIONS to bridge_settings at startup, so
+    worker-spawned bridge subprocesses - which never inherit the
+    daemon's env - enforce the same cap (the CLI-vs-daemon
+    discrepancy of task 264's diagnosis). A second start re-asserts
+    the value: the env stays the operator interface."""
+    monkeypatch.setattr(db, "MAX_ACTIVE_SESSIONS", 2)
+    assert daemon.run(env.db, env.qdir, once=True) == daemon.RUN_OK
+    assert db.effective_max_active_sessions(path=env.db) == 2
+
+    # restart with a different env value overwrites the stored row
+    monkeypatch.setattr(db, "MAX_ACTIVE_SESSIONS", 1)
+    assert daemon.run(env.db, env.qdir, once=True) == daemon.RUN_OK
+    assert db.effective_max_active_sessions(path=env.db) == 1

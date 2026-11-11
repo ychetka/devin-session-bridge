@@ -41,6 +41,7 @@ from session_bridge.state.contract import (
     Transport,
 )
 from session_bridge.state.verdict import UnregisterNotFound
+from session_bridge.wake import WakeError
 
 SID = "s1"
 
@@ -3090,6 +3091,69 @@ def test_item113_gwt4_kill_task_cli(env, capsys):
     assert rc == ExitCode.OK and len(out["data"]["events"]) == 1
 
 
+def test_issue142_gwt10_withdraw_cli(env, capsys, monkeypatch):
+    """[ISSUE-142.GWT-10] `bridge withdraw <task_id>`: the audited
+    scope-pull - cancelled row, actor+reason event, owner NOTICE,
+    refused on terminal, and --stop-turn routes through the acp-host
+    cancel transport with an honest outcome word."""
+    db.register("s1", "/repo/s", path=env.db)
+    db.heartbeat("s1", path=env.db)
+    tid = _task(env)
+
+    rc, out = _run(
+        [
+            "withdraw",
+            str(tid),
+            "--actor",
+            "buttered-tilapia",
+            "--reason",
+            "scope pulled",
+            "--json",
+        ],
+        capsys,
+    )
+    assert rc == ExitCode.OK
+    d = out["data"]
+    assert d["withdrawn"] and d["task_id"] == tid and d["status_before"] == "queued"
+    assert d["notification_id"] is not None
+    assert "stop_turn" not in d  # not requested, nothing claimed
+    assert db.get_task(tid, path=env.db)["status"] == "cancelled"
+    ev = db.list_events(session_id="s1", kind="task_withdrawn", path=env.db)
+    assert len(ev) == 1 and "actor=buttered-tilapia" in ev[0]["body"]
+
+    # repeat is refused, not double-journaled; missing task not_found
+    rc, out = _run(["withdraw", str(tid), "--json"], capsys)
+    assert rc == ExitCode.CONFLICT and out["status"] == "refused"
+    rc, out = _run(["withdraw", "9999", "--json"], capsys)
+    assert rc == ExitCode.NOT_FOUND and out["status"] == "not_found"
+    assert len(db.list_events(session_id="s1", kind="task_withdrawn", path=env.db)) == 1
+
+    # --stop-turn on a running task: the cancel transport reports its
+    # honest outcome word and the task is cancelled regardless
+    tid2 = _task(env)
+    _claim_acp(env, tid2)
+    monkeypatch.setattr("session_bridge.cli.commands.sessions.cancel_turn", lambda sid: "confirmed")
+    rc, out = _run(["withdraw", str(tid2), "--stop-turn", "--json"], capsys)
+    assert rc == ExitCode.OK
+    assert out["data"]["stop_turn"] == "confirmed"
+    assert out["data"]["status_before"] == "running"
+    assert db.get_task(tid2, path=env.db)["status"] == "cancelled"
+
+    # a turn-stop transport failure surfaces in the report but never
+    # fails the withdraw itself - the CAS already committed
+    tid3 = _task(env)
+    _claim_acp(env, tid3)
+
+    def _boom(sid):
+        raise WakeError("wake_host_down", "no lockfile")
+
+    monkeypatch.setattr("session_bridge.cli.commands.sessions.cancel_turn", _boom)
+    rc, out = _run(["withdraw", str(tid3), "--stop-turn", "--json"], capsys)
+    assert rc == ExitCode.OK
+    assert out["data"]["stop_turn"] == "failed:wake_host_down"
+    assert db.get_task(tid3, path=env.db)["status"] == "cancelled"
+
+
 # --- item_98 / directive 446: fleet-metrics read-only report -------
 
 
@@ -3622,8 +3686,8 @@ def test_item121_gwt1_session_slot_cap_blocks_new_sid(env, monkeypatch):
     (The already-active-sid exemption is unreachable by construction -
     ux_tasks_live_session allows one live task per session - but the
     guard stays so the check is safe under any future schema change.)"""
-    monkeypatch.setattr(dispatch, "MAX_ACTIVE_SESSIONS", 1)
-    # the CAS layer enforces independently of the pump pre-filter
+    # issue #142: pump pre-filter and CAS layer both read the durable
+    # effective cap - the db module constant is the test hook
     monkeypatch.setattr(db, "MAX_ACTIVE_SESSIONS", 1)
     env.devin["s1"] = {"working_directory": "/r1"}
     env.devin["s2"] = {"working_directory": "/r2"}
@@ -3660,8 +3724,9 @@ def test_item121_gwt2_zero_cap_unlimited(env):
 def test_item121_gwt3_status_surfaces_slots(env, monkeypatch):
     """[ITEM-121.GWT-3] status --json reports the session-slot
     occupancy, the configured cap, and the slot-wait reason."""
-    monkeypatch.setattr(dispatch, "MAX_ACTIVE_SESSIONS", 1)
-    monkeypatch.setattr("session_bridge.cli.status.MAX_ACTIVE_SESSIONS", 1)
+    # issue #142: the pump and the report read the durable effective
+    # cap - monkeypatching the db-level fallback covers both readers
+    monkeypatch.setattr(db, "MAX_ACTIVE_SESSIONS", 1)
     env.devin["s1"] = {"working_directory": "/r1"}
     env.devin["s2"] = {"working_directory": "/r2"}
     t1 = _task(env, sid="s1")
