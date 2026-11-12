@@ -138,11 +138,31 @@ Storage layout (state dir = the directory holding `state.db`, default
    waits burned leases silently. `bridge wait <id> --session <sid>
    [--reason "<what>"]` is the claimer's out-of-band wait signal: a
    lease-owner CAS (same guard as claim/finish) extends the lease by
-   one `LEASE_SECONDS` per call and lands the reason in the task
-   note. It is bounded on purpose - a dead claimer simply stops
+   one `LEASE_SECONDS` per call and lands the reason in the task's
+   `wait_reason` column (mirrored into `note` for compatibility; a
+   reason-less call clears the declared reason). It is bounded on
+   purpose - a dead claimer simply stops
    renewing and the task requeues within one lease period. Repeat it
    while the wait lasts; `claim` on an owned running task renews the
    same way without a reason.
+
+   External wait + un-park flow (issue #151): a running task with a
+   fresh wait stamp shows as a waiting/parked stall phase - `bridge
+   status` renders the session `PARKED` with `external wait: <reason>`
+   as its action (the reason is sourced from `wait_reason`, never a
+   stale lifecycle `note`), the fleet row reads `ewait`/`waiting`,
+   and --json carries `wait_until`/`wait_reason`. When the declared condition
+   resolves (PR merged, CI green, partner answered) the ORCHESTRATOR
+   or the operator un-parks the waiter by sending `bridge notice
+   <sid> "<text>"` or `bridge directive <sid> "<text>"` - the
+   delivery wakes the session, it drains the mail and finishes or
+   fails the task itself; there is no status flip, the task simply
+   resumes its ordinary lifecycle. The stamp must be renewed within
+   `LEASE_SECONDS` (default 3600s, `SB_LEASE_TTL_S`, 600s floor) or
+   it decays with the lease it mirrors; a dead or stopped claimant
+   just stops renewing and the task requeues on lease expiry. No
+   GitHub/CI polling is built or planned - the resolution signal
+   always comes from the side that knows the condition cleared.
 
    Provider rate limits (task #216): a task that hits an explicit
    model rate limit parks as `waiting_quota` - a durable step state
@@ -210,19 +230,22 @@ orchestrator: <orc-sid> active (hb 14s)
 SID              REPO             TASK                 TSTAT  STATE       Q FAIL  SEEN WAKE    MAIL
 <orc-sid>        ai_controller    -                    -      idle        -    -   14s sent    -
 <sid>            worker-repo      #7 fix flaky test    run    running   0/3  0/2   30s -      540s
-24h: done 0 | auto-decisions 0 | escalations 0
+24h: done 0 | auto-decisions 0 | escalations 0 | lease-expired 0
 ```
 
 `TSTAT` is the lifecycle of the session's latest task (`queued`,
 `disp` = dispatch_decided, `run`, `wait` = awaiting_user, `done`,
 `fail`, `paus`, `quota` = parked on a provider rate limit until the
-task's `quota_reset_at`); `-` when there is no task. `STATE` is the
+task's `quota_reset_at`, `ewait` = running task parked on a fresh
+`bridge wait` stamp); `-` when there is no task. `STATE` is the
 session reading: `dead` for a daemon-marked session, `idle` when
 nothing is running (a `done` task still reads `idle` - check `TSTAT`
 for the task's actual end state), `quota` when the latest task is
-`waiting_quota`, otherwise the task status. The two columns
+`waiting_quota`, `waiting` when the latest task declared an external
+wait that is still fresh, otherwise the task status. The two columns
 together separate "worker idle after finishing" (`done` + `idle`)
-from "task not picked up" (`queued` + `queued`).
+from "task not picked up" (`queued` + `queued`) and from "worker
+parked on an out-of-band answer" (`ewait` + `waiting`).
 
 `SEEN` is the liveness cell: heartbeat age for unmanaged sessions,
 turn-activity recency for managed ones (the freshest of heartbeat,
@@ -969,7 +992,7 @@ orchestrator: <orc-sid> active (hb 14s)
 SID              REPO             TASK                 TSTAT  STATE       Q FAIL  SEEN WAKE
 <orc-sid>        ai_controller    -                    -      idle        -    -   14s -
 worker-bee       devin-telegram   #7 fix flaky test    run    running   1/3  0/2   30s -
-24h: done 5 | auto-decisions 12 | escalations 1
+24h: done 5 | auto-decisions 12 | escalations 1 | lease-expired 0
 ```
 
 Attention banner (printed only when needed):
@@ -998,16 +1021,21 @@ Fleet table, one row per session:
 | `SID` | session id; a leading `*` marks a session that never registered (seen only through a pushed task). |
 | `REPO` | basename of the session `cwd`, else its title. |
 | `TASK` | `#<id> <label>` of the session's latest task (`-` when none). |
-| `TSTAT` | compact lifecycle of that latest task: `queued`, `disp` (= `dispatch_decided`), `run` (= `running`), `wait` (= `awaiting_user`), `done`, `fail` (= `failed`), `paus` (= `paused`); `-` when there is no task. Machine-readable equivalent: `task_status` in `--json` fleet rows. |
-| `STATE` | session-level reading: `dead` for a daemon-marked session; `idle` when nothing is running (a `done` task means idle - `TSTAT` carries the task's actual end state); otherwise the latest task's status - `queued`, `dispatch` (= `dispatch_decided`), `running`, `awaiting` (= `awaiting_user`), `paused`, `failed`. |
+| `TSTAT` | compact lifecycle of that latest task: `queued`, `disp` (= `dispatch_decided`), `run` (= `running`), `wait` (= `awaiting_user`), `done`, `fail` (= `failed`), `paus` (= `paused`), `quota` (= `waiting_quota` park), `ewait` (= `running` with a fresh `bridge wait` stamp); `-` when there is no task. Machine-readable equivalent: `task_status`/`step_state`/`wait_until` in `--json` fleet rows. |
+| `STATE` | session-level reading: `dead` for a daemon-marked session; `idle` when nothing is running (a `done` task means idle - `TSTAT` carries the task's actual end state); `quota` when the latest task is `waiting_quota`; `waiting` when the latest task is `running` but parked on a fresh `wait_until` stamp; otherwise the latest task's status - `queued`, `dispatch` (= `dispatch_decided`), `running`, `awaiting` (= `awaiting_user`), `paused`, `failed`. |
 | `Q` | questions asked on the task, `n/3` (`MAX_QUESTIONS_PER_TASK`). |
 | `FAIL` | task attempt counter, `n/2` (`MAX_ATTEMPTS`). |
 | `SEEN` | liveness age: heartbeat age for unmanaged sessions, turn-activity recency for managed ones (`-` when none). |
 | `WAKE` | last recorded wake outcome plus unconfirmed streak / escalation flag (`-` when never woken). |
 
 Footer digest (rolling 24h): `24h: done X | auto-decisions Y |
-escalations Z` - tasks finished, DELIBERATION audit rows written,
-ESCALATION audit rows written.
+escalations Z | lease-expired N` - tasks finished, DELIBERATION audit
+rows written, ESCALATION audit rows written, tasks folded by
+`requeue_or_fail` inside the window (counted on the durable
+`lease_expired_at` stamp, not the `lease expired` note).
+`waiting-external N` appends only when >0 - a live gauge (not a 24h
+count) of `running` tasks parked on a still-fresh `bridge wait`
+stamp, i.e. claimers waiting on an out-of-band answer.
 
 Overflow: `+N more session(s) - see --json`.
 
@@ -1016,12 +1044,15 @@ Overflow: `+N more session(s) - see --json`.
 `vitals.orchestrator {session_id, status, heartbeat_age_seconds}`,
 `fleet[]` (`registered`, `role`, `mode`, `repo`, `session_status`,
 `task_id`, `task_label`, `task_status`, `attempt`, `questions`,
-`heartbeat_age_seconds`, `state`), `digest_24h {done, auto_decisions,
-escalations}`, plus the legacy `sessions[]` per-session views -
-including `log_path` and `stderr_tail` for failed tasks, which are
-available only in JSON output, not in the human table. Top-level
-envelope fields: `queue_depth` (true COUNT, never capped),
-`queue_shown`, `queue_truncated`, `in_flight_dispatch`,
+`wait_until`, `wait_reason`, `heartbeat_age_seconds`, `state`),
+`digest_24h {done, auto_decisions, escalations, lease_expired,
+waiting_external}`, plus the legacy `sessions[]` per-session views -
+including `wait_until`/`wait_reason`, `log_path` and `stderr_tail`
+for failed tasks, which are available only in JSON output, not in
+the human table. Top-level envelope fields: `queue_depth` (true
+COUNT, never capped), `queue_shown`, `queue_truncated`,
+`in_flight_dispatch`, `waiting_external` (the same live parked-waiter
+gauge the digest carries),
 `concurrency {active, max}` (acp-push semaphore, max 3),
 `saturation_reason` when admission was refused.
 
@@ -1040,7 +1071,7 @@ Global flags: `--db PATH` (`SESSIONS_BRIDGE_DB`), `--queue-dir DIR`
 | `bridge push <sid> --task "..."` / `--file <path>` | enqueue a task; pump picks the transport: managed session > outbox notification (mailbox) + `dispatch_decided` mark, locked session > hook queue, idle session > acp push worker. Push guard (item_152): a dead sid is **refused** before enqueue (undrainable by every transport); an unmanaged sid still dispatches via its transports but the response carries a warning, the human line is tagged `[UNMANAGED TARGET]`, and the task `note` is flagged so `bridge inspect` surfaces the risk. |
 | `bridge claim <task_id> --session SID` | managed worker claims its delivered task: `queued`/`dispatch_decided` > `running` + lease. Idempotent - a repeat claim on the session's own running task renews the lease (long-task heartbeat). Refusals: wrong session, task already claimed/running/done/failed, `queue_paused`. |
 | `bridge finish <task_id> --session SID [--fail] [--note T]` | close the managed lifecycle: `running` > `done` (or `failed` with `--fail`), CAS'd on the claiming session's deterministic lease owner. |
-| `bridge wait <task_id> --session SID [--reason T]` | external-wait signal (item_22): the claiming session renews its lease by one `LEASE_SECONDS` while blocked out-of-band (CI, reviews, partner consults) and the reason lands in the task note. Same owner CAS as claim/finish; a dead claimer stops renewing and the task requeues within one lease period. |
+| `bridge wait <task_id> --session SID [--reason T]` | external-wait signal (item_22): the claiming session renews its lease by one `LEASE_SECONDS` while blocked out-of-band (CI, reviews, partner consults) and the reason lands in the task's `wait_reason` column (mirrored into `note` for compatibility; a reason-less call clears the declared reason). Same owner CAS as claim/finish; a dead claimer stops renewing and the task requeues within one lease period. A fresh wait stamp renders as a parked/waiting phase in `bridge status` (`ewait` TSTAT, `waiting` STATE, `external wait: <reason>` action sourced from `wait_reason`); the orchestrator or operator un-parks the waiter by sending `bridge notice <sid>` or `bridge directive <sid>` once the condition resolves - no GitHub/CI polling is built or planned. |
 | `bridge status` | fleet view above. |
 | `bridge inspect <sid\|task_id>` | full task detail + next action. |
 | `bridge clear <sid>` | drop the session's queued task. |

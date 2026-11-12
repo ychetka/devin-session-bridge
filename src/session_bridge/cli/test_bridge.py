@@ -23,6 +23,7 @@ import pytest
 
 from session_bridge.acp.contract import AcpError, PromptResult
 from session_bridge.cli import bridge, common, dispatch
+from session_bridge.cli import status as status_mod
 from session_bridge.cli.commands import ops, sessions
 from session_bridge.cli.contract import (
     EventKind,
@@ -1465,7 +1466,7 @@ def test_item13e2_digest_counts_24h_window(env, capsys):
     _age_row(env.db, "UPDATE audit_events SET created_at=? WHERE id=?", (stale_delib,))
     _escalation(env)
     lines = _status_human(capsys)
-    assert lines[-1] == "24h: done 1 | auto-decisions 1 | escalations 1"
+    assert lines[-1] == "24h: done 1 | auto-decisions 1 | escalations 1 | lease-expired 0"
 
 
 def test_item13e2_line_cap_under_fleet_and_banner_overflow(env, capsys):
@@ -1511,7 +1512,13 @@ def test_item13e2_status_json_carries_fleet_detail(env, capsys):
     assert fleet["w1"]["questions"] == 1
     assert fleet["w1"]["attempt"] == 0
     assert fleet["w1"]["heartbeat_age_seconds"] is not None
-    assert data["digest_24h"] == {"done": 0, "auto_decisions": 0, "escalations": 1}
+    assert data["digest_24h"] == {
+        "done": 0,
+        "auto_decisions": 0,
+        "escalations": 1,
+        "lease_expired": 0,
+        "waiting_external": 0,
+    }
 
 
 # --- item_13g: protocol wiring gaps ------------------------------------------
@@ -2001,6 +2008,7 @@ def test_item22_gwt1_wait_renews_own_lease_with_reason(env, capsys):
     row = db.get_task(tid, path=env.db)
     assert row["lease_expires_at"] > 1
     assert row["note"] == "PR review"
+    assert row["wait_reason"] == "PR review"
     assert row["lease_renewed_at"] is not None
 
 
@@ -2071,6 +2079,172 @@ def test_item22_gwt4_duty_text_mandates_wait():
     text = mailbox_duty_text("s1")
     assert "bridge wait <task_id> --session" in text
     assert "EXTERNAL WAITS" in text
+
+
+# --- issue #151: external-wait visibility + status observability MVP ----------
+
+
+def _wait_stamped_running(env, capsys, reason="PR review"):
+    """A managed session claiming a task, then wait-stamping it."""
+    _managed(env)
+    tid = _task(env)
+    assert _run(["claim", str(tid), "--session", SID, "--json"], capsys)[0] == ExitCode.OK
+    argv = ["wait", str(tid), "--session", SID, "--json"]
+    if reason is not None:
+        argv = ["wait", str(tid), "--session", SID, "--reason", reason, "--json"]
+    assert _run(argv, capsys)[0] == ExitCode.OK
+    return tid
+
+
+def test_issue151_gwt1_wait_stamp_renders_parked_phase(env, capsys):
+    """[ISSUE-151.GWT-1] a running task with a fresh wait stamp reads
+    parked with its declared reason - per-session view, fleet cells
+    and --json fields all expose the phase."""
+    tid = _wait_stamped_running(env, capsys)
+    # the declared reason lives in the dedicated column (issue #151)
+    assert db.get_task(tid, path=env.db)["wait_reason"] == "PR review"
+
+    rc, out = _run(["status", "--json"], capsys)
+    assert rc == ExitCode.OK
+    view = next(v for v in out["data"]["sessions"] if v["session"] == SID)
+    assert view["state"] == status_mod.STATE_PARKED
+    assert view["action"] == "external wait: PR review"
+    assert view["wait_until"] is not None
+    assert view["wait_reason"] == "PR review"
+    row = next(r for r in out["data"]["fleet"] if r["session_id"] == SID)
+    assert row["task_id"] == tid
+    assert row["state"] == "waiting"
+    assert status_mod._task_state_cell(row) == "ewait"
+    assert row["wait_until"] is not None
+    assert row["wait_reason"] == "PR review"
+
+    rc = bridge.main(["status"])
+    assert rc == ExitCode.OK
+    line = next(ln for ln in capsys.readouterr().out.splitlines() if ln.startswith(SID))
+    assert " ewait " in line
+    assert " waiting " in line
+
+
+def test_issue151_gwt2_wait_phase_decay_and_empty_reason(env, capsys):
+    """[ISSUE-151.GWT-2] no reason falls back to the bare 'external
+    wait' action, and a stamp already past now decays back to plain
+    running with no clearing write."""
+    tid = _wait_stamped_running(env, capsys, reason=None)
+    assert db.get_task(tid, path=env.db)["wait_reason"] is None
+    rc, out = _run(["status", "--json"], capsys)
+    assert rc == ExitCode.OK
+    view = next(v for v in out["data"]["sessions"] if v["session"] == SID)
+    assert view["action"] == "external wait"
+
+    # let the stamp lapse - the phase decays on read, nothing clears it
+    con = db.connect(env.db)
+    try:
+        con.execute("UPDATE tasks SET wait_until=? WHERE id=?", (1, tid))
+        con.commit()
+    finally:
+        con.close()
+    rc, out = _run(["status", "--json"], capsys)
+    assert rc == ExitCode.OK
+    view = next(v for v in out["data"]["sessions"] if v["session"] == SID)
+    assert view["state"] == status_mod.STATE_RUNNING
+    assert view["action"] == "-"
+    row = next(r for r in out["data"]["fleet"] if r["session_id"] == SID)
+    assert row["state"] == "running"
+    assert status_mod._task_state_cell(row) == "run"
+    # the stale stamp is still carried honestly for --json consumers
+    assert row["wait_until"] == 1
+    assert row["wait_reason"] is None  # this wait was declared without a reason
+
+
+def test_issue151_gwt2b_reasonless_wait_never_renders_stale_note(env, capsys):
+    """[ISSUE-151.GWT-2b] the reported bleed: a lease-expired fold
+    leaves note='lease expired' on the task; reclaim + a reason-less
+    `bridge wait` must render the bare 'external wait' action - the
+    stale note can never pose as the declared reason."""
+    _managed(env)
+    tid = _task(env)
+    assert _run(["claim", str(tid), "--session", SID, "--json"], capsys)[0] == ExitCode.OK
+    con = db.connect(env.db)
+    try:
+        con.execute("UPDATE tasks SET lease_expires_at=? WHERE id=?", (1, tid))
+        con.commit()
+    finally:
+        con.close()
+    assert db.requeue_or_fail(tid, note="lease expired", path=env.db) == TaskStatus.QUEUED
+    assert db.get_task(tid, path=env.db)["note"] == "lease expired"
+    # reclaim through the managed path, then wait without a reason
+    assert _run(["claim", str(tid), "--session", SID, "--json"], capsys)[0] == ExitCode.OK
+    assert _run(["wait", str(tid), "--session", SID, "--json"], capsys)[0] == ExitCode.OK
+    row = db.get_task(tid, path=env.db)
+    # lifecycle history keeps the note; the declared reason is cleared
+    # (a reason-less wait declares no reason - it does not inherit one)
+    assert row["note"] == "lease expired"
+    assert row["wait_reason"] is None
+
+    rc, out = _run(["status", "--json"], capsys)
+    assert rc == ExitCode.OK
+    view = next(v for v in out["data"]["sessions"] if v["session"] == SID)
+    assert view["state"] == status_mod.STATE_PARKED
+    assert view["action"] == "external wait"  # NOT 'external wait: lease expired'
+    assert view["wait_reason"] is None
+
+
+def test_issue151_gwt3_lease_expired_digest_counts_window(env, capsys):
+    """[ISSUE-151.GWT-3] lease_expired counts requeue_or_fail folds
+    inside the 24h window via the dedicated lease_expired_at stamp -
+    a sticky 'lease expired' note on a fresh row (the old overcount
+    case) and a stamp aged past the window both stay out, while a
+    note overwrite after the fold can no longer lose the count."""
+    t1 = _task(env)
+    o1 = _claim_acp(env, t1)
+    con = db.connect(env.db)
+    try:
+        con.execute("UPDATE tasks SET lease_expires_at=? WHERE id=?", (1, t1))
+        con.commit()
+    finally:
+        con.close()
+    assert db.requeue_or_fail(t1, note="lease expired", path=env.db) is not None
+    assert db.get_task(t1, path=env.db)["lease_expired_at"] is not None
+    # noise: the old proxy shape - a sticky 'lease expired' note on a
+    # freshly-written row must NOT count, and neither does a real fold
+    # stamp aged past the window; the fold itself survives a later
+    # note overwrite (the old undercount case)
+    t2 = _task(env, sid="s2")
+    t3 = _task(env, sid="s3")
+    stale = int(time.time()) - 25 * 3600
+    con = db.connect(env.db)
+    try:
+        con.execute("UPDATE tasks SET note=? WHERE id=?", ("lease expired", t2))
+        con.execute(
+            "UPDATE tasks SET lease_expired_at=?, note=? WHERE id=?",
+            (stale, "lease expired", t3),
+        )
+        con.execute("UPDATE tasks SET note=? WHERE id=?", ("requeued elsewhere", t1))
+        con.commit()
+    finally:
+        con.close()
+
+    rc, out = _run(["status", "--json"], capsys)
+    assert rc == ExitCode.OK
+    assert out["data"]["digest_24h"]["lease_expired"] == 1
+    assert o1  # lease owner was real, the fold was a genuine CAS
+
+
+def test_issue151_gwt4_status_json_carries_wait_fields(env, capsys):
+    """[ISSUE-151.GWT-4] --json exposes the parked-waiter gauge at top
+    level and inside digest_24h; the human footer shows it only
+    when >0."""
+    _wait_stamped_running(env, capsys)
+    rc, out = _run(["status", "--json"], capsys)
+    assert rc == ExitCode.OK
+    assert out["data"]["digest_24h"]["waiting_external"] == 1
+    assert out["data"]["waiting_external"] == 1
+
+    rc = bridge.main(["status"])
+    assert rc == ExitCode.OK
+    table = capsys.readouterr().out
+    assert "waiting-external 1" in table
+    assert "lease-expired 0" in table
 
 
 def test_item18_no_redispatch_after_ack(env, capsys):

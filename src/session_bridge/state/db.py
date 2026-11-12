@@ -471,6 +471,13 @@ _TASK_COLUMN_MIGRATIONS = (
     ("quota_model", "TEXT"),
     ("quota_checkpoint", "TEXT"),
     ("quota_defer_count", "INTEGER"),
+    # issue #151 wait observability: wait_reason carries the reason the
+    # last `bridge wait` declared (NULL on a reason-less wait, so a
+    # stale reason can never render); lease_expired_at stamps the last
+    # requeue_or_fail fold so the status digest counts real
+    # lease-expiry folds instead of a sticky 'lease expired' note.
+    ("wait_reason", "TEXT"),
+    ("lease_expired_at", "INTEGER"),
 )
 
 # Columns the item_139 schema adds to wake_state, applied idempotently
@@ -1074,10 +1081,17 @@ def wait_task(task_id: int, owner: str, note: str | None = None, *, path=None) -
 
     Same CAS guard as :func:`renew_lease` - only the session holding
     the lease can declare the wait - but one explicit call instead of
-    an implicit re-claim heartbeat, so the reason can land in ``note``
-    for operator visibility. Bounded: a single call extends at most
-    one LEASE_SECONDS, so a dead worker stops renewing and the task
-    still requeues within one lease period.
+    an implicit re-claim heartbeat, so the reason can land in
+    ``wait_reason`` for operator visibility (issue #151: the status
+    view reads the dedicated column, never ``note`` - a stale
+    lifecycle note like 'lease expired' can no longer masquerade as
+    the wait cause). The reason still mirrors into ``note`` for
+    backward compatibility, while ``wait_reason`` writes
+    unconditionally: a reason-less wait clears the previously
+    declared reason, which is correct - no reason was declared.
+    Bounded: a single call extends at most one LEASE_SECONDS, so a
+    dead worker stops renewing and the task still requeues within one
+    lease period.
 
     Also stamps ``wait_until`` = the new lease expiry (item_139): the
     daemon wake candidates skip a running task whose declared
@@ -1094,12 +1108,13 @@ def wait_task(task_id: int, owner: str, note: str | None = None, *, path=None) -
         try:
             cur = con.execute(
                 "UPDATE tasks SET lease_expires_at=?, lease_renewed_at=?,"
-                " wait_until=?, note=COALESCE(?,note), updated_at=?"
+                " wait_until=?, wait_reason=?, note=COALESCE(?,note), updated_at=?"
                 " WHERE id=? AND status=? AND lease_owner=?",
                 (
                     ts + LEASE_SECONDS,
                     ts,
                     ts + LEASE_SECONDS,
+                    note,
                     note,
                     ts,
                     task_id,
@@ -1166,6 +1181,12 @@ def requeue_or_fail(task_id: int, note: str | None = None, *, path=None):
     its CAS the moment the lease lapses) are consistent: exactly one
     side wins. Returns the new ``TaskStatus`` or ``None`` when the task
     was already moved.
+
+    Both branches stamp ``lease_expired_at`` (issue #151): it is the
+    "last fold" timestamp the status digest counts on - deliberately
+    not cleared by any later lifecycle writer, so the windowed count
+    can never lose a fold to a note overwrite or gain one from a
+    routine ``updated_at`` bump.
     """
     ts = _now()
     # a quota park landing between the caller's SELECT and this UPDATE
@@ -1188,13 +1209,14 @@ def requeue_or_fail(task_id: int, note: str | None = None, *, path=None):
             cur = con.execute(
                 "UPDATE tasks SET status=?, attempt=attempt+1,"
                 " lease_owner=NULL, lease_expires_at=NULL,"
-                " lease_renewed_at=NULL,"
+                " lease_renewed_at=NULL, lease_expired_at=?,"
                 " note=COALESCE(?,note), updated_at=?"
                 + _STEP_CLEAR_SQL
                 + guard
                 + " AND attempt+1<?",
                 (
                     TaskStatus.QUEUED.value,
+                    ts,
                     note,
                     ts,
                     task_id,
@@ -1207,13 +1229,14 @@ def requeue_or_fail(task_id: int, note: str | None = None, *, path=None):
             cur = con.execute(
                 "UPDATE tasks SET status=?, attempt=attempt+1,"
                 " lease_owner=NULL, lease_expires_at=NULL,"
-                " lease_renewed_at=NULL, finished_at=?,"
+                " lease_renewed_at=NULL, lease_expired_at=?, finished_at=?,"
                 " note=COALESCE(?,note), updated_at=?"
                 + _STEP_CLEAR_SQL
                 + guard
                 + " AND attempt+1>=?",
                 (
                     TaskStatus.FAILED.value,
+                    ts,
                     ts,
                     note,
                     ts,

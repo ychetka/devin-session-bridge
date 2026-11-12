@@ -61,13 +61,54 @@ ceiling `SESSIONS_BRIDGE_LEASE_AUTO_RENEW_SECONDS` (default 6x lease).
 `bridge wait` SHALL extend the caller's task lease by one
 `LEASE_SECONDS` per call under the same owner CAS as claim/finish -
 an out-of-band block (CI, reviews, partner consults) must not read as
-abandonment.
+abandonment. The declared reason lands in the task's `wait_reason`
+column, written unconditionally - a reason-less call clears the
+previously declared reason (none was declared). A `running` task
+whose `wait_until` stamp is still fresh SHALL render as a
+parked/waiting phase in `bridge status` - the per-session view reads
+PARKED with `external wait: <reason>` as its action (sourced from
+`wait_reason`, never the lifecycle `note`), the fleet row shows
+`ewait` in TSTAT and `waiting` in STATE, and `--json` carries
+`wait_until`/`wait_reason` - without any lifecycle change.
+Un-parking is a mail delivery, not a status flip:
+a `bridge notice` or `bridge directive` to the session wakes it, and
+the waiter drains and finishes/fails the task itself. No external
+poller (GitHub, CI) is part of the design - the resolution signal
+comes from the side that knows the condition resolved.
 
 #### Scenario: wait beats expiry
 
 - **WHEN** the lease owner calls `bridge wait <task_id>` before expiry
 - **THEN** `lease_expires_at` moves out by one lease length
 - **AND** a dead claimer that stops waiting requeues within one period
+
+#### Scenario: fresh wait stamp reads parked, stale decays alone
+
+- **WHEN** a `running` task's `wait_until` is still ahead of now
+- **THEN** `bridge status` shows the external-wait phase with its
+  declared `wait_reason` in the human view and `--json` - a stale
+  lifecycle `note` (e.g. `lease expired`) never renders as the cause
+- **AND** once the stamp ages past now the row reads `running` again
+  with no clearing write
+
+### Requirement: status digest reports lease and wait pressure
+
+The `bridge status` 24h digest SHALL count `lease_expired` - tasks
+whose `lease_expired_at` stamp (written by every `requeue_or_fail`
+fold, never cleared) sits inside the window - and
+SHALL report `waiting_external`, a current-snapshot gauge of
+`running` tasks whose `wait_until` stamp is still fresh. Both fields
+SHALL appear in the human footer (`waiting-external` only when >0)
+and in the `--json` payload.
+
+#### Scenario: expiry and parked waiter are countable
+
+- **WHEN** a lease fold requeues a task inside 24h and another task
+  is wait-parked right now
+- **THEN** the digest counts each under `lease_expired` and
+  `waiting_external` respectively
+- **AND** a sticky `lease expired` note without the stamp and stamps
+  already past the window are not counted
 
 ### Requirement: operator kill force-fails one live task
 
