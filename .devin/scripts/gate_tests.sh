@@ -38,6 +38,8 @@
 #   T32 scope gate inspects the OLD path of a rename too
 #   T33 cyrillic under an exempt path (.devin/agents/) is allowed
 #   T34 malformed project.json fails closed
+#   T36 .devin/ paths exempt from attribution class only (canon
+#       self-trip fix); secret still fires there
 #   T35 DRY_RUN_CMD env var is ignored; only the project.json-declared
 #       migration_dry_run_cmd runs
 # Exits non-zero if any expectation fails. Run from anywhere:
