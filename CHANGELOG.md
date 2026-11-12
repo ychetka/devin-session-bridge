@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.15.2] - 2026-11-12
+
+### User-facing
+
+_No user-visible changes._
+
+### Codebase
+
+#### tooling
+- [chore] Cleaned the .devin/.gitignore inventory drift (PR #156 residual): the blanket '.devin/' and '.windsurfrules' entries were replaced with precise local-only patterns (roadmap.md, tasks/, cycle_log.jsonl*, harness_log.jsonl, SESSION_STATE.md, hooks.v1.json, archive/, migration_ok stamp), and the remaining canon files that the blanket rule had been silently hiding are now tracked - .devin/agents/{git,hygiene}.md, .devin/config.json (generic permissions list, no machine paths), and 11 scripts (check_setup, cycle_log, session_audit, verify_constraints, ship_push, repo_issue_create, repo_issue_close, repo_pr_open, repo_status_check, repo_read, repo_branch_delete). Why: every .windsurfrules reference now resolves to a tracked file and every repository-agent contract verb maps to a tracked repo_*.sh wrapper, so the agent contract is no longer fail-closed on a fresh clone; local-only session state stays ignored by exact path. (issue #157)
+
 ## [0.15.1] - 2026-11-12
 
 ### User-facing
