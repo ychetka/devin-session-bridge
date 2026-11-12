@@ -1,0 +1,18 @@
+name: version-tag
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Assert pyproject version has a release tag
+        run: bash tools/check_version_tag.sh 600
