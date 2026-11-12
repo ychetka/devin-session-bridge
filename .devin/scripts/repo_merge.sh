@@ -85,6 +85,72 @@ print(json.dumps({"status": "blocked", "failure_class": "missing_changes_entry",
   exit 1
 fi
 
+# Version-bump gate (developer ruling 2026-11-12, incident
+# no_version_change): every merged PR must bump [project].version in
+# pyproject.toml - merges are versioned releases by policy.
+# Previously a missing bump only skipped the release step silently
+# (Shared Person PRs #126/#128 landed task work untagged).
+# Exemptions: (a) PR labeled "no-release" (explicit fixup to an
+# existing task), (b) diffs confined to non-shipping paths (.devin/,
+# docs/, .changes/, CHANGELOG.md, root README/LICENSE, .gitignore,
+# .github/). A non-exempt PR without a version bump is blocked BEFORE
+# merge with failure_class=version_not_bumped.
+VERGATE=$(PR="$PR" python3 - <<'PY'
+import json, os, re, subprocess
+pr = os.environ["PR"]
+
+def run(cmd):
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    return r.stdout.strip()
+
+labels = json.loads(
+    run(["gh", "pr", "view", pr, "--json", "labels",
+         "--jq", "[.labels[].name]"]) or "[]")
+files = json.loads(
+    run(["gh", "api", f"repos/{{owner}}/{{repo}}/pulls/{pr}/files",
+         "--paginate", "--jq", "[.[] | {filename, patch}]"]) or "[]")
+
+EXEMPT = re.compile(
+    r"^(\.devin/|docs/|\.changes/|\.github/|CHANGELOG\.md$"
+    r"|README[^/]*$|LICENSE[^/]*$|\.gitignore$)")
+exempt_paths = bool(files) and all(
+    EXEMPT.match(f["filename"]) for f in files)
+bumped = False
+ver_re = re.compile(r'version\s*=\s*["\']([^"\']+)')
+for f in files:
+    if f["filename"] != "pyproject.toml" or not f.get("patch"):
+        continue
+    nv, ov = set(), set()
+    for line in f["patch"].splitlines():
+        if line.startswith("+") and not line.startswith("+++"):
+            m = ver_re.search(line[1:])
+            if m: nv.add(m.group(1))
+        elif line.startswith("-") and not line.startswith("---"):
+            m = ver_re.search(line[1:])
+            if m: ov.add(m.group(1))
+    if nv and nv != ov:
+        bumped = True
+print(json.dumps({
+    "bumped": bumped,
+    "exempt": exempt_paths or ("no-release" in labels),
+    "exempt_paths_only": exempt_paths,
+    "no_release_label": "no-release" in labels,
+    "file_count": len(files)}))
+PY
+)
+VERGATE_OK=$(echo "$VERGATE" | python3 -c 'import json,sys
+try: g=json.load(sys.stdin)
+except Exception: print("no"); raise SystemExit(0)
+print("yes" if g["bumped"] or g["exempt"] else "no")')
+if [ "$VERGATE_OK" != "yes" ]; then
+  echo "$VERGATE" | python3 -c 'import json,sys
+try: g=json.load(sys.stdin)
+except Exception: g={}
+print(json.dumps({"status":"blocked","failure_class":"version_not_bumped",
+                  "gate_report":{"version":g}}))'
+  exit 1
+fi
+
 # Capture the pre-merge base head BEFORE merging: comparing
 # [project].version at this sha vs the post-merge head detects a
 # version-bump merge for any merge method (squash, merge, rebase) -
@@ -109,10 +175,11 @@ fi
 # incident - same fix ported here, issue #155): when the merge changed
 # [project].version on the base head, the release step is part of the
 # merge operation, not a separate agent duty - merges done through
-# this wrapper can no longer land untagged versions. Merges that did
-# not bump the version produce no tag on purpose (docs/fix PRs never
-# meant a release train step). Human merges via the GitHub UI are
-# covered by the version-tag CI check instead.
+# this wrapper can no longer land untagged versions. A merge that
+# reaches this point without a bump is EXEMPT by the pre-merge gate
+# above (no-release label or non-shipping paths only) and produces
+# no tag on purpose. Human merges via the GitHub UI are covered by
+# the version-tag CI check instead.
 export RELEASE='"skipped"'
 if ! git fetch "$REMOTE" "$BASE" >/dev/null 2>&1; then
   RELEASE='{"status":"skipped","reason":"fetch_failed"}'
