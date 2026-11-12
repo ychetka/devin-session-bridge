@@ -3329,3 +3329,207 @@ def test_issue121_staged_self_claim_exempt(db_path, monkeypatch):
     assert db.get_task(t1, path=db_path)["status"] == "running"
     assert not db.claim_queued(t2, "w2", Transport.HOOK_QUEUE, path=db_path)
     assert db.get_task(t2, path=db_path)["status"] == "queued"
+
+
+# --- issue #153: thrash circuit breaker ---------------------------------------
+
+
+def _refail(path, task_id, owner="w1"):
+    """One fix-fail cycle on a failed task: retry, re-claim, fail again."""
+    assert db.retry(task_id, path=path)
+    assert db.claim_queued(task_id, owner, "acp-push", path=path)
+    assert db.mark_running(task_id, owner, path=path)
+    assert db.finish_task(task_id, owner, False, note="boom", path=path)
+
+
+def _streak_to_limit(path, task_id):
+    """Drive a fresh running task's fail_streak to THRASH_LIMIT."""
+    assert db.finish_task(task_id, "w1", False, note="boom", path=path)
+    for _ in range(db.THRASH_LIMIT - 1):
+        _refail(path, task_id)
+
+
+def _thrash_escalations(path):
+    return [r for r in db.list_open_escalations(path=path) if r["doa_trigger"] == "thrash_breaker"]
+
+
+def test_issue153_gwt1_fail_streak_counts_failures_and_resets(db_path):
+    """[ISSUE-153.GWT-1] finish --fail increments the streak, a plain
+    retry preserves it (a requeue is not an outcome), a second failure
+    grows it, and finish ok resets it."""
+    tid = _enqueue_running(db_path, "s1", "w1")
+    assert db.get_task(tid, path=db_path)["fail_streak"] == 0
+
+    # WHEN the run finishes failed, the streak counts the outcome
+    assert db.finish_task(tid, "w1", False, note="boom", path=db_path)
+    assert db.get_task(tid, path=db_path)["fail_streak"] == 1
+
+    # AND a plain retry requeues without touching the streak
+    assert db.retry(tid, path=db_path)
+    assert db.get_task(tid, path=db_path)["fail_streak"] == 1
+
+    # WHEN the retried run fails again, the streak grows
+    assert db.claim_queued(tid, "w1", "acp-push", path=db_path)
+    assert db.mark_running(tid, "w1", path=db_path)
+    assert db.finish_task(tid, "w1", False, note="boom again", path=db_path)
+    assert db.get_task(tid, path=db_path)["fail_streak"] == 2
+
+    # WHEN a run finally finishes ok, the streak resets
+    assert db.retry(tid, path=db_path)
+    assert db.claim_queued(tid, "w1", "acp-push", path=db_path)
+    assert db.mark_running(tid, "w1", path=db_path)
+    assert db.finish_task(tid, "w1", True, path=db_path)
+    row = db.get_task(tid, path=db_path)
+    assert row["status"] == "done"
+    assert row["fail_streak"] == 0
+
+
+def test_issue153_gwt2_terminal_fold_increments_streak(db_path):
+    """[ISSUE-153.GWT-2] a terminal wedge fold (lease expiry, dead
+    worker) is a task-level failure and increments the streak; the
+    non-terminal requeue branch does not touch it."""
+    # GIVEN a task whose attempt budget is exhausted
+    tid = _enqueue_running(db_path, "s1", "w1")
+    _exec(db_path, "UPDATE tasks SET attempt=? WHERE id=?", (MAX_ATTEMPTS - 1, tid))
+    _expire(db_path, tid)
+    # WHEN the expired lease folds terminally, the streak counts it
+    assert db.requeue_or_fail(tid, note="lease expired", path=db_path) == TaskStatus.FAILED
+    row = db.get_task(tid, path=db_path)
+    assert row["status"] == "failed"
+    assert row["fail_streak"] == 1
+
+    # AND the dead-worker fold increments the same way
+    tid2 = _enqueue_running(db_path, "s2", "w1")
+    _exec(db_path, "UPDATE tasks SET attempt=? WHERE id=?", (MAX_ATTEMPTS - 1, tid2))
+    assert db.requeue_dead_worker(tid2, note="worker dead", path=db_path) == TaskStatus.FAILED
+    assert db.get_task(tid2, path=db_path)["fail_streak"] == 1
+
+    # BUT the non-terminal requeue branch leaves the streak alone
+    tid3 = _enqueue_running(db_path, "s3", "w1")
+    _expire(db_path, tid3)
+    assert db.requeue_or_fail(tid3, path=db_path) == TaskStatus.QUEUED
+    assert db.get_task(tid3, path=db_path)["fail_streak"] == 0
+
+
+def test_issue153_gwt3_retry_refused_at_threshold(db_path):
+    """[ISSUE-153.GWT-3] once fail_streak reaches THRASH_LIMIT a plain
+    retry loses its CAS - the task stays failed."""
+    tid = _enqueue_running(db_path, "s1", "w1")
+    _streak_to_limit(db_path, tid)
+    row = db.get_task(tid, path=db_path)
+    assert row["status"] == "failed"
+    assert row["fail_streak"] == db.THRASH_LIMIT
+
+    # WHEN a plain retry is attempted at the limit, the CAS refuses
+    assert db.retry(tid, path=db_path) is False
+    row = db.get_task(tid, path=db_path)
+    assert row["status"] == "failed"
+    assert row["fail_streak"] == db.THRASH_LIMIT
+
+
+def test_issue153_gwt4_force_retry_unparks(db_path):
+    """[ISSUE-153.GWT-4] a forced retry skips the breaker guard, lands
+    the task queued, and zeroes the streak in the same write."""
+    tid = _enqueue_running(db_path, "s1", "w1")
+    _streak_to_limit(db_path, tid)
+
+    # WHEN the operator forces the retry, the manual unpark lands
+    assert db.retry(tid, force=True, path=db_path) is True
+    row = db.get_task(tid, path=db_path)
+    assert row["status"] == "queued"
+    assert row["attempt"] == 0
+    assert row["fail_streak"] == 0
+
+
+def test_issue153_gwt5_trip_journals_once_per_task(db_path):
+    """[ISSUE-153.GWT-5] a trip appends the thrash_breaker decision
+    event, writes the ESCALATION audit row and notifies the
+    orchestrator - all first-observation-only except the event."""
+    db.register("orc", "/repo/ctl", role="orchestrator", path=db_path)
+    tid = _enqueue_running(db_path, "s1", "w1")
+    _streak_to_limit(db_path, tid)
+
+    # WHEN the breaker trips, the three records land atomically
+    trip = db.trip_thrash_breaker(tid, path=db_path)
+    assert trip is not None
+    assert trip["first"] is True
+    assert trip["notified"] is True
+    assert trip["fail_streak"] == db.THRASH_LIMIT
+
+    # decision_events row carries the structured trip record
+    events = db.list_events(kind="thrash_breaker", path=db_path)
+    assert len(events) == 1
+    body = json.loads(events[0]["body"])
+    assert body["task_id"] == tid
+    assert body["session_id"] == "s1"
+    assert body["fail_streak"] == db.THRASH_LIMIT
+    assert body["threshold"] == db.THRASH_LIMIT
+
+    # ESCALATION row summarizes the failure run and the unpark paths
+    esc = db.get_audit_event(trip["escalation_id"], path=db_path)
+    assert esc["kind"] == AuditEventKind.ESCALATION.value
+    assert esc["doa_trigger"] == "thrash_breaker"
+    assert esc["task_id"] == tid
+    assert esc["directive"] is None
+    assert str(tid) in esc["question_text"]
+    assert "--force" in esc["question_text"]
+
+    # the registered orchestrator gets the NOTICE
+    notices = db.unrelayed_notifications("orc", path=db_path)
+    assert len(notices) == 1
+    assert notices[0]["kind"] == NotificationKind.NOTICE.value
+    assert "thrash_breaker" in notices[0]["body"]
+
+    # WHEN the trip is observed again (e.g. a refused retry), the
+    # event journals but the escalation is reused, not duplicated
+    trip2 = db.trip_thrash_breaker(tid, path=db_path)
+    assert trip2["first"] is False
+    assert trip2["notified"] is False
+    assert trip2["escalation_id"] == trip["escalation_id"]
+    assert len(db.list_events(kind="thrash_breaker", path=db_path)) == 2
+    assert len(db.unrelayed_notifications("orc", path=db_path)) == 1
+    assert len(_thrash_escalations(db_path)) == 1
+
+
+def test_issue153_gwt6_trip_skips_notice_without_orchestrator(db_path):
+    """[ISSUE-153.GWT-6] with no registered orchestrator the trip still
+    lands its escalation - only the notice is skipped."""
+    tid = _enqueue_running(db_path, "s1", "w1")
+    assert db.finish_task(tid, "w1", False, note="boom", path=db_path)
+    _exec(db_path, "UPDATE tasks SET fail_streak=? WHERE id=?", (db.THRASH_LIMIT, tid))
+
+    trip = db.trip_thrash_breaker(tid, path=db_path)
+    assert trip is not None
+    assert trip["first"] is True
+    assert trip["notified"] is False
+    assert len(_thrash_escalations(db_path)) == 1
+
+
+def test_issue153_gwt7_disabled_threshold_turns_breaker_off(db_path, monkeypatch):
+    """[ISSUE-153.GWT-7] SB_THRASH_LIMIT<=0 disables the breaker: no
+    CAS guard, no trip writes."""
+    monkeypatch.setattr(db, "THRASH_LIMIT", 0)
+    tid = _enqueue_running(db_path, "s1", "w1")
+    assert db.finish_task(tid, "w1", False, note="boom", path=db_path)
+    _exec(db_path, "UPDATE tasks SET fail_streak=? WHERE id=?", (99, tid))
+
+    # a plain retry at an absurd streak still passes - no guard
+    assert db.retry(tid, path=db_path) is True
+    # and the trip helper never fires
+    assert db.claim_queued(tid, "w1", "acp-push", path=db_path)
+    assert db.mark_running(tid, "w1", path=db_path)
+    assert db.finish_task(tid, "w1", False, note="boom", path=db_path)
+    assert db.trip_thrash_breaker(tid, path=db_path) is None
+    assert db.list_events(kind="thrash_breaker", path=db_path) == []
+    assert _thrash_escalations(db_path) == []
+
+
+def test_issue153_gwt8_trip_below_threshold_is_noop(db_path):
+    """[ISSUE-153.GWT-8] the trip helper refuses below the limit - no
+    writes at all."""
+    tid = _enqueue_running(db_path, "s1", "w1")
+    assert db.finish_task(tid, "w1", False, note="boom", path=db_path)
+    assert db.trip_thrash_breaker(tid, path=db_path) is None
+    assert db.trip_thrash_breaker(9999, path=db_path) is None
+    assert db.list_events(kind="thrash_breaker", path=db_path) == []
+    assert _thrash_escalations(db_path) == []

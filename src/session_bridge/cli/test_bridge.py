@@ -3912,3 +3912,126 @@ def test_item121_gwt3_status_surfaces_slots(env, monkeypatch):
     assert out["data"]["session_slots"] == {"active": 1, "max": 1}
     assert out["data"]["slot_wait"] >= 1
     assert out["data"]["slot_wait_reason"] == "MAX_ACTIVE_SESSIONS_REACHED"
+
+
+# --- issue #153: thrash circuit breaker ---------------------------------------
+
+
+def _thrash_escalations(db_path):
+    return [
+        r for r in db.list_open_escalations(path=db_path) if r["doa_trigger"] == "thrash_breaker"
+    ]
+
+
+def test_issue153_gwt1_finish_fail_trips_breaker(env, capsys):
+    """[ISSUE-153.GWT-1] the Nth consecutive `finish --fail` trips the
+    breaker: decision event + open escalation + orchestrator NOTICE,
+    and the finish response reports the trip."""
+    db.register("orc1", "/repo/ctl", role="orchestrator", path=env.db)
+    db.set_session_mode(SID, SessionMode.MANAGED, path=env.db)
+    tid = _task(env)
+
+    out = None
+    for i in range(db.THRASH_LIMIT):
+        assert _run(["claim", str(tid), "--session", SID, "--json"], capsys)[0] == ExitCode.OK
+        rc, out = _run(
+            [
+                "finish",
+                str(tid),
+                "--session",
+                SID,
+                "--fail",
+                "--note",
+                f"gate red {i}",
+                "--json",
+            ],
+            capsys,
+        )
+        assert rc == ExitCode.OK
+        if i < db.THRASH_LIMIT - 1:
+            # a plain retry below the limit requeues as today
+            assert _run(["retry", str(tid), "--json"], capsys)[0] == ExitCode.OK
+
+    # the landing failure reported the trip in its response
+    trip = out["data"]["thrash_breaker"]
+    assert trip["fail_streak"] == db.THRASH_LIMIT
+    assert trip["first"] is True
+    assert trip["notified"] is True
+
+    escs = _thrash_escalations(env.db)
+    assert len(escs) == 1
+    assert escs[0]["id"] == trip["escalation_id"]
+    assert str(tid) in escs[0]["question_text"]
+
+    events = db.list_events(kind="thrash_breaker", path=env.db)
+    assert len(events) == 1
+    assert json.loads(events[0]["body"])["task_id"] == tid
+
+    notices = db.unrelayed_notifications("orc1", path=env.db)
+    assert any(
+        n["kind"] == NotificationKind.NOTICE.value and "thrash_breaker" in n["body"]
+        for n in notices
+    )
+
+
+def test_issue153_gwt2_retry_refused_then_force(env, capsys):
+    """[ISSUE-153.GWT-2] `bridge retry` at the limit conflicts with the
+    breaker explanation + escalation id; a repeated refuse journals a
+    second decision event but no duplicate escalation; `--force`
+    unparks with the streak reset."""
+    db.set_session_mode(SID, SessionMode.MANAGED, path=env.db)
+    tid = _task(env)
+    con = db.connect(env.db)
+    try:
+        con.execute(
+            "UPDATE tasks SET status='failed', fail_streak=? WHERE id=?",
+            (db.THRASH_LIMIT, tid),
+        )
+    finally:
+        con.close()
+
+    # WHEN a plain retry is attempted at the limit, it conflicts
+    rc, out = _run(["retry", str(tid), "--json"], capsys)
+    assert rc == ExitCode.CONFLICT
+    assert out["status"] == "thrash_breaker"
+    assert "thrash breaker" in out["error"]
+    escs = _thrash_escalations(env.db)
+    assert len(escs) == 1
+    assert out["data"]["escalation_id"] == escs[0]["id"]
+    assert db.get_task(tid, path=env.db)["status"] == TaskStatus.FAILED.value
+
+    # a second refused retry journals the observation but no new
+    # escalation
+    rc, out = _run(["retry", str(tid), "--json"], capsys)
+    assert rc == ExitCode.CONFLICT
+    assert out["data"]["escalation_id"] == escs[0]["id"]
+    assert len(_thrash_escalations(env.db)) == 1
+    assert len(db.list_events(kind="thrash_breaker", path=env.db)) == 2
+
+    # WHEN the operator forces it, the task unparks cleared
+    rc, out = _run(["retry", str(tid), "--force", "--json"], capsys)
+    assert rc == ExitCode.OK
+    row = db.get_task(tid, path=env.db)
+    assert row["fail_streak"] == 0
+    assert row["attempt"] == 0
+    assert row["status"] != TaskStatus.FAILED.value
+
+
+def test_issue153_gwt3_disabled_threshold(env, capsys, monkeypatch):
+    """[ISSUE-153.GWT-3] SB_THRASH_LIMIT<=0 disables the breaker: the
+    plain retry passes and nothing is journaled."""
+    monkeypatch.setattr(db, "THRASH_LIMIT", 0)
+    tid = _task(env)
+    con = db.connect(env.db)
+    try:
+        con.execute(
+            "UPDATE tasks SET status='failed', fail_streak=? WHERE id=?",
+            (99, tid),
+        )
+    finally:
+        con.close()
+
+    rc, _out = _run(["retry", str(tid), "--json"], capsys)
+    assert rc == ExitCode.OK
+    assert db.list_events(kind="thrash_breaker", path=env.db) == []
+    assert _thrash_escalations(env.db) == []

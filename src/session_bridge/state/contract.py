@@ -8,6 +8,12 @@ status lifecycle, the lease fields and the retry boundary:
   outgoing edges, so an auto-requeue after ``failed`` is not expressible.
 - the manual ``retry`` command (``Task.retry``) is the only exit from
   ``failed``: it moves the task back to ``queued`` and resets ``attempt``.
+  Because ``attempt`` resets on every retry, it cannot bound a
+  fix-fail-fix loop - ``tasks.fail_streak`` (issue #153, db layer)
+  closes that gap: consecutive failure outcomes (``finish --fail``,
+  terminal wedge folds) count up until a ``done`` or a forced retry
+  resets them, and the thrash breaker refuses a plain retry at
+  ``SB_THRASH_LIMIT`` (default 3).
 
 Message bus schema v2 (item_13a) extends the contract with the
 orchestration protocol tables: session roles/modes, the question
@@ -260,7 +266,11 @@ class Task(BaseModel):
 
         Resets ``attempt`` and clears the lease. Defined only for failed
         tasks; the automatic map has no edges out of ``failed``, so an
-        auto-retry after ``failed`` is not expressible.
+        auto-retry after ``failed`` is not expressible. The db layer
+        adds the thrash breaker on top of this edge (issue #153): the
+        CAS refuses while ``fail_streak >= SB_THRASH_LIMIT`` unless the
+        caller forces the retry, which is the manual unpark and zeroes
+        the streak in the same write.
         """
         if self.status is not TaskStatus.FAILED:
             raise ValidationError.from_exception_data(
