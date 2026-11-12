@@ -10,6 +10,7 @@ cd "$TOP"
 
 ISSUE="${1:?usage: repo_issue_comment.sh <issue_number> --body \"<text>\"}"
 shift || true
+[[ "$ISSUE" =~ ^[0-9]+$ ]] || { echo '{"status":"error","failure_class":"malformed_input","message":"issue_number must be numeric"}'; exit 2; }
 BODY=""
 while [ $# -gt 0 ]; do
   case "$1" in

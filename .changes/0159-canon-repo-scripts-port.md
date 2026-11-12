@@ -1,6 +1,6 @@
 ---
 type: chore
-scope: canon
+scope: cli
 user_visible: false
 breaking: false
 user_summary: "-"

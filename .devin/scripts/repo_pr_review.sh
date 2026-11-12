@@ -18,10 +18,14 @@ while [ $# -gt 0 ]; do
 done
 [ -n "$PR" ] && [ -n "$EVENT" ] || {
   echo '{"status":"error","failure_class":"malformed_input","message":"--pr and --event required"}'; exit 2; }
+[[ "$PR" =~ ^[0-9]+$ ]] || { echo '{"status":"error","failure_class":"malformed_input","message":"--pr must be numeric"}'; exit 2; }
 case "$EVENT" in
   approve|request-changes|comment) ;;
   *) echo '{"status":"error","failure_class":"malformed_input","message":"--event must be approve|request-changes|comment"}'; exit 2 ;;
 esac
+if [ "$EVENT" = "comment" ] && [ -z "$BODY" ]; then
+  echo '{"status":"error","failure_class":"malformed_input","message":"--body required for comment event"}'; exit 2
+fi
 
 if [ -n "$BODY" ]; then
   HYGIENE_OUT=$(printf '%s\n' "$BODY" | "$DEVIN_DIR/scripts/hygiene_check.sh")
