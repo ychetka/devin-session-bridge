@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.15.5] - 2026-11-12
+
+### Codebase
+
+#### tooling
+- [fix] repo_merge.sh now blocks merges that touch shipping paths (src/, pyproject.toml, uv.lock) without bumping [project].version - pre-merge `version_not_bumped` failure per the developer ruling of 2026-11-12 (issue #161). Exemptions: non-shipping-only diffs and PRs labeled `no-release`; post-merge release flow unchanged. (issue #161)
+
 ## [0.15.2] - 2026-11-12
 
 ### User-facing
