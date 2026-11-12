@@ -8,16 +8,30 @@ cd "$TOP"
 
 PR="${1:?usage: repo_status_check.sh <pr_number>}"
 
-gh pr view "$PR" --json statusCheckRollup,mergeable,reviews 2>/dev/null \
-| python3 -c '
-import json, sys
-d = json.load(sys.stdin)
+GH_OUT=$(gh pr view "$PR" --json statusCheckRollup,mergeable,reviews 2>/dev/null) || {
+  echo '{"status":"error","failure_class":"upstream_error","message":"gh pr view failed"}'
+  exit 1
+}
+GH_OUT="$GH_OUT" python3 -c '
+import json, os, sys
+try:
+    d = json.loads(os.environ["GH_OUT"])
+except Exception:
+    print(json.dumps({"status":"error","failure_class":"upstream_error",
+                      "message":"unparseable gh output"}))
+    sys.exit(1)
 checks = [{"name": c.get("name") or c.get("context","?"),
            "state": c.get("conclusion") or c.get("state","?")}
           for c in (d.get("statusCheckRollup") or [])]
 mergeable = d.get("mergeable") == "MERGEABLE"
-approved = any(r.get("state") == "APPROVED"
-               for r in (d.get("reviews") or []))
+latest = {}
+for r in (d.get("reviews") or []):
+    author = (r.get("author") or {}).get("login", "?")
+    state = r.get("state")
+    if state in ("APPROVED", "CHANGES_REQUESTED"):
+        latest[author] = state
+approved = (any(v == "APPROVED" for v in latest.values())
+            and not any(v == "CHANGES_REQUESTED" for v in latest.values()))
 print(json.dumps({"checks": checks, "mergeable": mergeable,
                   "approved": approved, "status": "ok"}))
 '

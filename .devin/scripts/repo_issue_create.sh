@@ -9,6 +9,7 @@ cd "$TOP"
 
 TITLE=""; BODY=""; LABELS=""
 while [ $# -gt 0 ]; do
+  [ $# -ge 2 ] || { echo "missing value for $1" >&2; exit 2; }
   case "$1" in
     --title) TITLE=$2;; --body) BODY=$2;; --labels) LABELS=$2;;
     *) echo "unknown arg $1" >&2; exit 2;;

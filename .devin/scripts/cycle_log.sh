@@ -33,6 +33,7 @@ flock 9 || { echo "cycle_log: cannot acquire lock" >&2; exit 1; }
 if [ "$CMD" = "append" ]; then
   ITEM=meta; ACTOR=root; ACTION=""; EXPECTED=""; RESULT=""; STATUS=closed; VERDICT=ok; FC=""
   while [ $# -gt 0 ]; do
+    [ $# -ge 2 ] || usage
     case "$1" in
       --item) ITEM=$2;; --actor) ACTOR=$2;; --action) ACTION=$2;;
       --expected) EXPECTED=$2;; --result) RESULT=$2;;
@@ -59,9 +60,11 @@ PY
 elif [ "$CMD" = "close" ]; then
   ITEM=""; ACTOR=""; VERDICT=""; NOTE=""; DRY=""
   while [ $# -gt 0 ]; do
+    case "$1" in --dry-run) DRY=1; shift; continue;; esac
+    [ $# -ge 2 ] || usage
     case "$1" in
       --item) ITEM=$2;; --actor) ACTOR=$2;; --verdict) VERDICT=$2;;
-      --note) NOTE=$2;; --dry-run) DRY=1; shift; continue;; *) usage;;
+      --note) NOTE=$2;; *) usage;;
     esac; shift 2
   done
   [ -n "$ACTOR" ] || { echo "close: --actor required"; exit 2; }

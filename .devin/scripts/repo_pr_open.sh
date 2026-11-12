@@ -10,6 +10,7 @@ cd "$TOP"
 
 BRANCH=""; BASE=""; ISSUE=""; TITLE=""; BODY=""
 while [ $# -gt 0 ]; do
+  [ $# -ge 2 ] || { echo "missing value for $1" >&2; exit 2; }
   case "$1" in
     --branch) BRANCH=$2;; --base) BASE=$2;; --issue) ISSUE=$2;;
     --title) TITLE=$2;; --body) BODY=$2;;
@@ -19,6 +20,12 @@ done
 [ -n "$BRANCH" ] && [ -n "$TITLE" ] || {
   echo '{"status":"error","failure_class":"malformed_input","message":"--branch and --title required"}'; exit 2; }
 [ -n "$BASE" ] || BASE=$(gh repo view --json defaultBranchRef -q .defaultBranchRef.name 2>/dev/null || echo main)
+
+if [ -n "$ISSUE" ] && ! printf '%s' "$BODY" | grep -qiE "(closes|fixes|resolves)[[:space:]]+#$ISSUE([^0-9]|$)"; then
+  BODY="${BODY:+$BODY
+
+}Closes #$ISSUE"
+fi
 
 HYGIENE_OUT=$(printf '%s\n%s\n' "$TITLE" "$BODY" | "$DEVIN_DIR/scripts/hygiene_check.sh")
 if [ $? -ne 0 ]; then

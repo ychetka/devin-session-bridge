@@ -1,1 +1,13 @@
-{"text_language":"en"}
+{
+  "repo": "ychetka/devin-session-bridge",
+  "text_language": "en",
+  "cyrillic_paths": [
+    ".devin/agents/",
+    ".windsurfrules",
+    "controller-manager/"
+  ],
+  "protected_paths": [
+    ".devin/",
+    ".windsurfrules"
+  ]
+}

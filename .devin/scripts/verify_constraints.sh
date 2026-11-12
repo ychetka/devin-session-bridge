@@ -77,10 +77,11 @@ if [ -f "$PJ" ]; then
   done < <(python3 -c "import json;[print(p) for p in json.load(open('$PJ')).get('protected_paths',[])]" 2>/dev/null)
 fi
 
-# 5. No stray untracked files (local infra artifacts are exempt:
-#    .devin/ and .windsurfrules are local-only by design)
+# 5. No stray untracked files (mid-migration scratch docs are exempt;
+#    true local-only .devin state is covered by .gitignore, so a new
+#    untracked .devin canon file still surfaces here)
 UNTRACKED=$(git status --porcelain | grep '^??' \
-            | grep -vE '\.devin/|\.windsurfrules' || true)
+            | grep -vE 'scope_whitelist\.txt|migration_rollforward\.md' || true)
 [ -z "$UNTRACKED" ] \
   && pass "tree clean (no untracked)" \
   || fail "untracked files present" "commit intended ones, remove leftovers"

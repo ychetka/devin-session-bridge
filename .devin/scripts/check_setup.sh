@@ -40,11 +40,13 @@ PY
   if [ $? -eq 0 ]; then ok "project.json schema"; else fails=$((fails+1)); fi
 fi
 
+before=$fails
 for f in agents/git.md agents/repository.md agents/hygiene.md; do
   [ -f "$DEVIN_DIR/$f" ] || fail "missing .devin/$f"
 done
-ok "agent profiles"
+[ $fails -eq $before ] && ok "agent profiles"
 
+before=$fails
 for s in check_setup.sh hygiene_check.sh cycle_log.sh \
          verify_constraints.sh ship_commit.sh ship_push.sh \
          repo_issue_create.sh repo_issue_close.sh repo_pr_open.sh \
@@ -52,15 +54,15 @@ for s in check_setup.sh hygiene_check.sh cycle_log.sh \
          repo_release.sh repo_branch_delete.sh session_audit.sh; do
   [ -x "$DEVIN_DIR/scripts/$s" ] || fail "missing/not executable: .devin/scripts/$s"
 done
-ok "wrapper scripts"
+[ $fails -eq $before ] && ok "wrapper scripts"
 
+before=$fails
 for bin in gh git python3; do
   command -v "$bin" >/dev/null || fail "missing binary: $bin"
 done
-ok "binaries: gh git python3"
+[ $fails -eq $before ] && ok "binaries: gh git python3"
 
-gh auth status >/dev/null 2>&1 || fail "gh not authenticated"
-ok "gh auth"
+if gh auth status >/dev/null 2>&1; then ok "gh auth"; else fail "gh not authenticated"; fi
 
 
 # canary check: .windsurfrules must end with the canary token - if it is
