@@ -21,6 +21,13 @@ release:      IN {part?: patch|minor|major|auto}
 repo_read:    IN {what: pr|issue|checks|reviews|diff|releases|tags, ref}
               (releases|tags ref-free; releases latest = newest)
               -> OUT {data, status}
+issue_close:  IN {issue_number} -> OUT {issue_id, status}
+issue_comment: IN {issue_number, body}
+              -> OUT {issue_id, url, status}
+pr_review:    IN {pr_number, event: approve|request-changes|comment,
+                  body?}
+              -> OUT {pr_number, event, status}
+branch_delete: IN {branch} -> OUT {branch, status}
 
 ## Правила
 
