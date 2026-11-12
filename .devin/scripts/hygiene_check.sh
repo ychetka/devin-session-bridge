@@ -155,6 +155,14 @@ for i, (line, path) in enumerate(items(), 1):
         if base.endswith(".lock") or base in LOCKFILE_NAMES:
             continue
     for pattern, cls, hint in rules:
+        # Canon rule-source files under .devin/ legitimately carry
+        # attribution-pattern examples (they define the detection
+        # rules) - exempt them from the attribution class only.
+        # Secret patterns still scan everywhere: a real key in a
+        # .devin file must keep tripping the gate.
+        if (cls == "attribution" and path is not None
+                and path.startswith(".devin/")):
+            continue
         if re.search(pattern, line, re.IGNORECASE):
             hit(cls, pattern, i, hint, path)
     exempt = path is not None and any(
