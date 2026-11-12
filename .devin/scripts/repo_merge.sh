@@ -79,11 +79,58 @@ print(json.dumps({"status": "blocked", "failure_class": "missing_changes_entry",
   exit 1
 fi
 
+# Capture the pre-merge base head BEFORE merging: comparing
+# [project].version at this sha vs the post-merge head detects a
+# version-bump merge for any merge method (squash, merge, rebase) -
+# a post-merge "base~1" would resolve to the PR's penultimate commit
+# on multi-commit rebase merges and silently read a bump as unchanged.
+# Canon adaptation (issue #155): upstream hardcodes origin, but this
+# repo's github remote may be named 'github' - resolve it the same
+# way repo_release.sh does.
+REMOTE=$(git remote get-url origin >/dev/null 2>&1 && echo origin \
+         || git remote -v | awk '$2 ~ /github\.com/ {print $1; exit}')
+git fetch "$REMOTE" "$BASE" >/dev/null 2>&1 || true
+PRE_MERGE_SHA=$(git rev-parse --verify -q "$REMOTE/$BASE" 2>/dev/null || true)
+
 ERR=$(gh pr merge "$PR" --"$METHOD" --match-head-commit "$EXPECTED" 2>&1)
 rc=$?
-if [ $rc -eq 0 ]; then
-  echo '{"status":"merged"}'
-else
+if [ $rc -ne 0 ]; then
   python3 -c 'import json,sys;print(json.dumps({"status":"error","failure_class":"upstream_error","message":sys.argv[1]}))' "$ERR"
   exit 1
 fi
+
+# Post-merge release (the devin-telegram 2026-11-12 version-drift
+# incident - same fix ported here, issue #155): when the merge changed
+# [project].version on the base head, the release step is part of the
+# merge operation, not a separate agent duty - merges done through
+# this wrapper can no longer land untagged versions. Merges that did
+# not bump the version produce no tag on purpose (docs/fix PRs never
+# meant a release train step). Human merges via the GitHub UI are
+# covered by the version-tag CI check instead.
+export RELEASE='"skipped"'
+if ! git fetch "$REMOTE" "$BASE" >/dev/null 2>&1; then
+  RELEASE='{"status":"skipped","reason":"fetch_failed"}'
+elif [ -z "$PRE_MERGE_SHA" ]; then
+  RELEASE='{"status":"skipped","reason":"pre_merge_sha_unknown"}'
+else
+  VER_AT() { git show "$1:pyproject.toml" 2>/dev/null | awk -F= '
+    /^\[project\]/ {inp=1; next} /^\[/ {inp=0}
+    inp && /^[[:space:]]*version[[:space:]]*=/ {
+      v=$2; gsub(/["'"'"'[:space:]]/, "", v); print v; exit }'; }
+  NEW_VER=$(VER_AT "$REMOTE/$BASE")
+  OLD_VER=$(VER_AT "$PRE_MERGE_SHA")
+  if [ -z "$NEW_VER" ]; then
+    RELEASE='{"status":"skipped","reason":"version_unparseable"}'
+  elif [ "$NEW_VER" = "$OLD_VER" ]; then
+    RELEASE='{"status":"skipped","reason":"no_version_change"}'
+  elif [ ! -x "$TOP/.devin/scripts/repo_release.sh" ]; then
+    RELEASE='{"status":"skipped","reason":"repo_release_missing"}'
+  else
+    RELEASE=$(bash "$TOP/.devin/scripts/repo_release.sh" 2>&1 | tail -n 1)
+  fi
+fi
+python3 -c 'import json,os,sys
+raw = os.environ.get("RELEASE","{}")
+try: rel = json.loads(raw)
+except Exception: rel = {"status":"error","message":raw}
+print(json.dumps({"status":"merged","release":rel}))'

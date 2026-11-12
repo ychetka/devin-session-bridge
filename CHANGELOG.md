@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.15.1] - 2026-11-12
+
+### User-facing
+
+_No user-visible changes._
+
+### Codebase
+
+#### tooling
+- [feat] Ported the devin-telegram version-tag release automation (PR #183) - repo_release.sh now derives the tag from [project].version on the base head and fails on missing/unparseable pyproject, version-behind-latest-tag, or tag-exists-on-different-sha; repo_merge.sh gained a post-merge release block (pre-merge sha capture, structured skip reasons, release result folded into the merged JSON); new tools/check_version_tag.sh + version-tag.yml CI assert every merged version lands a remote tag. Why: The 2026-11-12 devin-telegram version-drift incident showed latest_tag+1 arithmetic and a release step decoupled from merge can land untagged versions - the same gap left sessions-bridge v0.14.0 untagged overnight. Canon adaptations: REMOTE detection (canon remote is 'github', not 'origin') in the new merge block, and the idempotent 'gh release view' early-exit kept from the pre-port repo_release. (issue #155)
+
 ## [0.15.0] - 2026-11-12
 
 ### User-facing
