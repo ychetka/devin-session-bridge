@@ -121,10 +121,17 @@ if [ -n "$SHIPPING" ]; then
   HAS_NORELEASE=$(INFO="$INFO" python3 -c 'import json,os
 labels = {l.get("name") for l in json.loads(os.environ["INFO"]).get("labels") or []}
 print("yes" if "no-release" in labels else "no")')
-  if [ "$HAS_NORELEASE" != "yes" ] && [ -n "$PRE_MERGE_SHA" ]; then
-    git fetch "$REMOTE" "pull/$PR/head:refs/merge-gate/pr-$PR" >/dev/null 2>&1 || true
+  if [ "$HAS_NORELEASE" != "yes" ]; then
+    [ -n "$PRE_MERGE_SHA" ] || {
+      echo '{"status":"error","failure_class":"upstream_error","message":"cannot resolve pre-merge base sha - refusing to merge a shipping diff"}'
+      exit 1
+    }
+    git fetch "$REMOTE" "$EXPECTED" >/dev/null 2>&1 || {
+      echo '{"status":"error","failure_class":"upstream_error","message":"cannot fetch PR head sha"}'
+      exit 1
+    }
     OLD_VER=$(VER_AT "$PRE_MERGE_SHA")
-    HEAD_VER=$(VER_AT "refs/merge-gate/pr-$PR")
+    HEAD_VER=$(VER_AT "$EXPECTED")
     if [ -n "$OLD_VER" ] && { [ -z "$HEAD_VER" ] || [ "$HEAD_VER" = "$OLD_VER" ]; }; then
       SHIPPING="$SHIPPING" OLD_VER="$OLD_VER" HEAD_VER="$HEAD_VER" python3 -c 'import json,os
 print(json.dumps({"status":"blocked","failure_class":"version_not_bumped",
