@@ -55,10 +55,16 @@ print(json.dumps(report))
 PY
 )
 
-OK=$(echo "$GATE" | python3 -c 'import json,sys;g=json.load(sys.stdin);print("yes" if all([g["head_match"],g["mergeable"],g["approved"],g["checks_green"]]) else "no")')
+OK=$(echo "$GATE" | python3 -c 'import json,sys
+try: g=json.load(sys.stdin)
+except Exception: print("no"); raise SystemExit(0)
+print("yes" if all([g["head_match"],g["mergeable"],g["approved"],g["checks_green"]]) else "no")')
 
 if [ "$OK" != "yes" ]; then
-  echo "$GATE" | python3 -c 'import json,sys;g=json.load(sys.stdin);fc="stale_head" if not g["head_match"] else "gate_blocked";print(json.dumps({"status":"blocked","failure_class":fc,"gate_report":g}))'
+  echo "$GATE" | python3 -c 'import json,sys
+try: g=json.load(sys.stdin)
+except Exception: g={"head_match":False,"unparseable_gate_report":True}
+fc="stale_head" if not g["head_match"] else "gate_blocked";print(json.dumps({"status":"blocked","failure_class":fc,"gate_report":g}))'
   exit 1
 fi
 

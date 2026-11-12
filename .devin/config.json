@@ -1,0 +1,25 @@
+{
+  "permissions": {
+    "deny": [
+      "Exec(git)",
+      "Exec(gh)",
+      "Exec(sudo)",
+      "Exec(bash -",
+      "Exec(sh -",
+      "Exec(zsh -",
+      "Exec(dash -",
+      "Exec(eval",
+      "Exec(env ",
+      "Exec(xargs ",
+      "Exec(time ",
+      "Exec(nohup ",
+      "Exec(command ",
+      "Exec(source "
+    ],
+    "allow": [
+      "Exec(.devin/scripts/)",
+      "Exec(./.devin/scripts/)",
+      "Exec(bridge)"
+    ]
+  }
+}
