@@ -404,6 +404,21 @@ echo '{"text_language":"en","migration_dry_run_cmd":"false"}' > "$SCRATCH/devin/
 cp "$SCRATCH/pj.bak" "$SCRATCH/devin/project.json"
 git reset -q && rm -f db/migrations/010_up.sql
 
+# --- T36: .devin/ attribution exemption (canon self-trip fix).
+# Rule-source files under .devin/ carry attribution-pattern examples
+# and must not trip the attribution class; secret class still scans
+# them, and attribution still fires outside .devin/.
+ATTR='generated'' with'
+printf 'diff --git a/.devin/agents/git.md b/.devin/agents/git.md\n+++ b/.devin/agents/git.md\n@@ -1,1 +1,1 @@\n+do not add "%s Devin" footer\n' "$ATTR" \
+  | "$HYG" --diff >"$SCRATCH/out" 2>&1
+expect T36a-devin-attribution-exempt 0 $?
+printf 'diff --git a/.devin/agents/git.md b/.devin/agents/git.md\n+++ b/.devin/agents/git.md\n@@ -1,1 +1,1 @@\n+KEY = "sk-%s"\n' 'abcdefghijklmnopqrst1234' \
+  | "$HYG" --diff >"$SCRATCH/out" 2>&1
+expect T36b-devin-secret-still-fails 1 $? "secret"
+printf 'diff --git a/docs/x.md b/docs/x.md\n+++ b/docs/x.md\n@@ -1,1 +1,1 @@\n+%s Devin\n' "$ATTR" \
+  | "$HYG" --diff >"$SCRATCH/out" 2>&1
+expect T36c-attribution-outside-devin 1 $? "attribution"
+
 echo "---"
 echo "gate_tests: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]
