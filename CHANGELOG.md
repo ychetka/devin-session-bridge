@@ -12,6 +12,13 @@
 #### cli
 - [feat] New `wake.acp_host.close_session` (forced `session/close` with `cognition.ai/force` meta, honest idle/confirmed/requested outcomes), a new `stop` package implementing the attributed /proc orphan sweep (backend-tree descendants attributed by workspace cwd or sid markers; backend, acp-host supervisor, MCP servers and foreign sessions excluded; SIGTERM -> grace -> SIGKILL), a `bridge stop` CLI command, `kill --hard-stop`/`--dry-run` flags, `db.kill_session(stop_report=...)` folding layer outcomes into `session_killed`, and a `session_stopped` decision event. Why: The 2026-11-12 incident showed `bridge kill <sid>` only tore down bridge state while the Devin Desktop session kept running - spawning subagents, dialing tools, writing artifacts. The layered design (docs/SESSION_HARD_STOP.md) stops the session honestly: cancel first, forced close second, a conservative attributed sweep only under --hard, and the bus teardown last for kill --hard-stop - every layer reports observed state, never a claim inferred from delivery. (issue #164, task 339, docs/SESSION_HARD_STOP.md)
 
+## [0.15.6] - 2026-11-13
+
+### Codebase
+
+#### docs
+- [docs] Added `docs/SESSION_HARD_STOP.md`: root-cause analysis of the managed-session stop incident (kill is bus-state only, cancel wired only to `withdraw --stop-turn`, single shared `devin acp` backend owns all sessions) and the layered hard-stop design with implementation plan. (issue #164)
+
 ## [0.15.5] - 2026-11-12
 
 ### Codebase
