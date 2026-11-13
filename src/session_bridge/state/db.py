@@ -2454,7 +2454,7 @@ def unregister_session(session_id: str, *, force: bool = False, path=None) -> Un
     return _retry(op)
 
 
-def kill_session(session_id: str, *, path=None) -> KillVerdict:
+def kill_session(session_id: str, *, stop_report: dict | None = None, path=None) -> KillVerdict:
     """Force-terminate a session's live bridge state (task #210).
 
     The kill path for a session that must be detached NOW, without
@@ -2497,6 +2497,13 @@ def kill_session(session_id: str, *, path=None) -> KillVerdict:
     forever, so only a liveness verdict is revivable) - so cutting
     that off needs the process or its hooks stopped first, which is
     the operator's side of the contract.
+
+    ``stop_report`` (issue #164, ``bridge kill --hard-stop``) carries
+    the per-layer outcomes of the stop ladder that ran BEFORE this
+    transaction - ``cancel_outcome``, ``close_outcome`` and the swept
+    pid list - and folds them into the same ``session_killed`` event
+    body, so the durable audit cannot separate the process-level
+    evidence from the bus teardown that ran last.
     """
     ts = _now()
 
@@ -2562,14 +2569,27 @@ def kill_session(session_id: str, *, path=None) -> KillVerdict:
             ).fetchone()
             pinned = latest is not None and latest["kind"] == "session_killed"
             if flipped or requeued or staged or hb or not pinned:
+                body = (
+                    f"tasks_requeued={requeued} staged_folded={staged}"
+                    f" heartbeat_removed={bool(hb)}"
+                    f" status_before={row['status']} mode={row['mode']}"
+                )
+                if stop_report:
+                    swept = stop_report.get("swept") or []
+                    pids = ",".join(str(e.get("pid")) for e in swept[:20])
+                    body += (
+                        f" stop_cancel={stop_report.get('cancel_outcome')}"
+                        f" stop_close={stop_report.get('close_outcome')}"
+                        f" swept_pids=[{pids}]"
+                    )
+                    if stop_report.get("stop_exception"):
+                        body += f" stop_exception={stop_report['stop_exception']}"
                 con.execute(
                     "INSERT INTO decision_events(session_id,kind,body,created_at) VALUES (?,?,?,?)",
                     (
                         session_id,
                         "session_killed",
-                        f"tasks_requeued={requeued} staged_folded={staged}"
-                        f" heartbeat_removed={bool(hb)}"
-                        f" status_before={row['status']} mode={row['mode']}",
+                        body,
                         ts,
                     ),
                 )

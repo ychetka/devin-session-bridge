@@ -84,6 +84,7 @@ from session_bridge.cli.commands.sessions import (
     _cmd_kill,
     _cmd_register,
     _cmd_resume,
+    _cmd_stop,
     _cmd_unregister,
     _cmd_wake,
     _cmd_withdraw,
@@ -268,6 +269,51 @@ def _parse_args(argv) -> argparse.Namespace:
         ),
     )
     sp.add_argument("session_id")
+    sp.add_argument(
+        "--hard-stop",
+        action="store_true",
+        help=(
+            "session kill only: run the stop layers (cancel, forced"
+            " session/close, attributed sweep) BEFORE the bus teardown"
+        ),
+    )
+    sp.add_argument(
+        "--dry-run",
+        action="store_true",
+        help=(
+            "enumerate the stop layers and sweep victims without"
+            " signalling and without the bus teardown"
+        ),
+    )
+    _add_json(sp)
+
+    # issue #164: layered hard-stop - cancel -> forced close ->
+    # (--hard) attributed orphan sweep. Session/process level only;
+    # the bus row is untouched (kill owns the teardown). --dry-run
+    # enumerates victims without sending or signalling anything.
+    sp = sub.add_parser(
+        "stop",
+        help=(
+            "layered session stop: session/cancel, forced session/close,"
+            " and with --hard the attributed orphan sweep"
+        ),
+    )
+    sp.add_argument("session_id")
+    sp.add_argument(
+        "--hard",
+        action="store_true",
+        help=(
+            "also run the attributed orphan sweep (SIGTERM -> grace ->"
+            " SIGKILL) against backend-tree processes of this session"
+        ),
+    )
+    sp.add_argument(
+        "--dry-run",
+        action="store_true",
+        help=(
+            "enumerate layers and would-be sweep victims with reasons; sends and signals nothing"
+        ),
+    )
     _add_json(sp)
 
     # issue #142: audited orchestrator scope-pull - the benign
@@ -694,6 +740,7 @@ _HANDLERS = {
     "resume": _cmd_resume,
     "unregister": _cmd_unregister,
     "kill": _cmd_kill,
+    "stop": _cmd_stop,
     "withdraw": _cmd_withdraw,
     "daemon": _cmd_daemon,
     "register": _cmd_register,
