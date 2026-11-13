@@ -79,6 +79,17 @@ def _ctx(**kw):
     return SweepContext(**args)
 
 
+def _start_of(procs, overrides=None):
+    """Fake /proc starttime reader for the PID-reuse guard: returns
+    the enumeration-time start of each fabricated process (a pid not
+    in the table reads as gone). ``overrides`` simulates a recycled
+    pid - a DIFFERENT start read back at signal time."""
+    starts = {p.pid: p.start_seconds for p in procs}
+    if overrides:
+        starts.update(overrides)
+    return lambda pid: starts.get(pid)
+
+
 # --- backend resolution --------------------------------------------------------
 
 
@@ -200,10 +211,12 @@ def test_issue164_gwt7_dry_run_enumerates_never_signals():
     nothing."""
     ctx = _ctx()
     calls = []
+    procs = _fake_tree()
     res = sweep(
         ctx,
-        _fake_tree(),
+        procs,
         signaler=lambda pid, sig: calls.append((pid, sig)),
+        start_of=_start_of(procs),
         dry_run=True,
     )
     assert calls == []
@@ -225,12 +238,14 @@ def test_issue164_gwt8_term_then_kill_ordering():
     after the grace."""
     ctx = _ctx()
     calls = []
+    procs = _fake_tree()
     alive = {105, 106}  # 106's parent 104 dies on TERM; 106 + 105 survive
     res = sweep(
         ctx,
-        _fake_tree(),
+        procs,
         signaler=lambda pid, sig: calls.append((pid, sig)),
         gone=lambda pid: pid not in alive,
+        start_of=_start_of(procs),
         sleep=lambda s: calls.append(("sleep", s)),
         grace_seconds=2.0,
     )
@@ -257,15 +272,17 @@ def test_issue164_gwt9_plan_and_sweep_full_report():
     backend + acp-host pids and runs the sweep over the injected
     tree - foreign sessions still excluded."""
     calls = []
+    procs = _fake_tree()
     res = hard_stop.plan_and_sweep(
         lock_pid=LOCK_PID,
         sid=SID,
         session_cwd="/repo/w1",
         mailbox_dir="/state/queue/s1",
         registered=[("s1", "/repo/w1"), ("s2", "/repo/w2")],
-        procs=_fake_tree(),
+        procs=procs,
         signaler=lambda pid, sig: calls.append((pid, sig)),
         gone=lambda pid: True,
+        start_of=_start_of(procs),
         sleep=lambda s: None,
     )
     assert res["status"] == "ok"
@@ -291,6 +308,7 @@ def test_issue164_gwt10_no_backend_is_honest_not_a_guess():
         registered=[("s1", "/repo/w1")],
         procs=procs,
         signaler=lambda pid, sig: calls.append((pid, sig)),
+        start_of=_start_of(procs),
     )
     assert res["status"] == "no_backend"
     assert res["acp_host_pid"] == LOCK_PID
@@ -305,15 +323,17 @@ def test_issue164_gwt11_term_error_recorded_not_raised():
         if pid == 105:
             raise ProcessLookupError("gone")
 
+    procs = _fake_tree()
     res = hard_stop.plan_and_sweep(
         lock_pid=LOCK_PID,
         sid=SID,
         session_cwd="/repo/w1",
         mailbox_dir=None,
         registered=[("s1", "/repo/w1")],
-        procs=_fake_tree(),
+        procs=procs,
         signaler=flaky,
         gone=lambda pid: True,
+        start_of=_start_of(procs),
         sleep=lambda s: None,
     )
     by_pid = {e["pid"]: e for e in res["swept"]}
@@ -343,3 +363,143 @@ def test_issue164_gwt12_real_lister_reads_proc():
     assert by_pid[11].argv == ("bash", "-c", "work")
     assert by_pid[11].cwd == "/repo/w1"
     assert by_pid[11].start_seconds > by_pid[10].start_seconds
+
+
+# --- review fixes: pid-reuse guard, orphan pass, foreign-cwd guard --------------
+
+
+def test_issue164_gwt13_pid_reused_skips_sigterm():
+    """[ISSUE-164.GWT-13] PID-reuse race (review WARNING-1): a victim
+    dying mid-enumeration may yield its pid to a foreign process -
+    before SIGTERM the starttime is re-read and a mismatch skips the
+    pid entirely, recorded as pid_reused:skipped."""
+    ctx = _ctx()
+    procs = _fake_tree()
+    calls = []
+    # pid 105 was recycled: its /proc starttime no longer matches the
+    # enumeration-time capture
+    res = sweep(
+        ctx,
+        procs,
+        signaler=lambda pid, sig: calls.append((pid, sig)),
+        gone=lambda pid: True,
+        start_of=_start_of(procs, {105: 9999.0}),
+        sleep=lambda s: None,
+    )
+    signalled = {pid for pid, _ in calls}
+    assert 105 not in signalled
+    by_pid = {e["pid"]: e for e in res["swept"]}
+    assert by_pid[105]["outcome"] == "pid_reused:skipped"
+    assert by_pid[105]["signal"] == "SIGTERM"  # intended leg, never sent
+    assert by_pid[104]["outcome"] == "gone"
+
+
+def test_issue164_gwt14_pid_reused_skips_sigkill():
+    """[ISSUE-164.GWT-14] the identity check also guards the SIGKILL
+    follow-up: a victim that dies inside the grace and gets recycled
+    is skipped - the recycled pid never eats the kill."""
+    ctx = _ctx()
+    procs = _fake_tree()
+    calls = []
+    # 105 survives the TERM (not gone) but reads back a different
+    # starttime at KILL time - a recycled pid
+    res = sweep(
+        ctx,
+        procs,
+        signaler=lambda pid, sig: calls.append((pid, sig)),
+        gone=lambda pid: pid != 105,
+        start_of=_start_of(procs, {105: 8888.0}),
+        sleep=lambda s: None,
+        grace_seconds=1.0,
+    )
+    terms = [pid for pid, sig in calls if sig == signal.SIGTERM]
+    kills = [pid for pid, sig in calls if sig == signal.SIGKILL]
+    # wait: TERM also checks identity first - 105 is skipped there too
+    assert 105 not in terms and 105 not in kills
+    by_pid = {e["pid"]: e for e in res["swept"]}
+    assert by_pid[105]["outcome"] == "pid_reused:skipped"
+
+
+def test_issue164_gwt14b_recycled_during_grace_skips_sigkill():
+    """The mid-grace variant: pid is identical at TERM (so the TERM
+    went out), then recycled before the KILL leg - identity is
+    re-read per signal, so the recycled pid is skipped there too."""
+    ctx = _ctx()
+    procs = _fake_tree()
+    calls = []
+    starts = {p.pid: p.start_seconds for p in procs}
+    recycled = {"armed": False}
+
+    def start_of(pid):
+        if pid == 105 and recycled["armed"]:
+            return 7777.0
+        return starts.get(pid)
+
+    def signaler(pid, sig):
+        calls.append((pid, sig))
+        if pid == 105 and sig == signal.SIGTERM:
+            recycled["armed"] = True  # died on TERM, pid recycled
+
+    res = sweep(
+        ctx,
+        procs,
+        signaler=signaler,
+        gone=lambda pid: False,  # the pid exists - but it is not our victim
+        start_of=start_of,
+        sleep=lambda s: None,
+        grace_seconds=1.0,
+    )
+    kills = [pid for pid, sig in calls if sig == signal.SIGKILL]
+    assert 105 not in kills
+    by_pid = {e["pid"]: e for e in res["swept"]}
+    assert by_pid[105]["outcome"] == "pid_reused:skipped"
+
+
+def test_issue164_gwt15_foreign_root_cwd_no_blanket_exclusion():
+    """[ISSUE-164.GWT-15] review MINOR: a foreign session registered
+    at '/' must not nullify every cwd-attributed candidate - the cwd
+    leg of the foreign check carries the same _cwd_usable guard as
+    the target leg."""
+    ctx = _ctx(foreign_sessions=(("sX", "/"),))
+    proc = P(200, BACKEND_PID, ["bash", "-c", "x"], "/repo/w1/sub", 2000.0)
+    verdict, detail = classify(proc, ctx)
+    assert verdict == "candidate" and detail == "cwd_under:/repo/w1"
+    # marker legs stay unconditional even at a trivial foreign cwd
+    marked = P(201, BACKEND_PID, ["bridge", "wait", "--session", "sX"], "/repo/w1", 2000.0)
+    assert classify(marked, ctx) == ("excluded", "other_session:sX")
+
+
+def test_issue164_gwt16_orphan_marker_second_pass():
+    """[ISSUE-164.GWT-16] review WARNING-2: a setsid/double-forked
+    victim reparents to init and is invisible to the descendant walk
+    - pass 2 finds it by STRONG sid markers only (cwd deliberately
+    NOT used), records orphan_marker:<marker>, and signals it."""
+    ctx = _ctx()
+    procs = [
+        *_fake_tree(),
+        P(300, 1, ["python3", "/brg/worker.py", "queue/s1"], "/repo/w1", 2000.0),
+        P(301, 1, ["bridge", "wait", "9", "--session", "s1"], "/home/u", 2000.0),
+        # an orphan with ONLY the workspace cwd is NOT attributed in
+        # pass 2 - strong markers are the contract
+        P(302, 1, ["bash", "-c", "x"], "/repo/w1", 2000.0),
+        # an orphan carrying OUR marker AND a foreign marker is
+        # claimed by the foreign session - ambiguous attribution
+        # always loses
+        P(303, 1, ["python3", "w.py", "queue/s1", "--session", "s2"], "/repo/w2", 2000.0),
+    ]
+    calls = []
+    res = sweep(
+        ctx,
+        procs,
+        signaler=lambda pid, sig: calls.append((pid, sig)),
+        gone=lambda pid: True,
+        start_of=_start_of(procs),
+        sleep=lambda s: None,
+    )
+    by_pid = {c["pid"]: c["reason"] for c in res["candidates"]}
+    assert by_pid[300] == "orphan_marker:queue/s1"
+    assert by_pid[301] == "orphan_marker:--session s1"
+    assert 302 not in by_pid  # cwd alone never attributes an orphan
+    excluded = {s["pid"]: s["exclusion"] for s in res["skipped"]}
+    assert excluded[303] == "other_session:s2"
+    assert {pid for pid, _ in calls} == {104, 105, 106, 107, 111, 300, 301}

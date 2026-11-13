@@ -30,14 +30,28 @@ Safety invariants (design doc section 8):
   Marker attribution is strong and sweeps regardless of age; cwd
   attribution is weak and yields to the startup-window exclusion.
 
+Two enumeration passes run before any signal:
+
+- pass 1 walks the backend's descendant tree;
+- pass 2 re-scans the whole process table for STRONG sid markers
+  only - setsid/double-forked victims reparent to init and are
+  invisible to the descendant walk, which is the whole point of the
+  incident. Pass 2 never uses cwd attribution: a reparented process
+  may share a workspace path with unrelated infra.
+
 Signal order: SIGTERM, grace (default 2s), SIGKILL to survivors -
 deepest tree members first so a dying parent cannot respawn or
-re-parent a child mid-sweep. Every action lands in the result with
-its attribution reason; nothing is claimed that was not observed.
+re-parent a child mid-sweep. Before EVERY signal the victim's
+``/proc`` starttime is re-read and compared against the value
+captured at enumeration: a pid that was recycled mid-sweep is
+skipped (``pid_reused:skipped``), never signalled - existence is
+not identity. Every action lands in the result with its attribution
+reason; nothing is claimed that was not observed.
 
 Stdlib only (Linux ``/proc``). The process lister is injectable:
-tests pass a fabricated ``procs`` list plus fake signal/alive/sleep
-functions - no real PID is ever enumerated or signalled under test.
+tests pass a fabricated ``procs`` list plus fake signal/alive/
+starttime/sleep functions - no real PID is ever enumerated or
+signalled under test.
 """
 
 import os
@@ -55,7 +69,9 @@ __all__ = [
     "descendants",
     "is_devin_acp",
     "list_processes",
+    "marker_hits",
     "plan_and_sweep",
+    "proc_start_seconds",
     "process_gone",
     "resolve_backend",
     "sweep",
@@ -153,6 +169,21 @@ def list_processes(proc_root: str = "/proc") -> list[ProcInfo]:
         if info is not None:
             out.append(info)
     return out
+
+
+def proc_start_seconds(pid: int, proc_root: str = "/proc") -> float | None:
+    """Re-read one pid's ``/proc`` starttime - the identity half of
+    the PID-reuse guard. ``process_gone`` alone checks existence, not
+    identity: a victim dying inside the grace window may yield its
+    pid to a foreign process that would then eat the follow-up
+    signal. ``None`` means unreadable (the process is gone).
+    """
+    try:
+        hz = float(os.sysconf("SC_CLK_TCK"))
+    except (ValueError, OSError, AttributeError):
+        hz = 100.0
+    info = _read_proc(proc_root, pid, hz)
+    return info.start_seconds if info is not None else None
 
 
 def is_devin_acp(proc: ProcInfo) -> bool:
@@ -281,7 +312,11 @@ def _foreign_hit(proc: ProcInfo, ctx: SweepContext) -> str | None:
     for sid, cwd in ctx.foreign_sessions:
         if marker_hits(proc, sid, None):
             return sid
-        if _under(proc.cwd, cwd):
+        # the cwd leg carries the same trivial-workspace guard as the
+        # target attribution: a foreign session registered at '/' (or
+        # another trivially-broad root) must not silently nullify
+        # every cwd-attributed candidate on the host
+        if _under(proc.cwd, cwd) and _cwd_usable(cwd):
             return sid
     return None
 
@@ -356,44 +391,81 @@ def _depth(pid: int, procs_by_pid, backend_pids) -> int:
     return depth
 
 
+def _identity_verdict(start_of, pid: int, expected_start: float) -> str | None:
+    """``None`` when ``pid`` is still the enumerated process; else the
+    skip outcome to record. A recycled pid is ``pid_reused:skipped``;
+    a vanished one (unreadable stat) is ``gone``. Identity is checked
+    before EVERY signal - a victim dying inside the grace may yield
+    its pid to a foreign process that must never eat ours.
+    """
+    observed = start_of(pid)
+    if observed is None:
+        return "gone"
+    if observed != expected_start:
+        return "pid_reused:skipped"
+    return None
+
+
 def sweep(
     ctx: SweepContext,
     procs,
     *,
     signaler=None,
     gone=None,
+    start_of=None,
     sleep=time.sleep,
     grace_seconds: float = SWEEP_TERM_GRACE_SECONDS,
     dry_run: bool = False,
 ) -> dict:
     """SIGTERM -> grace -> SIGKILL the attributed descendants.
 
-    ``signaler``/``gone``/``sleep`` are the injection seams - tests
-    pass fakes so no real PID is ever signalled. Returns the recorded
-    action list: ``candidates`` (attribution reasons), ``skipped``
-    (exclusion reasons) and ``swept`` (signal + observed outcome per
-    pid). ``dry_run`` enumerates and reports without signalling.
+    ``signaler``/``gone``/``start_of``/``sleep`` are the injection
+    seams - tests pass fakes so no real PID is ever signalled.
+    Returns the recorded action list: ``candidates`` (attribution
+    reasons), ``skipped`` (exclusion reasons) and ``swept`` (signal +
+    observed outcome per pid). ``dry_run`` enumerates and reports
+    without signalling.
     """
     signaler = signaler or os.kill
     gone = gone or process_gone
+    start_of = start_of or proc_start_seconds
     procs = list(procs)
     by_pid = {p.pid: p for p in procs}
-    tree = descendants(ctx.backend_pids, procs)
     candidates = []
     skipped = []
-    for proc in tree:
+
+    def _consider(proc, orphan: bool) -> None:
+        hits = marker_hits(proc, ctx.sid, ctx.mailbox_dir) if orphan else []
+        if orphan and not hits:
+            return  # pass 2: strong markers only, no cwd attribution
         verdict, detail = classify(proc, ctx)
         if verdict == "candidate":
             candidates.append(
                 {
                     "pid": proc.pid,
-                    "reason": detail,
+                    "reason": f"orphan_marker:{hits[0]}" if orphan else detail,
                     "cmdline": proc.cmdline[:200],
                     "depth": _depth(proc.pid, by_pid, ctx.backend_pids),
+                    "start_seconds": proc.start_seconds,
                 }
             )
         elif verdict == "excluded":
             skipped.append({"pid": proc.pid, "exclusion": detail})
+
+    # pass 1: the backend's descendant tree (cwd + marker attribution)
+    tree = descendants(ctx.backend_pids, procs)
+    for proc in tree:
+        _consider(proc, orphan=False)
+
+    # pass 2: setsid/double-forked victims reparent to init and are
+    # invisible to the descendant walk - the incident's whole point.
+    # STRONG sid markers only; exclusions identical via classify().
+    tree_pids = {p.pid for p in tree}
+    for proc in procs:
+        if proc.pid in tree_pids:
+            continue
+        _consider(proc, orphan=True)
+
     result = {
         "dry_run": dry_run,
         "candidates": [
@@ -414,10 +486,14 @@ def sweep(
         pid = c["pid"]
         entry = {"pid": pid, "reason": c["reason"], "signal": "SIGTERM"}
         record[pid] = entry
-        try:
-            signaler(pid, signal.SIGTERM)
-        except OSError as e:
-            entry["outcome"] = f"term_error:{e.__class__.__name__}"
+        reused = _identity_verdict(start_of, pid, c["start_seconds"])
+        if reused is not None:
+            entry["outcome"] = reused
+        else:
+            try:
+                signaler(pid, signal.SIGTERM)
+            except OSError as e:
+                entry["outcome"] = f"term_error:{e.__class__.__name__}"
         result["swept"].append(entry)
     if grace_seconds > 0 and candidates:
         sleep(grace_seconds)
@@ -425,9 +501,13 @@ def sweep(
         pid = c["pid"]
         entry = record[pid]
         if "outcome" in entry:
-            continue  # signal itself failed - already reported
+            continue  # signal itself failed or was skipped - reported
         if gone(pid):
             entry["outcome"] = "gone"
+            continue
+        reused = _identity_verdict(start_of, pid, c["start_seconds"])
+        if reused is not None:
+            entry["outcome"] = reused
             continue
         entry["signal"] = "SIGKILL"
         try:
@@ -452,6 +532,7 @@ def plan_and_sweep(
     dry_run: bool = False,
     signaler=None,
     gone=None,
+    start_of=None,
     sleep=time.sleep,
     lister=None,
 ) -> dict:
@@ -494,6 +575,7 @@ def plan_and_sweep(
         procs,
         signaler=signaler,
         gone=gone,
+        start_of=start_of,
         sleep=sleep,
         grace_seconds=grace_seconds,
         dry_run=dry_run,

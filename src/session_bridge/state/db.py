@@ -2582,6 +2582,8 @@ def kill_session(session_id: str, *, stop_report: dict | None = None, path=None)
                         f" stop_close={stop_report.get('close_outcome')}"
                         f" swept_pids=[{pids}]"
                     )
+                    if stop_report.get("stop_exception"):
+                        body += f" stop_exception={stop_report['stop_exception']}"
                 con.execute(
                     "INSERT INTO decision_events(session_id,kind,body,created_at) VALUES (?,?,?,?)",
                     (

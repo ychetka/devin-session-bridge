@@ -879,7 +879,28 @@ def _cmd_kill_session(args) -> int:
                 error=f"no registration for {sid}",
             )
             return _emit(args, resp, ExitCode.NOT_FOUND, f"not registered: {sid}")
-        stop_report = _run_stop_layers(args, sid, hard=want_hard, dry_run=dry_run)
+        try:
+            stop_report = _run_stop_layers(args, sid, hard=want_hard, dry_run=dry_run)
+        except Exception as e:
+            # teardown-last is the contract: an unexpected layer
+            # failure must NOT strand the registry alive over a
+            # half-killed tree - record the failure verbatim and
+            # still run db.kill_session. Nothing is swallowed: the
+            # exception lands in the JSON, the human line and the
+            # session_killed event body.
+            stop_report = {
+                "hard": want_hard,
+                "dry_run": dry_run,
+                "cancel_outcome": "unknown",
+                "close_outcome": "unknown",
+                "sweep_status": "unknown",
+                "swept": [],
+                "candidates": [],
+                "sweep_excluded": [],
+                "acp_host_pid": None,
+                "backend_pid": None,
+                "stop_exception": f"{e.__class__.__name__}: {e}",
+            }
         if dry_run:
             status = "dry_run"
             resp = JsonResponse(
@@ -895,12 +916,16 @@ def _cmd_kill_session(args) -> int:
                     "status": status,
                 },
             )
+            if stop_report.get("stop_exception"):
+                resp.data["stop_exception"] = stop_report["stop_exception"]
             human = (
                 f"kill {sid} [dry-run]: cancel={stop_report['cancel_outcome']}"
                 f" close={stop_report['close_outcome']}"
                 f" sweep={stop_report['sweep_status']}"
                 f" candidates={len(stop_report['candidates'])} - bus state untouched"
             )
+            if stop_report.get("stop_exception"):
+                human += f"; stop_exception={stop_report['stop_exception']}"
             return _emit(args, resp, ExitCode.OK, human)
     verdict = db.kill_session(sid, stop_report=stop_report, path=args.db)
     if isinstance(verdict, KillNotFound):
@@ -925,6 +950,8 @@ def _cmd_kill_session(args) -> int:
             "swept": stop_report["swept"],
             "sweep_status": stop_report["sweep_status"],
         }
+        if stop_report.get("stop_exception"):
+            data["stop"]["stop_exception"] = stop_report["stop_exception"]
     resp = JsonResponse(
         session=sid,
         status="ok",
@@ -942,6 +969,8 @@ def _cmd_kill_session(args) -> int:
             f" close={stop_report['close_outcome']}"
             f" swept={len(stop_report['swept'])}"
         )
+        if stop_report.get("stop_exception"):
+            human += f" stop_exception={stop_report['stop_exception']}"
     return _emit(args, resp, ExitCode.OK, human)
 
 

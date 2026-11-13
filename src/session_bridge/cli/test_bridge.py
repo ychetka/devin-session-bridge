@@ -4239,3 +4239,56 @@ def test_issue164_gwt9_kill_task_ignores_hard_flags(env, capsys):
     assert rc == ExitCode.OK
     assert db.get_task(tid, path=env.db)["status"] == "failed"
     assert db.get_session("s1", path=env.db)["status"] == "active"
+
+
+def test_issue164_gwt10_stop_all_layers_failed_is_internal(env, capsys, monkeypatch):
+    """[ISSUE-164.CLI-10] review MINOR: every layer failing before
+    delivery reports status=error AND exits non-zero - scripts read
+    the exit code before the JSON, so a refused stop cannot masquerade
+    as an ok-with-caveats."""
+    db.register("w1", "/repo/w", path=env.db)
+
+    def _down(*a, **kw):
+        raise WakeError("wake_host_down", "no acp-host lockfile")
+
+    monkeypatch.setattr(sessions, "cancel_turn", _down)
+    monkeypatch.setattr(sessions, "close_session", _down)
+
+    rc, out = _run(["stop", "w1", "--json"], capsys)
+
+    assert rc == ExitCode.INTERNAL
+    assert out["status"] == "error"
+    assert out["data"]["cancel_outcome"] == "failed:wake_host_down"
+    assert out["data"]["close_outcome"] == "failed:wake_host_down"
+    ev = db.list_events(session_id="w1", kind="session_stopped", path=env.db)
+    assert len(ev) == 1 and "status=error" in ev[0]["body"]
+
+
+def test_issue164_gwt11_kill_hard_stop_teardown_survives_layer_crash(env, capsys, monkeypatch):
+    """[ISSUE-164.CLI-11] review WARNING-3: an unexpected exception in
+    the stop ladder must NOT strand the registry alive over a
+    half-killed tree - db.kill_session still runs LAST, and the
+    exception surfaces in the JSON, the human line and the
+    session_killed event body."""
+    db.register("w1", "/repo/w", path=env.db)
+    db.heartbeat("w1", path=env.db)
+    tid = _task(env, sid="w1")
+    _claim_acp(env, tid)
+
+    def _boom(*a, **kw):
+        raise RuntimeError("ladder exploded")
+
+    monkeypatch.setattr(sessions, "_run_stop_layers", _boom)
+
+    rc, out = _run(["kill", "w1", "--hard-stop", "--json"], capsys)
+
+    # teardown still ran to completion
+    assert rc == ExitCode.OK
+    assert out["data"]["killed"] and out["data"]["tasks_requeued"] == 1
+    assert db.get_session("w1", path=env.db)["status"] == "dead"
+    # the failure is surfaced, not swallowed
+    assert "RuntimeError" in out["data"]["stop"]["stop_exception"]
+    assert "ladder exploded" in out["data"]["stop"]["stop_exception"]
+    ev = db.list_events(session_id="w1", kind="session_killed", path=env.db)
+    assert len(ev) == 1
+    assert "stop_exception=RuntimeError" in ev[0]["body"]
