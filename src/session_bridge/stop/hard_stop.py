@@ -484,7 +484,10 @@ def sweep(
     record = {}
     for c in candidates:
         pid = c["pid"]
-        entry = {"pid": pid, "reason": c["reason"], "signal": "SIGTERM"}
+        # ``signal`` records the last signal DELIVERED - never intent:
+        # a pid skipped before its signal carries no signal field at
+        # all, so the report cannot read as if a signal was sent
+        entry = {"pid": pid, "reason": c["reason"]}
         record[pid] = entry
         reused = _identity_verdict(start_of, pid, c["start_seconds"])
         if reused is not None:
@@ -494,6 +497,8 @@ def sweep(
                 signaler(pid, signal.SIGTERM)
             except OSError as e:
                 entry["outcome"] = f"term_error:{e.__class__.__name__}"
+            else:
+                entry["signal"] = "SIGTERM"
         result["swept"].append(entry)
     if grace_seconds > 0 and candidates:
         sleep(grace_seconds)
@@ -509,12 +514,12 @@ def sweep(
         if reused is not None:
             entry["outcome"] = reused
             continue
-        entry["signal"] = "SIGKILL"
         try:
             signaler(pid, signal.SIGKILL)
         except OSError as e:
             entry["outcome"] = f"kill_error:{e.__class__.__name__}"
             continue
+        entry["signal"] = "SIGKILL"
         entry["outcome"] = "gone" if gone(pid) else "still_alive"
     return result
 

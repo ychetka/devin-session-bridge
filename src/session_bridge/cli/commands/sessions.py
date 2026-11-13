@@ -755,8 +755,11 @@ def _stop_status(report: dict) -> str:
     gone or idle (never inferred from a sent request); ``requested``
     means at least one layer delivered without confirmation - or a
     dry-run enumeration is all that ran; ``error`` means every layer
-    failed before delivery.
+    failed before delivery - and an unexpected ladder exception is
+    always an error, even on a dry run.
     """
+    if report.get("stop_exception"):
+        return "error"
     if report["dry_run"]:
         return "dry_run"
     outcomes = (report["cancel_outcome"], report["close_outcome"])
@@ -770,11 +773,14 @@ def _stop_status(report: dict) -> str:
 def _stop_event_body(report: dict) -> str:
     swept = report["swept"]
     pids = ",".join(str(e.get("pid")) for e in swept[:20])
-    return (
+    body = (
         f"cancel={report['cancel_outcome']} close={report['close_outcome']}"
         f" sweep={report['sweep_status']} swept_pids=[{pids}]"
         f" dry_run={report['dry_run']} status={_stop_status(report)}"
     )
+    if report.get("stop_exception"):
+        body += f" stop_exception={report['stop_exception']}"
+    return body
 
 
 def _cmd_stop(args) -> int:
@@ -813,7 +819,27 @@ def _cmd_stop(args) -> int:
             error=f"no registration for {sid}",
         )
         return _emit(args, resp, ExitCode.NOT_FOUND, f"not registered: {sid}")
-    report = _run_stop_layers(args, sid, hard=args.hard, dry_run=args.dry_run)
+    try:
+        report = _run_stop_layers(args, sid, hard=args.hard, dry_run=args.dry_run)
+    except Exception as e:
+        # layers 0-1 may already have signalled the live session when
+        # a later layer crashes - the audit contract ("every run
+        # writes session_stopped") must still hold, so the exception
+        # is recorded verbatim and reported as status=error, never
+        # dropped on the floor of an unguarded raise.
+        report = {
+            "hard": args.hard,
+            "dry_run": args.dry_run,
+            "cancel_outcome": "unknown",
+            "close_outcome": "unknown",
+            "sweep_status": "unknown",
+            "swept": [],
+            "candidates": [],
+            "sweep_excluded": [],
+            "acp_host_pid": None,
+            "backend_pid": None,
+            "stop_exception": f"{e.__class__.__name__}: {e}",
+        }
     status = _stop_status(report)
     db.record_event(sid, "session_stopped", _stop_event_body(report), path=args.db)
     data = {
@@ -825,6 +851,8 @@ def _cmd_stop(args) -> int:
         "sweep_excluded": report["sweep_excluded"],
         "status": status,
     }
+    if report.get("stop_exception"):
+        data["stop_exception"] = report["stop_exception"]
     if report["backend_pid"] is not None:
         data["backend_pid"] = report["backend_pid"]
         data["acp_host_pid"] = report["acp_host_pid"]
@@ -836,6 +864,8 @@ def _cmd_stop(args) -> int:
         + (f" sweep={report['sweep_status']} swept={len(swept)}" if args.hard else "")
         + (" [dry-run]" if args.dry_run else "")
     )
+    if report.get("stop_exception"):
+        human += f" stop_exception={report['stop_exception']}"
     if swept:
         human += " pids=" + ",".join(str(e.get("pid")) for e in swept[:20])
     # every layer failed before delivery is a real failure, not an

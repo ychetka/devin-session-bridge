@@ -4292,3 +4292,28 @@ def test_issue164_gwt11_kill_hard_stop_teardown_survives_layer_crash(env, capsys
     ev = db.list_events(session_id="w1", kind="session_killed", path=env.db)
     assert len(ev) == 1
     assert "stop_exception=RuntimeError" in ev[0]["body"]
+
+
+def test_issue164_gwt12_stop_layer_crash_still_writes_audit(env, capsys, monkeypatch):
+    """[ISSUE-164.CLI-12] review round-2: an unexpected exception
+    inside the stop ladder must NOT lose the session_stopped audit
+    event - layers 0-1 may already have signalled the live session,
+    so the run still journals status=error with stop_exception and
+    exits INTERNAL."""
+    db.register("w1", "/repo/w", path=env.db)
+
+    def _boom(*a, **kw):
+        raise RuntimeError("sweep enumerator exploded")
+
+    monkeypatch.setattr(sessions, "_run_stop_layers", _boom)
+
+    rc, out = _run(["stop", "w1", "--hard", "--json"], capsys)
+
+    assert rc == ExitCode.INTERNAL
+    assert out["status"] == "error"
+    assert "RuntimeError" in out["data"]["stop_exception"]
+    assert "sweep enumerator exploded" in out["data"]["stop_exception"]
+    ev = db.list_events(session_id="w1", kind="session_stopped", path=env.db)
+    assert len(ev) == 1
+    assert "status=error" in ev[0]["body"]
+    assert "stop_exception=RuntimeError" in ev[0]["body"]

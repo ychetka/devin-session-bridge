@@ -390,8 +390,9 @@ def test_issue164_gwt13_pid_reused_skips_sigterm():
     assert 105 not in signalled
     by_pid = {e["pid"]: e for e in res["swept"]}
     assert by_pid[105]["outcome"] == "pid_reused:skipped"
-    assert by_pid[105]["signal"] == "SIGTERM"  # intended leg, never sent
-    assert by_pid[104]["outcome"] == "gone"
+    # the signal field records delivery, not intent: nothing was sent
+    assert "signal" not in by_pid[105]
+    assert by_pid[104]["signal"] == "SIGTERM" and by_pid[104]["outcome"] == "gone"
 
 
 def test_issue164_gwt14_pid_reused_skips_sigkill():
