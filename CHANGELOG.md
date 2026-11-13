@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.15.6] - 2026-11-13
+
+### Codebase
+
+#### docs
+- [docs] Added `docs/SESSION_HARD_STOP.md`: root-cause analysis of the managed-session stop incident (kill is bus-state only, cancel wired only to `withdraw --stop-turn`, single shared `devin acp` backend owns all sessions) and the layered hard-stop design with implementation plan. (issue #164)
+
 ## [0.15.5] - 2026-11-12
 
 ### Codebase
