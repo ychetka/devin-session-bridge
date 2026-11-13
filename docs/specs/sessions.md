@@ -52,6 +52,41 @@ to `queued` for re-claim - work survives the worker.
   `queued`, claimable by the next worker
 - **AND** a second kill of the same session is an idempotent no-op
 
+### Requirement: layered stop reports observed outcomes only
+
+`bridge stop` SHALL run the hard-stop ladder against a registered
+session in escalation order - `session/cancel`, then forced
+`session/close`, then the attributed orphan sweep under `--hard` -
+without touching the bus row, and SHALL report each layer's observed
+outcome (`idle`/`confirmed`/`requested`/`failed:<reason>`) instead of
+claiming a stop that was only requested. `bridge kill <sid>
+--hard-stop` SHALL run the same ladder BEFORE `db.kill_session` and
+fold the per-layer outcomes into the `session_killed` event body;
+`--dry-run` SHALL enumerate layers and sweep victims without sending,
+signalling, or tearing down. The sweep SHALL attribute only processes
+in the shared `devin acp` backend tree carrying the session's
+workspace cwd or explicit sid markers, and SHALL never signal the
+backend, the acp-host supervisor, MCP/tool servers, or processes
+attributed to other registered sessions.
+
+#### Scenario: hard-stop kill tears down the bus last
+
+- **WHEN** `bridge kill <sid> --hard-stop` runs
+- **THEN** cancel and forced close precede the teardown, the
+  `session_killed` event body carries `stop_cancel`/`stop_close`/
+  `swept_pids`, and the session row ends `dead`
+- **AND** `bridge kill <sid> --hard-stop --dry-run` leaves the row
+  and every process untouched while still listing the would-be
+  victims with attribution reasons
+
+#### Scenario: a requested layer is never reported as stopped
+
+- **WHEN** `session/cancel` is delivered but the session still lists
+  busy after the confirm window
+- **THEN** `bridge stop` reports `requested`, not `stopped` - the
+  claim is bound to observed state, and every layer failing before
+  delivery reports `error` with a non-zero exit
+
 ### Requirement: dead managed sessions revive on proven return
 
 A managed session marked dead SHALL self-recover when two signals

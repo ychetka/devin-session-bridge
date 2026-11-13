@@ -57,6 +57,7 @@ import threading
 import time
 
 from session_bridge.acp import protocol
+from session_bridge.acp.contract import META_FORCE
 
 __all__ = [
     "ATTACH_LOCK",
@@ -67,6 +68,8 @@ __all__ = [
     "REPLAY_TIMEOUT_SECONDS",
     "SESSION_ABSENT",
     "WakeError",
+    "cancel_turn",
+    "close_session",
     "find_lockfile",
     "nudge_text",
     "pid_alive",
@@ -705,6 +708,123 @@ def cancel_turn(
             # the cancel IS on the wire, so any failure here degrades
             # to "requested", never to a raised error claiming nothing
             # was sent (PR #143 review)
+            try:
+                while True:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return "requested"
+                    listing = call("session/list", {}, timeout=remaining)
+                    still_busy = False
+                    for item in listing.get("sessions", []):
+                        if item.get("sessionId") == session_id:
+                            still_busy = _is_busy(item)
+                            break
+                    if not still_busy:
+                        return "confirmed"
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return "requested"
+                    time.sleep(min(0.25, remaining))
+            except WakeError:
+                return "requested"
+        finally:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+
+# Grace between the session/close response and the confirmation
+# re-list (issue #164): the response proves the request was accepted;
+# the re-list exists to UPGRADE the report to "confirmed", never to
+# block on it - after the window the outcome is honestly "requested".
+_CLOSE_CONFIRM_SECONDS = 3.0
+
+#: wire flag marking a forced close (acp/contract.py META_FORCE).
+_CLOSE_FORCE_META = {META_FORCE: True}
+
+
+def close_session(
+    session_id: str,
+    *,
+    force: bool = True,
+    lock_data: dict | None = None,
+    lock_dir: str | None = None,
+    agent_id: str = DEFAULT_AGENT_ID,
+    confirm_timeout: float = _CLOSE_CONFIRM_SECONDS,
+) -> str:
+    """Best-effort ``session/close`` for the ``bridge stop`` escalation.
+
+    ``session/close`` is the strongest session-scoped primitive the
+    acp-host exposes (design doc layer 1, issue #164); ``force`` sets
+    ``_meta.cognition.ai/force=true`` so a wedged or locked session
+    cannot veto the teardown. Unlike ``session/cancel`` it is a real
+    request: the response itself is the delivery proof, and an
+    rpc_error is a refused close - raised as ``WakeError``, never
+    reported as sent.
+
+    Outcomes:
+
+    - ``"idle"`` - the session is absent from ``session/list``:
+      nothing to close, the goal state is already observed. This
+      diverges from ``cancel_turn``'s ``no_session`` error on
+      purpose: a cancel against a missing session has no valid
+      target, while teardown treats absence as already achieved.
+    - ``"confirmed"`` - the close response arrived AND a re-list
+      within ``confirm_timeout`` shows the session absent or no
+      longer busy: the live-turn state is observed gone, which is
+      all the host can certify - never a process-death claim.
+    - ``"requested"`` - the close response arrived but the session
+      still reports busy: delivered, unconfirmed.
+
+    Raises ``WakeError`` on attach/transport failure or an rpc_error
+    on the close itself - in both cases nothing was provably
+    requested.
+    """
+    if lock_data is None:
+        lock_data = find_lockfile(lock_dir)
+    if lock_data is None:
+        raise WakeError("wake_host_down", "no acp-host lockfile found")
+
+    with ATTACH_LOCK:
+        chan = _attach(lock_data, agent_id)
+        sock = chan._sock
+        try:
+            req = 0
+
+            def call(method, params=None, timeout=_REQUEST_TIMEOUT, cap=256):
+                nonlocal req
+                req += 1
+                _rpc(chan, req, method, params)
+                return _await_response(chan, req, timeout, cap)
+
+            try:
+                call("initialize", _initialize_params(1))
+                chan.send({"jsonrpc": "2.0", "method": "initialized", "params": {}})
+                listing = call("session/list", {})
+            except WakeError as e:
+                if e.reason == "rpc_error":
+                    raise WakeError("attach_failed", str(e)) from e
+                raise
+            entry = None
+            for item in listing.get("sessions", []):
+                if item.get("sessionId") == session_id:
+                    entry = item
+                    break
+            if entry is None:
+                return "idle"
+            params = {"sessionId": session_id}
+            if force:
+                params["_meta"] = dict(_CLOSE_FORCE_META)
+            # session/close IS a request: its response is awaited and
+            # a refused close (rpc_error) propagates as WakeError -
+            # the strongest honest failure the host can give.
+            call("session/close", params)
+            deadline = time.monotonic() + confirm_timeout
+            # post-close re-list only ever upgrades the report - the
+            # close response already arrived, so any failure here
+            # degrades to "requested", never to a raised error
+            # claiming nothing was sent (mirrors cancel_turn)
             try:
                 while True:
                     remaining = deadline - time.monotonic()

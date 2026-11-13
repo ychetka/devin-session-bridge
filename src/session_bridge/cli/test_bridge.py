@@ -4035,3 +4035,207 @@ def test_issue153_gwt3_disabled_threshold(env, capsys, monkeypatch):
     assert rc == ExitCode.OK
     assert db.list_events(kind="thrash_breaker", path=env.db) == []
     assert _thrash_escalations(env.db) == []
+
+
+# --- issue #164: bridge stop / kill --hard-stop -------------------------------
+
+
+def test_issue164_gwt1_stop_not_found(env, capsys):
+    """[ISSUE-164.CLI-1] `bridge stop <sid>` on an unregistered sid is
+    NOT_FOUND, mirroring kill - no attach is attempted."""
+    rc, out = _run(["stop", "ghost", "--json"], capsys)
+    assert rc == ExitCode.NOT_FOUND and out["status"] == "not_found"
+
+
+def test_issue164_gwt2_stop_reports_layer_outcomes(env, capsys, monkeypatch):
+    """[ISSUE-164.CLI-2] `bridge stop <sid>` runs cancel then forced
+    close and reports both outcomes verbatim; a 'requested' layer is
+    honest, not a claimed stop. The session_stopped decision event
+    carries the same outcomes."""
+    db.register("w1", "/repo/w", path=env.db)
+    seen = []
+    monkeypatch.setattr(
+        sessions, "cancel_turn", lambda sid, **kw: seen.append("cancel") or "requested"
+    )
+    monkeypatch.setattr(
+        sessions, "close_session", lambda sid, **kw: seen.append("close") or "requested"
+    )
+
+    rc, out = _run(["stop", "w1", "--json"], capsys)
+
+    assert rc == ExitCode.OK
+    assert seen == ["cancel", "close"]  # layer order is the contract
+    d = out["data"]
+    assert d["cancel_outcome"] == "requested" and d["close_outcome"] == "requested"
+    assert d["status"] == "requested"
+    ev = db.list_events(session_id="w1", kind="session_stopped", path=env.db)
+    assert len(ev) == 1
+    assert "cancel=requested" in ev[0]["body"] and "close=requested" in ev[0]["body"]
+    # stop is session-level only: the bus row is untouched
+    assert db.get_session("w1", path=env.db)["status"] == "active"
+
+
+def test_issue164_gwt3_stop_confirmed_reports_stopped(env, capsys, monkeypatch):
+    """[ISSUE-164.CLI-3] an observed-stopped layer upgrades the overall
+    verdict to 'stopped' - claimed only on observed idle/absent."""
+    db.register("w1", "/repo/w", path=env.db)
+    monkeypatch.setattr(sessions, "cancel_turn", lambda sid, **kw: "confirmed")
+    monkeypatch.setattr(sessions, "close_session", lambda sid, **kw: "confirmed")
+
+    rc, out = _run(["stop", "w1", "--json"], capsys)
+
+    assert rc == ExitCode.OK and out["data"]["status"] == "stopped"
+
+
+def test_issue164_gwt4_stop_dry_run_suppresses_layers(env, capsys, monkeypatch):
+    """[ISSUE-164.CLI-4] --dry-run sends nothing: layers 0-1 report
+    'dry_run' and never call the transport - the only safe way to
+    preview a real stop on a live host."""
+    db.register("w1", "/repo/w", path=env.db)
+
+    def _boom(*a, **kw):
+        raise AssertionError("dry_run must not attach")
+
+    monkeypatch.setattr(sessions, "cancel_turn", _boom)
+    monkeypatch.setattr(sessions, "close_session", _boom)
+
+    rc, out = _run(["stop", "w1", "--dry-run", "--json"], capsys)
+
+    assert rc == ExitCode.OK
+    assert out["data"]["status"] == "dry_run"
+    assert out["data"]["cancel_outcome"] == "dry_run"
+    assert out["data"]["close_outcome"] == "dry_run"
+    ev = db.list_events(session_id="w1", kind="session_stopped", path=env.db)
+    assert len(ev) == 1 and "dry_run=True" in ev[0]["body"]
+
+
+def test_issue164_gwt5_stop_hard_dry_run_enumerates(env, capsys, monkeypatch, tmp_path):
+    """[ISSUE-164.CLI-5] `bridge stop <sid> --hard --dry-run` runs the
+    attribution enumeration over the (faked) backend tree and lists
+    candidates + exclusions - nothing is signalled, nothing sent."""
+    from session_bridge.stop import hard_stop
+    from session_bridge.stop.hard_stop import ProcInfo
+
+    db.register("w1", "/repo/w", path=env.db)
+    db.register("w2", "/repo/w2", path=env.db)
+
+    def _boom(*a, **kw):
+        raise AssertionError("dry_run must not attach")
+
+    monkeypatch.setattr(sessions, "cancel_turn", _boom)
+    monkeypatch.setattr(sessions, "close_session", _boom)
+    monkeypatch.setattr(sessions, "find_lockfile", lambda *a, **kw: {"pid": 100})
+
+    def P(pid, ppid, argv, cwd=None, start=2000.0):
+        return ProcInfo(pid=pid, ppid=ppid, argv=tuple(argv), cwd=cwd, start_seconds=start)
+
+    fake_procs = [
+        P(100, 1, ["/opt/windsurf-cli", "agent", "acp-host"], "/home/u", 900.0),
+        P(101, 100, ["/opt/bin/devin", "acp"], "/home/u", 1000.0),
+        P(102, 101, ["/usr/bin/python3", "/prj/mcp_partner.py"], "/home/u", 1001.0),
+        P(103, 101, ["bash", "-c", "make"], "/repo/w/build", 2000.0),
+        P(104, 101, ["python3", "w.py", "queue/w1"], "/home/u", 2000.0),
+        P(105, 101, ["bash", "-c", "build"], "/repo/w2", 2000.0),
+    ]
+    monkeypatch.setattr(hard_stop, "list_processes", lambda *a, **kw: list(fake_procs))
+
+    rc, out = _run(["stop", "w1", "--hard", "--dry-run", "--json"], capsys)
+
+    assert rc == ExitCode.OK
+    d = out["data"]
+    assert d["status"] == "dry_run"
+    assert d["sweep_status"] == "dry_run"
+    assert {c["pid"] for c in d["candidates"]} == {103, 104}
+    assert d["swept"] == []
+    excluded = {e["pid"]: e["exclusion"] for e in d["sweep_excluded"]}
+    assert excluded[102] == "mcp_server" and excluded[105].startswith("other_session:")
+    assert d["backend_pid"] == 101
+
+
+def test_issue164_gwt6_kill_hard_stop_chains_layers_then_teardown(env, capsys, monkeypatch):
+    """[ISSUE-164.CLI-6] `bridge kill <sid> --hard-stop` runs the stop
+    ladder FIRST and db.kill_session LAST; the session_killed event
+    body carries the per-layer outcomes."""
+    db.register("w1", "/repo/w", path=env.db)
+    db.heartbeat("w1", path=env.db)
+    tid = _task(env, sid="w1")
+    _claim_acp(env, tid)
+    monkeypatch.setattr(sessions, "cancel_turn", lambda sid, **kw: "confirmed")
+    monkeypatch.setattr(sessions, "close_session", lambda sid, **kw: "requested")
+    canned = {
+        "sweep_status": "ok",
+        "swept": [
+            {"pid": 424242, "reason": "cwd_under:/repo/w", "signal": "SIGTERM", "outcome": "gone"}
+        ],
+        "candidates": [{"pid": 424242, "reason": "cwd_under:/repo/w", "cmdline": "bash"}],
+        "sweep_excluded": [],
+        "acp_host_pid": 100,
+        "backend_pid": 101,
+    }
+    monkeypatch.setattr(sessions, "_run_sweep", lambda args, sid, **kw: dict(canned))
+
+    rc, out = _run(["kill", "w1", "--hard-stop", "--json"], capsys)
+
+    assert rc == ExitCode.OK
+    d = out["data"]
+    assert d["killed"] and d["tasks_requeued"] == 1
+    assert d["stop"]["cancel_outcome"] == "confirmed"
+    assert d["stop"]["close_outcome"] == "requested"
+    assert d["stop"]["swept"][0]["pid"] == 424242
+    assert db.get_session("w1", path=env.db)["status"] == "dead"
+    ev = db.list_events(session_id="w1", kind="session_killed", path=env.db)
+    assert len(ev) == 1
+    body = ev[0]["body"]
+    assert "stop_cancel=confirmed" in body
+    assert "stop_close=requested" in body
+    assert "swept_pids=[424242]" in body
+
+
+def test_issue164_gwt7_kill_dry_run_no_teardown(env, capsys, monkeypatch):
+    """[ISSUE-164.CLI-7] `bridge kill <sid> --hard-stop --dry-run`
+    reports the layers + candidates and leaves the bus row alone."""
+    db.register("w1", "/repo/w", path=env.db)
+    monkeypatch.setattr(
+        sessions,
+        "_run_stop_layers",
+        lambda args, sid, **kw: {
+            "hard": True,
+            "dry_run": True,
+            "cancel_outcome": "dry_run",
+            "close_outcome": "dry_run",
+            "sweep_status": "dry_run",
+            "swept": [],
+            "candidates": [{"pid": 1, "reason": "x", "cmdline": "c"}],
+            "sweep_excluded": [],
+            "acp_host_pid": 100,
+            "backend_pid": 101,
+        },
+    )
+
+    rc, out = _run(["kill", "w1", "--hard-stop", "--dry-run", "--json"], capsys)
+
+    assert rc == ExitCode.OK and out["data"]["status"] == "dry_run"
+    assert db.get_session("w1", path=env.db)["status"] == "active"
+    assert db.list_events(session_id="w1", kind="session_killed", path=env.db) == []
+
+
+def test_issue164_gwt8_kill_hard_stop_unregistered_is_not_found(env, capsys):
+    """[ISSUE-164.CLI-8] kill --hard-stop on a ghost refuses before any
+    attach - same not_found contract as plain kill."""
+    rc, out = _run(["kill", "ghost", "--hard-stop", "--json"], capsys)
+    assert rc == ExitCode.NOT_FOUND and out["status"] == "not_found"
+
+
+def test_issue164_gwt9_kill_task_ignores_hard_flags(env, capsys):
+    """[ISSUE-164.CLI-9] `bridge kill <task_id>` keeps its contract:
+    the session-level --hard-stop/--dry-run flags do not reach the
+    per-task force-fail path."""
+    db.register("s1", "/repo/s", path=env.db)
+    tid = _task(env)
+    _claim_acp(env, tid)
+
+    rc, _out = _run(["kill", str(tid), "--hard-stop", "--json"], capsys)
+
+    assert rc == ExitCode.OK
+    assert db.get_task(tid, path=env.db)["status"] == "failed"
+    assert db.get_session("s1", path=env.db)["status"] == "active"

@@ -32,6 +32,7 @@ from session_bridge.wake import (
     WakeError,
     WakePolicy,
     cancel_turn,
+    close_session,
     find_lockfile,
     nudge_text,
     pid_alive,
@@ -62,6 +63,8 @@ class FakeAcpHost:
         resume_error=None,
         reject_above=None,
         on_notification=None,
+        close_error=None,
+        on_close=None,
     ):
         self.sessions = list(sessions)
         self.hello_error = hello_error
@@ -74,6 +77,8 @@ class FakeAcpHost:
         self.resume_error = resume_error
         self.reject_above = reject_above
         self.on_notification = on_notification
+        self.close_error = close_error
+        self.on_close = on_close
         self.hellos: list[dict] = []
         self.calls: list[tuple[str, dict]] = []
         self.notifications: list[dict] = []
@@ -156,6 +161,13 @@ class FakeAcpHost:
                         out["result"] = {}
                 elif method == "session/list":
                     out["result"] = {"sessions": self.sessions}
+                elif method == "session/close":
+                    if self.close_error is not None:
+                        out["error"] = {"code": -32000, "message": self.close_error}
+                    else:
+                        if self.on_close is not None:
+                            self.on_close(params)
+                        out["result"] = {}
                 elif method == "session/load":
                     for _ in range(self.replay_count):
                         f.write(
@@ -1254,3 +1266,104 @@ def test_issue142_gwt_cancel_turn_no_session():
     assert exc.value.reason == "no_session"
     cancels = [m for m in host.notifications if m.get("method") == "session/cancel"]
     assert cancels == []
+
+
+# --- issue #164: forced session/close transport for bridge stop ---------------
+
+
+def _drop_session(host):
+    """Fake the host honouring session/close: the sid leaves
+    session/list, so the confirm re-list sees it absent."""
+
+    def _on_close(params):
+        sid = params.get("sessionId")
+        host.sessions[:] = [s for s in host.sessions if s.get("sessionId") != sid]
+
+    return _on_close
+
+
+def _idle_session(host):
+    """Fake close flipping the turn off while the persisted row stays
+    listed - the 'closed but still listed' shape."""
+
+    def _on_close(params):
+        sid = params.get("sessionId")
+        for entry in host.sessions:
+            if entry.get("sessionId") == sid:
+                entry["_meta"]["cognition.ai/statusEnum"] = "idle"
+
+    return _on_close
+
+
+def test_issue164_gwt_close_idle_when_absent():
+    """[ISSUE-164.GWT] A sid absent from session/list reports 'idle' -
+    teardown treats the missing session as already achieved, and no
+    close request is ever sent."""
+    host = FakeAcpHost(sessions=[])
+    out = close_session(SID, lock_data=host.lock_data())
+    assert out == "idle"
+    assert "session/close" not in host.methods()
+
+
+def test_issue164_gwt_close_confirmed_absent():
+    """A forced close whose re-list shows the session gone reports
+    'confirmed' - and the wire params carry sessionId plus
+    _meta.cognition.ai/force=true."""
+    host = FakeAcpHost(sessions=[json.loads(json.dumps(BUSY_SESSION))])
+    host.on_close = _drop_session(host)
+    out = close_session(SID, lock_data=host.lock_data(), confirm_timeout=1.0)
+    assert out == "confirmed"
+    closes = [p for m, p in host.calls if m == "session/close"]
+    assert len(closes) == 1
+    assert closes[0]["sessionId"] == SID
+    assert closes[0]["_meta"] == {"cognition.ai/force": True}
+
+
+def test_issue164_gwt_close_no_force_meta():
+    """force=False drops the _meta entirely - the wire contract makes
+    the flag optional, not false."""
+    host = FakeAcpHost(sessions=[json.loads(json.dumps(BUSY_SESSION))])
+    host.on_close = _drop_session(host)
+    out = close_session(SID, force=False, lock_data=host.lock_data(), confirm_timeout=1.0)
+    assert out == "confirmed"
+    closes = [p for m, p in host.calls if m == "session/close"]
+    assert "_meta" not in closes[0]
+
+
+def test_issue164_gwt_close_confirmed_idle_listed():
+    """The session stays listed (persisted row) but its statusEnum
+    flips idle after the close: 'confirmed' - the live-turn state is
+    observed gone, which is all the host can certify."""
+    host = FakeAcpHost(sessions=[json.loads(json.dumps(BUSY_SESSION))])
+    host.on_close = _idle_session(host)
+    out = close_session(SID, lock_data=host.lock_data(), confirm_timeout=1.0)
+    assert out == "confirmed"
+
+
+def test_issue164_gwt_close_requested_still_busy():
+    """A session still reporting busy past the window: the close
+    response DID arrive - the outcome is honestly 'requested', never
+    'confirmed' on a sent request alone."""
+    host = FakeAcpHost(sessions=[json.loads(json.dumps(BUSY_SESSION))])
+    out = close_session(SID, lock_data=host.lock_data(), confirm_timeout=0.3)
+    assert out == "requested"
+    assert "session/close" in host.methods()
+
+
+def test_issue164_gwt_close_rpc_error_raises():
+    """A refused close is WakeError rpc_error - the honest failure,
+    never a reported 'requested'."""
+    host = FakeAcpHost(
+        sessions=[json.loads(json.dumps(BUSY_SESSION))],
+        close_error="session is busy",
+    )
+    with pytest.raises(WakeError) as exc:
+        close_session(SID, lock_data=host.lock_data())
+    assert exc.value.reason == "rpc_error"
+
+
+def test_issue164_gwt_close_attach_failure_raises():
+    """No lockfile -> WakeError, same plumbing as cancel_turn."""
+    with pytest.raises(WakeError) as exc:
+        close_session(SID, lock_data={"pid": 2**22, "port": 1, "token": "t"})
+    assert exc.value.reason == "wake_host_down"

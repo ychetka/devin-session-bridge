@@ -42,16 +42,25 @@ from session_bridge.state.verdict import (
     UnregisterRefusedFreshHeartbeat,
     UnregisterRefusedLiveTask,
 )
+from session_bridge.stop import hard_stop
 from session_bridge.wake import (
     SESSION_ABSENT,
     WakeError,
     cancel_turn,
+    close_session,
     find_lockfile,
     verify_sessions,
     wake_session,
 )
 
 _DISARM_BODY = "managed mode disarmed: stop re-arming the mailbox watcher"
+
+#: hard-stop layer timings (issue #164): the cancel confirm window IS
+#: the layer-0 grace the design calls for (~5s) - after it the forced
+#: close fires; the sweep holds its own TERM->KILL grace.
+_STOP_CANCEL_CONFIRM = 5.0
+_STOP_CLOSE_CONFIRM = 3.0
+_SWEEP_TERM_GRACE = 2.0
 
 
 def _cmd_arm(args) -> int:
@@ -657,8 +666,187 @@ def _cmd_kill_task(args) -> int:
     return _emit(args, resp, ExitCode.OK, human)
 
 
+def _run_sweep(args, sid: str, *, dry_run: bool) -> dict:
+    """Layer 2 of the hard-stop design: the attributed orphan sweep.
+
+    Resolves the acp-host lockfile pid, hands the bridge session
+    registry (every registered sid + cwd feeds the foreign-session
+    exclusion) to ``hard_stop.plan_and_sweep`` and reports honestly:
+    ``no_lockfile``/``no_backend`` are sweep outcomes, not guesses.
+    """
+    out = {
+        "sweep_status": "skipped",
+        "swept": [],
+        "candidates": [],
+        "sweep_excluded": [],
+        "acp_host_pid": None,
+        "backend_pid": None,
+    }
+    lock_data = find_lockfile()
+    if lock_data is None:
+        out["sweep_status"] = "no_lockfile"
+        return out
+    registered = [(r["session_id"], r["cwd"]) for r in _all_session_rows(args)]
+    res = hard_stop.plan_and_sweep(
+        lock_pid=lock_data.get("pid"),
+        sid=sid,
+        session_cwd=_session_cwd(sid, args),
+        mailbox_dir=mailbox_dir(sid, db_path=args.db, queue_dir=args.queue_dir),
+        registered=registered,
+        grace_seconds=_SWEEP_TERM_GRACE,
+        dry_run=dry_run,
+    )
+    out["sweep_status"] = res["status"]
+    out["swept"] = res["swept"]
+    out["candidates"] = res["candidates"]
+    out["sweep_excluded"] = res["skipped"]
+    out["acp_host_pid"] = res.get("acp_host_pid")
+    out["backend_pid"] = res.get("backend_pid")
+    return out
+
+
+def _run_stop_layers(args, sid: str, *, hard: bool, dry_run: bool) -> dict:
+    """Layers 0-2 of the layered hard-stop (issue #164).
+
+    Order is the escalation contract: ``session/cancel`` first (the
+    cancel's own confirm window is the ~5s grace the design asks
+    for), forced ``session/close`` next, the attributed process
+    sweep last and only under ``--hard``. ``dry_run`` makes the whole
+    ladder side-effect-free: layers 0-1 report ``dry_run`` (nothing
+    is sent) and the sweep enumerates without signalling - the only
+    safe way to preview a real stop on a live host.
+    """
+    report = {
+        "hard": hard,
+        "dry_run": dry_run,
+        "cancel_outcome": "dry_run" if dry_run else None,
+        "close_outcome": "dry_run" if dry_run else None,
+    }
+    if not dry_run:
+        try:
+            report["cancel_outcome"] = cancel_turn(sid, confirm_timeout=_STOP_CANCEL_CONFIRM)
+        except WakeError as e:
+            report["cancel_outcome"] = f"failed:{e.reason}"
+        try:
+            report["close_outcome"] = close_session(
+                sid, force=True, confirm_timeout=_STOP_CLOSE_CONFIRM
+            )
+        except WakeError as e:
+            report["close_outcome"] = f"failed:{e.reason}"
+    report.update(
+        _run_sweep(args, sid, dry_run=dry_run)
+        if hard
+        else {
+            "sweep_status": "skipped",
+            "swept": [],
+            "candidates": [],
+            "sweep_excluded": [],
+            "acp_host_pid": None,
+            "backend_pid": None,
+        }
+    )
+    return report
+
+
+def _stop_status(report: dict) -> str:
+    """Fold per-layer outcomes into one honest verdict.
+
+    ``stopped`` is claimed only when a layer OBSERVED the session
+    gone or idle (never inferred from a sent request); ``requested``
+    means at least one layer delivered without confirmation - or a
+    dry-run enumeration is all that ran; ``error`` means every layer
+    failed before delivery.
+    """
+    if report["dry_run"]:
+        return "dry_run"
+    outcomes = (report["cancel_outcome"], report["close_outcome"])
+    if "confirmed" in outcomes or outcomes == ("idle", "idle"):
+        return "stopped"
+    if "idle" in outcomes or "requested" in outcomes or report["swept"]:
+        return "requested"
+    return "error"
+
+
+def _stop_event_body(report: dict) -> str:
+    swept = report["swept"]
+    pids = ",".join(str(e.get("pid")) for e in swept[:20])
+    return (
+        f"cancel={report['cancel_outcome']} close={report['close_outcome']}"
+        f" sweep={report['sweep_status']} swept_pids=[{pids}]"
+        f" dry_run={report['dry_run']} status={_stop_status(report)}"
+    )
+
+
+def _cmd_stop(args) -> int:
+    """``bridge stop <sid> [--hard] [--dry-run]``: layered session stop (issue #164).
+
+    The session-level counterpart of ``bridge halt``: actually stops
+    what the session is DOING instead of parking its bridge duty.
+    Layers run in escalation order and each reports an honest
+    outcome:
+
+    - layer 0: ``session/cancel`` via acp-host (``idle`` /
+      ``confirmed`` / ``requested`` / ``failed:<reason>``) - proven
+      ~3s on a live busy session;
+    - layer 1: forced ``session/close`` (``cognition.ai/force``) -
+      the strongest session-scoped primitive the host exposes;
+    - layer 2 (``--hard`` only): the attributed orphan sweep -
+      SIGTERM -> grace -> SIGKILL for backend-tree processes
+      attributable to this session (workspace cwd or explicit sid
+      markers), with the backend, acp-host, MCP servers and foreign
+      sessions excluded. ``--dry-run`` enumerates the would-be
+      victims with reasons and kills nothing - and suppresses layers
+      0-1 too, so a dry run never touches the live session.
+
+    The bus row is untouched: ``stop`` is process/session level only.
+    For the full teardown chain ``bridge kill <sid> --hard-stop``
+    runs these layers first and ``db.kill_session`` LAST, folding the
+    layer outcomes into the ``session_killed`` event. Every stop
+    writes a ``session_stopped`` decision event carrying the
+    per-layer outcomes.
+    """
+    sid = args.session_id
+    if db.get_session(sid, path=args.db) is None:
+        resp = JsonResponse(
+            session=sid,
+            status="not_found",
+            error=f"no registration for {sid}",
+        )
+        return _emit(args, resp, ExitCode.NOT_FOUND, f"not registered: {sid}")
+    report = _run_stop_layers(args, sid, hard=args.hard, dry_run=args.dry_run)
+    status = _stop_status(report)
+    db.record_event(sid, "session_stopped", _stop_event_body(report), path=args.db)
+    data = {
+        "cancel_outcome": report["cancel_outcome"],
+        "close_outcome": report["close_outcome"],
+        "swept": report["swept"],
+        "sweep_status": report["sweep_status"],
+        "candidates": report["candidates"],
+        "sweep_excluded": report["sweep_excluded"],
+        "status": status,
+    }
+    if report["backend_pid"] is not None:
+        data["backend_pid"] = report["backend_pid"]
+        data["acp_host_pid"] = report["acp_host_pid"]
+    resp = JsonResponse(session=sid, status=status, data=data)
+    swept = report["swept"]
+    human = (
+        f"stop {sid}: cancel={report['cancel_outcome']}"
+        f" close={report['close_outcome']}"
+        + (f" sweep={report['sweep_status']} swept={len(swept)}" if args.hard else "")
+        + (" [dry-run]" if args.dry_run else "")
+    )
+    if swept:
+        human += " pids=" + ",".join(str(e.get("pid")) for e in swept[:20])
+    # every layer failed before delivery is a real failure, not an
+    # ok-with-caveats: scripts read the exit code before the JSON
+    rc = ExitCode.INTERNAL if status == "error" else ExitCode.OK
+    return _emit(args, resp, rc, human)
+
+
 def _cmd_kill_session(args) -> int:
-    """``bridge kill <sid>``: force-terminate a session's live state (task #210).
+    """``bridge kill <sid> [--hard-stop]``: force-terminate a session's
+    live state (task #210, hard-stop option issue #164).
 
     The detach path for a session that is gone or must be cut loose
     NOW, without ``unregister``'s liveness refusals and row deletion:
@@ -670,9 +858,51 @@ def _cmd_kill_session(args) -> int:
     Every effect lands inside one transaction together with a
     ``session_killed`` ``decision_events`` row, so the durable audit
     cannot separate from the effect.
+
+    ``--hard-stop`` (issue #164) runs the layered stop first - turn
+    cancel, forced ``session/close``, attributed orphan sweep - and
+    the bus teardown LAST, so a failed sweep never leaves the
+    registry claiming alive while the session is dead; the per-layer
+    outcomes fold into the ``session_killed`` event body.
+    ``--dry-run`` previews the layers and the sweep without touching
+    the session or the bus row.
     """
     sid = args.session_id
-    verdict = db.kill_session(sid, path=args.db)
+    want_hard = getattr(args, "hard_stop", False)
+    dry_run = getattr(args, "dry_run", False)
+    stop_report = None
+    if want_hard or dry_run:
+        if db.get_session(sid, path=args.db) is None:
+            resp = JsonResponse(
+                session=sid,
+                status="not_found",
+                error=f"no registration for {sid}",
+            )
+            return _emit(args, resp, ExitCode.NOT_FOUND, f"not registered: {sid}")
+        stop_report = _run_stop_layers(args, sid, hard=want_hard, dry_run=dry_run)
+        if dry_run:
+            status = "dry_run"
+            resp = JsonResponse(
+                session=sid,
+                status=status,
+                data={
+                    "cancel_outcome": stop_report["cancel_outcome"],
+                    "close_outcome": stop_report["close_outcome"],
+                    "swept": stop_report["swept"],
+                    "sweep_status": stop_report["sweep_status"],
+                    "candidates": stop_report["candidates"],
+                    "sweep_excluded": stop_report["sweep_excluded"],
+                    "status": status,
+                },
+            )
+            human = (
+                f"kill {sid} [dry-run]: cancel={stop_report['cancel_outcome']}"
+                f" close={stop_report['close_outcome']}"
+                f" sweep={stop_report['sweep_status']}"
+                f" candidates={len(stop_report['candidates'])} - bus state untouched"
+            )
+            return _emit(args, resp, ExitCode.OK, human)
+    verdict = db.kill_session(sid, stop_report=stop_report, path=args.db)
     if isinstance(verdict, KillNotFound):
         resp = JsonResponse(
             session=sid,
@@ -680,17 +910,25 @@ def _cmd_kill_session(args) -> int:
             error=f"no registration for {sid}",
         )
         return _emit(args, resp, ExitCode.NOT_FOUND, f"not registered: {sid}")
+    data = {
+        "killed": True,
+        "tasks_requeued": verdict.tasks_requeued,
+        "staged_folded": verdict.staged_folded,
+        "heartbeat_removed": verdict.heartbeat_removed,
+        "status_before": verdict.status_before,
+        "mode": verdict.mode,
+    }
+    if stop_report:
+        data["stop"] = {
+            "cancel_outcome": stop_report["cancel_outcome"],
+            "close_outcome": stop_report["close_outcome"],
+            "swept": stop_report["swept"],
+            "sweep_status": stop_report["sweep_status"],
+        }
     resp = JsonResponse(
         session=sid,
         status="ok",
-        data={
-            "killed": True,
-            "tasks_requeued": verdict.tasks_requeued,
-            "staged_folded": verdict.staged_folded,
-            "heartbeat_removed": verdict.heartbeat_removed,
-            "status_before": verdict.status_before,
-            "mode": verdict.mode,
-        },
+        data=data,
     )
     human = (
         f"killed {sid}: status {verdict.status_before}->dead,"
@@ -698,6 +936,12 @@ def _cmd_kill_session(args) -> int:
         f" {verdict.staged_folded} staged folded,"
         f" heartbeat {'removed' if verdict.heartbeat_removed else 'absent'}"
     )
+    if stop_report:
+        human += (
+            f"; stop layers: cancel={stop_report['cancel_outcome']}"
+            f" close={stop_report['close_outcome']}"
+            f" swept={len(stop_report['swept'])}"
+        )
     return _emit(args, resp, ExitCode.OK, human)
 
 
