@@ -711,9 +711,16 @@ def _run_stop_layers(args, sid: str, *, hard: bool, dry_run: bool) -> dict:
     Order is the escalation contract: ``session/cancel`` first (the
     cancel's own confirm window is the ~5s grace the design asks
     for), forced ``session/close`` next, the attributed process
-    sweep last and only under ``--hard``. ``dry_run`` makes the whole
-    ladder side-effect-free: layers 0-1 report ``dry_run`` (nothing
-    is sent) and the sweep enumerates without signalling - the only
+    sweep last and only under ``--hard``. Layer 1 is an ESCALATION,
+    not a fixed step (issue #167): it fires only when layer 0 left
+    the session busy - ``cancel_outcome == "requested"`` is the sole
+    state where escalation is warranted. Every other cancel outcome
+    skips the close with an honest ``skipped:<cancel_outcome>``
+    verdict: ``idle``/``confirmed`` already observed the goal state,
+    and a ``failed:<reason>`` transport would only fail the same way
+    for the close request. ``dry_run`` makes the whole ladder
+    side-effect-free: layers 0-1 report ``dry_run`` (nothing is
+    sent) and the sweep enumerates without signalling - the only
     safe way to preview a real stop on a live host.
     """
     report = {
@@ -727,12 +734,17 @@ def _run_stop_layers(args, sid: str, *, hard: bool, dry_run: bool) -> dict:
             report["cancel_outcome"] = cancel_turn(sid, confirm_timeout=_STOP_CANCEL_CONFIRM)
         except WakeError as e:
             report["cancel_outcome"] = f"failed:{e.reason}"
-        try:
-            report["close_outcome"] = close_session(
-                sid, force=True, confirm_timeout=_STOP_CLOSE_CONFIRM
-            )
-        except WakeError as e:
-            report["close_outcome"] = f"failed:{e.reason}"
+        # Layer 1 escalation gate (issue #167): only "requested" means
+        # the session still reports busy after the layer-0 grace.
+        if report["cancel_outcome"] == "requested":
+            try:
+                report["close_outcome"] = close_session(
+                    sid, force=True, confirm_timeout=_STOP_CLOSE_CONFIRM
+                )
+            except WakeError as e:
+                report["close_outcome"] = f"failed:{e.reason}"
+        else:
+            report["close_outcome"] = f"skipped:{report['cancel_outcome']}"
     report.update(
         _run_sweep(args, sid, dry_run=dry_run)
         if hard
@@ -756,16 +768,20 @@ def _stop_status(report: dict) -> str:
     means at least one layer delivered without confirmation - or a
     dry-run enumeration is all that ran; ``error`` means every layer
     failed before delivery - and an unexpected ladder exception is
-    always an error, even on a dry run.
+    always an error, even on a dry run. A ``skipped:<reason>``
+    outcome (issue #167) is neither: the skip itself makes no claim,
+    so the verdict folds from the layer that actually ran -
+    ``idle``/``confirmed`` cancels still reach ``stopped`` while a
+    skipped close after a failed cancel stays ``error``.
     """
     if report.get("stop_exception"):
         return "error"
     if report["dry_run"]:
         return "dry_run"
     outcomes = (report["cancel_outcome"], report["close_outcome"])
-    if "confirmed" in outcomes or outcomes == ("idle", "idle"):
+    if "confirmed" in outcomes or "idle" in outcomes:
         return "stopped"
-    if "idle" in outcomes or "requested" in outcomes or report["swept"]:
+    if "requested" in outcomes or report["swept"]:
         return "requested"
     return "error"
 
@@ -795,7 +811,11 @@ def _cmd_stop(args) -> int:
       ``confirmed`` / ``requested`` / ``failed:<reason>``) - proven
       ~3s on a live busy session;
     - layer 1: forced ``session/close`` (``cognition.ai/force``) -
-      the strongest session-scoped primitive the host exposes;
+      the strongest session-scoped primitive the host exposes -
+      fired ONLY when layer 0 left the session busy
+      (``cancel=requested``, issue #167); every other cancel outcome
+      records ``skipped:<cancel_outcome>`` instead of hitting the
+      same transport or a state that needs no close;
     - layer 2 (``--hard`` only): the attributed orphan sweep -
       SIGTERM -> grace -> SIGKILL for backend-tree processes
       attributable to this session (workspace cwd or explicit sid
@@ -890,10 +910,12 @@ def _cmd_kill_session(args) -> int:
     cannot separate from the effect.
 
     ``--hard-stop`` (issue #164) runs the layered stop first - turn
-    cancel, forced ``session/close``, attributed orphan sweep - and
-    the bus teardown LAST, so a failed sweep never leaves the
-    registry claiming alive while the session is dead; the per-layer
-    outcomes fold into the ``session_killed`` event body.
+    cancel, forced ``session/close`` as an escalation only while the
+    session still reports busy (issue #167), attributed orphan
+    sweep - and the bus teardown LAST, so a failed sweep never
+    leaves the registry claiming alive while the session is dead;
+    the per-layer outcomes fold into the ``session_killed`` event
+    body.
     ``--dry-run`` previews the layers and the sweep without touching
     the session or the bus row.
     """

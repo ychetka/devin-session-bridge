@@ -4160,7 +4160,7 @@ def test_issue164_gwt6_kill_hard_stop_chains_layers_then_teardown(env, capsys, m
     db.heartbeat("w1", path=env.db)
     tid = _task(env, sid="w1")
     _claim_acp(env, tid)
-    monkeypatch.setattr(sessions, "cancel_turn", lambda sid, **kw: "confirmed")
+    monkeypatch.setattr(sessions, "cancel_turn", lambda sid, **kw: "requested")
     monkeypatch.setattr(sessions, "close_session", lambda sid, **kw: "requested")
     canned = {
         "sweep_status": "ok",
@@ -4179,14 +4179,14 @@ def test_issue164_gwt6_kill_hard_stop_chains_layers_then_teardown(env, capsys, m
     assert rc == ExitCode.OK
     d = out["data"]
     assert d["killed"] and d["tasks_requeued"] == 1
-    assert d["stop"]["cancel_outcome"] == "confirmed"
+    assert d["stop"]["cancel_outcome"] == "requested"
     assert d["stop"]["close_outcome"] == "requested"
     assert d["stop"]["swept"][0]["pid"] == 424242
     assert db.get_session("w1", path=env.db)["status"] == "dead"
     ev = db.list_events(session_id="w1", kind="session_killed", path=env.db)
     assert len(ev) == 1
     body = ev[0]["body"]
-    assert "stop_cancel=confirmed" in body
+    assert "stop_cancel=requested" in body
     assert "stop_close=requested" in body
     assert "swept_pids=[424242]" in body
 
@@ -4245,7 +4245,9 @@ def test_issue164_gwt10_stop_all_layers_failed_is_internal(env, capsys, monkeypa
     """[ISSUE-164.CLI-10] review MINOR: every layer failing before
     delivery reports status=error AND exits non-zero - scripts read
     the exit code before the JSON, so a refused stop cannot masquerade
-    as an ok-with-caveats."""
+    as an ok-with-caveats. Under the issue #167 gate a failed cancel
+    also skips the close (the same transport would refuse it), so
+    nothing was delivered on either layer."""
     db.register("w1", "/repo/w", path=env.db)
 
     def _down(*a, **kw):
@@ -4259,7 +4261,7 @@ def test_issue164_gwt10_stop_all_layers_failed_is_internal(env, capsys, monkeypa
     assert rc == ExitCode.INTERNAL
     assert out["status"] == "error"
     assert out["data"]["cancel_outcome"] == "failed:wake_host_down"
-    assert out["data"]["close_outcome"] == "failed:wake_host_down"
+    assert out["data"]["close_outcome"] == "skipped:failed:wake_host_down"
     ev = db.list_events(session_id="w1", kind="session_stopped", path=env.db)
     assert len(ev) == 1 and "status=error" in ev[0]["body"]
 
@@ -4317,3 +4319,183 @@ def test_issue164_gwt12_stop_layer_crash_still_writes_audit(env, capsys, monkeyp
     assert len(ev) == 1
     assert "status=error" in ev[0]["body"]
     assert "stop_exception=RuntimeError" in ev[0]["body"]
+
+
+# --- issue #167: layer-1 close is a conditional escalation -----------------
+
+
+def test_issue167_gwt1_stop_idle_cancel_skips_close(env, capsys, monkeypatch):
+    """[ISSUE-167.CLI-1] cancel=idle means the goal state is already
+    observed: the forced session/close is NEVER sent - close_session
+    is not called - and close_outcome reports skipped:idle in the
+    JSON, the session_stopped event and the human line. The verdict
+    is 'stopped' (observed idle), a skip is not a stop claim."""
+    db.register("w1", "/repo/w", path=env.db)
+    sent = []
+    monkeypatch.setattr(sessions, "cancel_turn", lambda sid, **kw: "idle")
+    monkeypatch.setattr(
+        sessions,
+        "close_session",
+        lambda sid, **kw: sent.append(sid) or "confirmed",
+    )
+
+    rc, out = _run(["stop", "w1", "--json"], capsys)
+
+    assert rc == ExitCode.OK
+    assert sent == []  # layer 1 must not fire on an idle session
+    d = out["data"]
+    assert d["cancel_outcome"] == "idle"
+    assert d["close_outcome"] == "skipped:idle"
+    assert d["status"] == "stopped"
+    ev = db.list_events(session_id="w1", kind="session_stopped", path=env.db)
+    assert len(ev) == 1
+    assert "cancel=idle" in ev[0]["body"]
+    assert "close=skipped:idle" in ev[0]["body"]
+    assert "status=stopped" in ev[0]["body"]
+
+    # the human line carries the same honest skip reason
+    rc = bridge.main(["stop", "w1"])
+    human = capsys.readouterr().out.strip()
+    assert rc == ExitCode.OK
+    assert "cancel=idle" in human and "close=skipped:idle" in human
+
+
+def test_issue167_gwt2_stop_confirmed_cancel_skips_close(env, capsys, monkeypatch):
+    """[ISSUE-167.CLI-2] cancel=confirmed observed the turn stopped:
+    no escalation is warranted - close_session is not called and
+    close_outcome reports skipped:confirmed under status=stopped."""
+    db.register("w1", "/repo/w", path=env.db)
+    sent = []
+    monkeypatch.setattr(sessions, "cancel_turn", lambda sid, **kw: "confirmed")
+    monkeypatch.setattr(
+        sessions,
+        "close_session",
+        lambda sid, **kw: sent.append(sid) or "confirmed",
+    )
+
+    rc, out = _run(["stop", "w1", "--json"], capsys)
+
+    assert rc == ExitCode.OK
+    assert sent == []
+    d = out["data"]
+    assert d["cancel_outcome"] == "confirmed"
+    assert d["close_outcome"] == "skipped:confirmed"
+    assert d["status"] == "stopped"
+    ev = db.list_events(session_id="w1", kind="session_stopped", path=env.db)
+    assert len(ev) == 1 and "close=skipped:confirmed" in ev[0]["body"]
+
+
+def test_issue167_gwt3_stop_requested_cancel_runs_close(env, capsys, monkeypatch):
+    """[ISSUE-167.CLI-3] cancel=requested is the ONE outcome that
+    escalates: the session still reports busy after the layer-0
+    grace, so the forced close fires and reports its real outcome."""
+    db.register("w1", "/repo/w", path=env.db)
+    seen = []
+    monkeypatch.setattr(
+        sessions, "cancel_turn", lambda sid, **kw: seen.append("cancel") or "requested"
+    )
+    monkeypatch.setattr(
+        sessions,
+        "close_session",
+        lambda sid, **kw: seen.append("close") or "confirmed",
+    )
+
+    rc, out = _run(["stop", "w1", "--json"], capsys)
+
+    assert rc == ExitCode.OK
+    assert seen == ["cancel", "close"]  # escalation order preserved
+    d = out["data"]
+    assert d["cancel_outcome"] == "requested"
+    assert d["close_outcome"] == "confirmed"
+    assert d["status"] == "stopped"
+
+
+def test_issue167_gwt4_stop_failed_cancel_skips_close(env, capsys, monkeypatch):
+    """[ISSUE-167.CLI-4] cancel=failed:<reason> means the transport
+    refused - a close attempt would hit the same dead transport, so
+    it is skipped with the honest skipped:failed:<reason> verdict
+    (the skip is recorded, not masked). No delivery happened, so the
+    verdict stays error and exits non-zero."""
+    db.register("w1", "/repo/w", path=env.db)
+    sent = []
+
+    def _down(*a, **kw):
+        raise WakeError("wake_host_down", "no acp-host lockfile")
+
+    monkeypatch.setattr(sessions, "cancel_turn", _down)
+    monkeypatch.setattr(
+        sessions,
+        "close_session",
+        lambda sid, **kw: sent.append(sid) or "confirmed",
+    )
+
+    rc, out = _run(["stop", "w1", "--json"], capsys)
+
+    assert rc == ExitCode.INTERNAL
+    assert sent == []
+    assert out["status"] == "error"
+    d = out["data"]
+    assert d["cancel_outcome"] == "failed:wake_host_down"
+    assert d["close_outcome"] == "skipped:failed:wake_host_down"
+    ev = db.list_events(session_id="w1", kind="session_stopped", path=env.db)
+    assert len(ev) == 1
+    assert "close=skipped:failed:wake_host_down" in ev[0]["body"]
+    assert "status=error" in ev[0]["body"]
+
+
+def test_issue167_gwt5_real_close_rpc_error_stays_honest(env, capsys, monkeypatch):
+    """[ISSUE-167.CLI-5] only the UNCONDITIONAL invocation was the
+    bug: when the escalation gate does fire (cancel=requested), a
+    WakeError on the real close attempt is still reported verbatim
+    as failed:<reason>, never converted into a skip."""
+    db.register("w1", "/repo/w", path=env.db)
+    seen = []
+    monkeypatch.setattr(sessions, "cancel_turn", lambda sid, **kw: "requested")
+
+    def _rpc_err(*a, **kw):
+        seen.append("close")
+        raise WakeError("rpc_error", "close rejected")
+
+    monkeypatch.setattr(sessions, "close_session", _rpc_err)
+
+    rc, out = _run(["stop", "w1", "--json"], capsys)
+
+    assert rc == ExitCode.OK
+    assert seen == ["close"]
+    d = out["data"]
+    assert d["cancel_outcome"] == "requested"
+    assert d["close_outcome"] == "failed:rpc_error"
+    assert d["status"] == "requested"
+
+
+def test_issue167_gwt6_kill_hard_stop_inherits_close_skip(env, capsys, monkeypatch):
+    """[ISSUE-167.CLI-6] `bridge kill <sid> --hard-stop` shares
+    _run_stop_layers, so the same gate applies: cancel=idle skips
+    the close (close_session never called), the skipped outcome
+    folds into the JSON stop block and the session_killed event,
+    and the bus teardown still runs last."""
+    db.register("w1", "/repo/w", path=env.db)
+    db.heartbeat("w1", path=env.db)
+    tid = _task(env, sid="w1")
+    _claim_acp(env, tid)
+    sent = []
+    monkeypatch.setattr(sessions, "cancel_turn", lambda sid, **kw: "idle")
+    monkeypatch.setattr(
+        sessions,
+        "close_session",
+        lambda sid, **kw: sent.append(sid) or "confirmed",
+    )
+
+    rc, out = _run(["kill", "w1", "--hard-stop", "--json"], capsys)
+
+    assert rc == ExitCode.OK
+    assert sent == []
+    d = out["data"]
+    assert d["killed"] and d["tasks_requeued"] == 1
+    assert d["stop"]["cancel_outcome"] == "idle"
+    assert d["stop"]["close_outcome"] == "skipped:idle"
+    assert db.get_session("w1", path=env.db)["status"] == "dead"
+    ev = db.list_events(session_id="w1", kind="session_killed", path=env.db)
+    assert len(ev) == 1
+    assert "stop_cancel=idle" in ev[0]["body"]
+    assert "stop_close=skipped:idle" in ev[0]["body"]
