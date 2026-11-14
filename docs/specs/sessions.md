@@ -56,10 +56,15 @@ to `queued` for re-claim - work survives the worker.
 
 `bridge stop` SHALL run the hard-stop ladder against a registered
 session in escalation order - `session/cancel`, then forced
-`session/close`, then the attributed orphan sweep under `--hard` -
-without touching the bus row, and SHALL report each layer's observed
-outcome (`idle`/`confirmed`/`requested`/`failed:<reason>`) instead of
-claiming a stop that was only requested. `bridge kill <sid>
+`session/close` as an escalation fired ONLY while the session still
+reports busy after the cancel's confirm window
+(`cancel_outcome=requested`; any other cancel outcome skips the
+close and reports `skipped:<cancel_outcome>`), then the attributed
+orphan sweep under `--hard` - without touching the bus row, and
+SHALL report each layer's observed outcome
+(`idle`/`confirmed`/`requested`/`failed:<reason>`/
+`skipped:<reason>`) instead of claiming a stop that was only
+requested. `bridge kill <sid>
 --hard-stop` SHALL run the same ladder BEFORE `db.kill_session` and
 fold the per-layer outcomes into the `session_killed` event body;
 `--dry-run` SHALL enumerate layers and sweep victims without sending,

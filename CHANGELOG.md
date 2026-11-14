@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.15.8] - 2026-11-14
+
+### User-facing
+
+#### fix
+- `bridge stop` and `bridge kill --hard-stop` escalate to forced `session/close` only while the session still reports busy after `session/cancel` (`cancel_outcome=requested`); an `idle`/`confirmed`/`failed:<reason>` cancel skips the close and reports `skipped:<cancel_outcome>`. `cli` (issue #167, task 345, docs/SESSION_HARD_STOP.md)
+
+### Codebase
+
+#### cli
+- [fix] `_run_stop_layers` gates layer 1 on `cancel_outcome == 'requested'` and records an honest `skipped:<cancel_outcome>` otherwise; `_stop_status` folds a skipped close from the layer that actually ran (`idle`/`confirmed` cancel + skipped close -> `stopped`; failed cancel + skipped close -> `error`); spec and OPERATOR rows updated. Why: Observed live: `bridge stop` on an idle session ran the forced close unconditionally and reported `cancel_outcome=idle + close_outcome=failed:rpc_error`. Layer 1 is an escalation per docs/SESSION_HARD_STOP.md - warranted only while the session still reports busy - and a close on a refused transport could only fail the same way. (issue #167, task 345, docs/SESSION_HARD_STOP.md)
+
 ## [0.15.7] - 2026-11-13
 
 ### User-facing
