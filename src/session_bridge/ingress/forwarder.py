@@ -59,6 +59,13 @@ def _pump(a: socket.socket, b: socket.socket) -> None:
 
 
 def main(argv: list[str]) -> int:
+    # issue #168 blast radius: the forwarder is long-lived shared
+    # infra - drop an inherited DEVIN_SESSION_ID so it (and anything
+    # it might spawn) is never an orphan-sweep target for a session
+    # that happened to launch the reconciler marked. Literal var name:
+    # this module stays self-contained (no package imports beyond
+    # spec) per the module docstring.
+    os.environ.pop("DEVIN_SESSION_ID", None)
     if len(argv) != 4:
         sys.stderr.write("usage: forwarder <bind> <port> <spec>\n")
         return 2

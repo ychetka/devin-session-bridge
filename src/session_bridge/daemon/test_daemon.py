@@ -3129,3 +3129,50 @@ def test_issue142_daemon_persists_session_cap(env, monkeypatch):
     monkeypatch.setattr(db, "MAX_ACTIVE_SESSIONS", 1)
     assert daemon.run(env.db, env.qdir, once=True) == daemon.RUN_OK
     assert db.effective_max_active_sessions(path=env.db) == 1
+
+
+# --- issue #168 review: infra entrypoints strip DEVIN_SESSION_ID ---------------
+
+
+def test_issue168_daemon_run_strips_inherited_marker(env, monkeypatch):
+    """[ISSUE-168.REVIEW-1] a ``bridge daemon run`` launched inside a
+    marked session shell would otherwise carry the caller's sid into
+    every helper the supervisor spawns - the daemon entry pops the
+    marker before the loop starts (blast-radius guard; the spawn seam
+    in ops._spawn_daemon strips the exec-time copy too)."""
+    from session_bridge.env_marker import SESSION_ID_ENV
+
+    monkeypatch.setenv(SESSION_ID_ENV, "s1")
+    assert daemon.run(env.db, env.qdir, once=True) == daemon.RUN_OK
+    assert SESSION_ID_ENV not in os.environ
+
+
+def test_issue168_spawn_daemon_strips_marker_from_exec_env(env, monkeypatch):
+    """[ISSUE-168.REVIEW-1b] ``bridge daemon start`` from a marked
+    shell: the detached child's EXEC-TIME env (what /proc/<pid>/
+    environ shows the sweep) must not carry DEVIN_SESSION_ID."""
+    from types import SimpleNamespace as _NS
+
+    from session_bridge.cli.commands import ops
+    from session_bridge.env_marker import SESSION_ID_ENV
+
+    monkeypatch.setenv(SESSION_ID_ENV, "s1")
+    captured = {}
+
+    class _FakeProc:
+        pid = 4242
+
+    def fake_popen(argv, **kw):
+        captured["argv"] = argv
+        captured["env"] = kw.get("env")
+        return _FakeProc()
+
+    monkeypatch.setattr(ops.subprocess, "Popen", fake_popen)
+    args = _NS(db=env.db, queue_dir=env.qdir, interval=None)
+    proc = ops._spawn_daemon(args)
+
+    assert proc.pid == 4242
+    assert SESSION_ID_ENV not in captured["env"]
+    # the marker is stripped only from the child's copy - the caller's
+    # own environment is untouched
+    assert os.environ[SESSION_ID_ENV] == "s1"

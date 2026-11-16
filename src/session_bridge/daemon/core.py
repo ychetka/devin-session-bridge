@@ -47,6 +47,7 @@ import tempfile
 import threading
 import time
 
+from session_bridge.env_marker import unmark_env
 from session_bridge.mailbox import mailbox_dir, queue_root, write_message
 from session_bridge.quota import DEFAULT_PARK_SECONDS, parse_quota_signal
 from session_bridge.state import db
@@ -2276,6 +2277,14 @@ def run(
     random pre-loop delay that spreads fleet restarts - skipped in
     once mode.
     """
+    # issue #168 blast radius: the daemon is fleet-wide infra. A
+    # ``bridge daemon run`` invoked inside a marked session shell
+    # inherits the caller's DEVIN_SESSION_ID - drop it at the entry
+    # so no helper the supervisor spawns (forwarders, notify-send)
+    # becomes an orphan-sweep target for that session. The spawn
+    # seam (ops._spawn_daemon) strips it from the exec-time env too,
+    # which is the copy /proc/<pid>/environ shows.
+    unmark_env()
     state_directory = state_dir(db_path)
     os.makedirs(state_directory, exist_ok=True)
     lock_fd = _acquire_lock(state_directory)
