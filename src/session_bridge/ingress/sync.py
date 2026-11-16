@@ -34,6 +34,7 @@ import subprocess
 import sys
 import time
 
+from session_bridge.env_marker import SESSION_ID_ENV
 from session_bridge.ingress.spec import (
     _KINDS,
     ForwardSpec,
@@ -140,6 +141,12 @@ def _kill(pid: int, port: str) -> None:
 def _spawn(state_dir: str, port: int, spec: ForwardSpec) -> int:
     os.makedirs(os.path.join(state_dir, "logs"), exist_ok=True)
     env = dict(os.environ)
+    # issue #168 blast radius: a detached forwarder is long-lived
+    # host infra - a caller's DEVIN_SESSION_ID in its exec-time env
+    # (what /proc/<pid>/environ shows) would make it an orphan-sweep
+    # target for that session. forwarder.main pops the inherited copy
+    # again so any future children stay unmarked too.
+    env.pop(SESSION_ID_ENV, None)
     src = _src_root()
     prev = env.get("PYTHONPATH")
     env["PYTHONPATH"] = f"{src}{os.pathsep}{prev}" if prev else src

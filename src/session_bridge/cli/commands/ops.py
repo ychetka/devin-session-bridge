@@ -19,6 +19,7 @@ from session_bridge.cli.contract import (
 )
 from session_bridge.cli.dispatch import _logs_dir
 from session_bridge.daemon import core as daemon
+from session_bridge.env_marker import SESSION_ID_ENV
 from session_bridge.state import db
 
 #: ``--every`` grammar: a number plus an optional unit suffix
@@ -249,6 +250,13 @@ def _spawn_daemon(args) -> subprocess.Popen:
     if getattr(args, "interval", None):
         argv += ["--interval", str(args.interval)]
     env = dict(os.environ)
+    # issue #168 blast radius: ``bridge daemon start`` run inside a
+    # marked session shell would stamp the fleet-wide daemon with the
+    # caller's sid in its /proc environ (the exec-time env), making it
+    # a pass-2 orphan-sweep target - never let the marker reach the
+    # child. daemon.core.run pops it again in-process so helpers stay
+    # clean even on launch paths that bypass this seam.
+    env.pop(SESSION_ID_ENV, None)
     src = os.path.dirname(
         os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     )

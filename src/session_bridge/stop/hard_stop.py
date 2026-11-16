@@ -65,6 +65,8 @@ import signal
 import time
 from typing import NamedTuple
 
+from session_bridge.env_marker import SESSION_ID_ENV
+
 __all__ = [
     "BACKEND_SPAWN_GRACE_SECONDS",
     "SWEEP_TERM_GRACE_SECONDS",
@@ -106,7 +108,9 @@ _MIN_CWD_DEPTH = 2
 #: the env marker prefix inside ``/proc/<pid>/environ`` (issue #168;
 #: injected where the bridge controls the exec-time environment -
 #: see ``session_bridge.env_marker`` for the covered surfaces).
-_ENV_MARK = b"DEVIN_SESSION_ID="
+#: Derived from the shared constant so the sweep can never drift
+#: away from the injection-side name.
+_ENV_MARK = SESSION_ID_ENV.encode() + b"="
 
 
 class ProcInfo(NamedTuple):

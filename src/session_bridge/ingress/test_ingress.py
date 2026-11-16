@@ -468,3 +468,44 @@ def test_reserve_fwd_rejects_non_port(tmp_path):
         ]
     )
     assert rc == ExitCode.USAGE
+
+
+# --- issue #168 review: forwarder spawn strips DEVIN_SESSION_ID ----------------
+
+
+def test_issue168_spawn_strips_marker_from_exec_env(tmp_path, monkeypatch):
+    """[ISSUE-168.REVIEW-1c] a detached forwarder is long-lived host
+    infra - when the reconciler runs inside a marked session shell,
+    the child's exec-time env (the /proc/<pid>/environ the sweep
+    reads) must not carry the caller's DEVIN_SESSION_ID."""
+    from session_bridge.env_marker import SESSION_ID_ENV
+
+    monkeypatch.setenv(SESSION_ID_ENV, "s1")
+    captured = {}
+
+    class _FakeProc:
+        pid = 4343
+
+    def fake_popen(argv, **kw):
+        captured["env"] = kw.get("env")
+        return _FakeProc()
+
+    monkeypatch.setattr(sync_mod.subprocess, "Popen", fake_popen)
+    pid = sync_mod._spawn(str(tmp_path), 12345, parse_fwd_spec("tcp:127.0.0.1:9"))
+
+    assert pid == 4343
+    assert SESSION_ID_ENV not in captured["env"]
+    assert os.environ[SESSION_ID_ENV] == "s1"  # caller env untouched
+
+
+def test_issue168_forwarder_main_pops_inherited_marker(monkeypatch):
+    """[ISSUE-168.REVIEW-1d] forwarder.main drops an inherited marker
+    at its entry (defense for launch paths bypassing sync._spawn);
+    argv validation still runs afterwards."""
+    from session_bridge.env_marker import SESSION_ID_ENV
+    from session_bridge.ingress import forwarder
+
+    monkeypatch.setenv(SESSION_ID_ENV, "s1")
+    rc = forwarder.main(["forwarder"])  # bad argc -> 2, after the pop
+    assert rc == 2
+    assert SESSION_ID_ENV not in os.environ

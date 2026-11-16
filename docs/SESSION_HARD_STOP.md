@@ -212,6 +212,15 @@ honest, not bugs):
 - the bridge daemon, ingress forwarders, notify-send: host
   infrastructure with no session scope.
 
+Blast radius (review 5926327596): the marker propagates by
+inheritance through any spawn inside a marked subtree, so a
+long-lived infra process launched from a marked shell would carry a
+stale sid and become a pass-2 orphan-sweep target. The infra
+entrypoints strip it twice: `ops._spawn_daemon` and
+`ingress.sync._spawn` drop it from the child's exec-time env, and
+`daemon.core.run` / `ingress.forwarder.main` pop the inherited copy
+(`env_marker.unmark_env`) so nothing they spawn sees it either.
+
 Marker-less or uncovered processes simply fall back to the existing
 cwd/cmdline heuristics - partial coverage is a win, never a
 misattribution vector.

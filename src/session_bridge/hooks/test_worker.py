@@ -939,12 +939,14 @@ def test_issue168_gwt2_self_mark_degrades_without_reexec(tmp_path, monkeypatch):
     worker._self_mark("s1", "{}", argv=["--db", "x"], exec_fn=lambda *a: calls.append(a))
     assert calls == []
     assert os.environ["DEVIN_SESSION_ID"] == "s1"
-    # re-exec guard present: never re-execs again
+    # re-exec guard present: never re-execs again, and the guard var
+    # is consumed (popped) so children cannot inherit it
     monkeypatch.setenv(worker._HOOK_ENV_MARKED, "1")
     worker._self_mark("s1", "{}", exec_fn=lambda *a: calls.append(a))
     assert calls == []
+    assert worker._HOOK_ENV_MARKED not in os.environ
     # exec failure: swallowed, the marker stays for children
-    monkeypatch.delenv(worker._HOOK_ENV_MARKED)
+    monkeypatch.delenv(worker._HOOK_ENV_MARKED, raising=False)
     script = tmp_path / "worker.py"
     script.write_text("# stub\n")
     monkeypatch.setattr(sys, "argv", [str(script)])
@@ -974,3 +976,18 @@ def test_issue168_gwt3_main_consumes_relayed_payload(env, monkeypatch, capsys):
     row = db.get_session(SID, path=env["db"])
     assert row is not None
     assert "clear" in (row["note"] or "")
+    # both relay vars are consumed: they must not linger in the
+    # environment this worker's children would inherit (review fix)
+    assert worker._HOOK_PAYLOAD_ENV not in os.environ
+    assert worker._HOOK_ENV_MARKED not in os.environ
+
+
+def test_issue168_gwt4_main_pops_relay_payload_without_valid_payload(env, monkeypatch):
+    """[ISSUE-168.GWT-4] the env relay is popped even when its content
+    is garbage - main() still exits 0 and the var does not survive to
+    children (issue #168 review finding: /proc environ leak)."""
+    monkeypatch.setenv(worker._HOOK_PAYLOAD_ENV, "not-json")
+    monkeypatch.setattr(sys, "stdin", io.StringIO(""))
+    rc = worker.main(env["argv"])
+    assert rc == 0
+    assert worker._HOOK_PAYLOAD_ENV not in os.environ

@@ -214,11 +214,15 @@ def _self_mark(session_id: str, raw_payload: str, argv=None, *, exec_fn=None) ->
     degrades to child-only marking - marking never risks the hook
     answer contract.
     """
+    # the guard is this worker's own re-exec marker - pop it as we
+    # read it so children never inherit a copy that would make a
+    # future worker spawned beneath us skip its own marking.
+    already_marked = os.environ.pop(_HOOK_ENV_MARKED, None)
     sid = (session_id or "").strip()
     if not sid:
         return
     os.environ[SESSION_ID_ENV] = sid  # children inherit regardless
-    if argv is not None or os.environ.get(_HOOK_ENV_MARKED):
+    if argv is not None or already_marked:
         return
     script = os.path.abspath(sys.argv[0] or "")
     if not os.path.isfile(script):
@@ -228,8 +232,8 @@ def _self_mark(session_id: str, raw_payload: str, argv=None, *, exec_fn=None) ->
     env[_HOOK_PAYLOAD_ENV] = raw_payload
     try:
         (exec_fn or os.execvpe)(sys.executable, [sys.executable, script, *sys.argv[1:]], env)
-    except OSError:
-        pass
+    except Exception:
+        pass  # the always-exit-0 hook contract: marking is best-effort
 
 
 # --- managed mode (mailbox duty) ----------------------------------------------
@@ -601,8 +605,10 @@ def _dispatch(payload: HookPayload, args, cfg: ParkConfig | None):
 def main(argv=None) -> int:
     """Hook entry point: read one payload, maybe answer, always exit 0."""
     args = _parse_args(argv)
-    # the re-exec'd second pass receives the drained payload via env
-    raw = os.environ.get(_HOOK_PAYLOAD_ENV)
+    # the re-exec'd second pass receives the drained payload via env;
+    # pop() so the relay var cannot linger in this worker's children
+    # (issue #168 review).
+    raw = os.environ.pop(_HOOK_PAYLOAD_ENV, None)
     if raw is None:
         try:
             raw = sys.stdin.read()
