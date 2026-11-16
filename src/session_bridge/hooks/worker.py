@@ -64,6 +64,7 @@ import subprocess
 import sys
 import time
 
+from session_bridge.env_marker import SESSION_ID_ENV
 from session_bridge.hooks.contract import (
     HOOK_TIMEOUT_DEFAULT,
     PARKED_TASK_PREFIX,
@@ -98,6 +99,15 @@ SESSION_ENDED_NOTE = "session ended"
 
 _POLL_SECONDS = 2.0  # fallback check interval when inotifywait is absent
 _INOTIFY_GRACE_SECONDS = 10  # head-room around inotifywait's own -t
+
+#: env relay for the already-consumed stdin payload through the
+#: marker re-exec (issue #168) - the second pass reads it instead of
+#: stdin, which the first pass drained.
+_HOOK_PAYLOAD_ENV = "SESSIONS_BRIDGE_HOOK_PAYLOAD"
+
+#: re-exec guard: set in the re-exec'd environment so the second pass
+#: never re-execs again even if the payload relay is dropped.
+_HOOK_ENV_MARKED = "SESSIONS_BRIDGE_HOOK_ENV_MARKED"
 
 
 def _log(msg: str) -> None:
@@ -189,6 +199,37 @@ def _context(text: str, event=HookEventName.USER_PROMPT_SUBMIT) -> str:
             additional_context=text,
         )
     ).model_dump_json(by_alias=True)
+
+
+def _self_mark(session_id: str, raw_payload: str, argv=None, *, exec_fn=None) -> None:
+    """Best-effort ``DEVIN_SESSION_ID`` self-marking (issue #168).
+
+    ``/proc/<pid>/environ`` only reflects the exec-time environment,
+    so the worker's OWN marker needs a one-shot re-exec once the
+    payload has revealed the sid; the already-consumed stdin payload
+    is relayed through ``SESSIONS_BRIDGE_HOOK_PAYLOAD`` and the second
+    pass reads it instead of stdin. The ``os.environ`` write alone
+    already marks every child the worker spawns (the inotifywait
+    watcher), so an exec failure or an argv-driven (test) invocation
+    degrades to child-only marking - marking never risks the hook
+    answer contract.
+    """
+    sid = (session_id or "").strip()
+    if not sid:
+        return
+    os.environ[SESSION_ID_ENV] = sid  # children inherit regardless
+    if argv is not None or os.environ.get(_HOOK_ENV_MARKED):
+        return
+    script = os.path.abspath(sys.argv[0] or "")
+    if not os.path.isfile(script):
+        return
+    env = dict(os.environ)
+    env[_HOOK_ENV_MARKED] = "1"
+    env[_HOOK_PAYLOAD_ENV] = raw_payload
+    try:
+        (exec_fn or os.execvpe)(sys.executable, [sys.executable, script, *sys.argv[1:]], env)
+    except OSError:
+        pass
 
 
 # --- managed mode (mailbox duty) ----------------------------------------------
@@ -560,17 +601,21 @@ def _dispatch(payload: HookPayload, args, cfg: ParkConfig | None):
 def main(argv=None) -> int:
     """Hook entry point: read one payload, maybe answer, always exit 0."""
     args = _parse_args(argv)
-    try:
-        raw = sys.stdin.read()
-    except Exception as e:
-        _log(f"cannot read stdin: {e}")
-        return 0
+    # the re-exec'd second pass receives the drained payload via env
+    raw = os.environ.get(_HOOK_PAYLOAD_ENV)
+    if raw is None:
+        try:
+            raw = sys.stdin.read()
+        except Exception as e:
+            _log(f"cannot read stdin: {e}")
+            return 0
     try:
         data = json.loads(raw) if raw.strip() else {}
         payload = parse_hook_payload(data)
     except Exception as e:
         _log(f"invalid hook payload: {e}")
         return 0
+    _self_mark(getattr(payload, "session_id", ""), raw, argv)
     cfg = _park_config(args)
     try:
         db.init(args.db)  # idempotent: schema may not exist yet

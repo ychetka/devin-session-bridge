@@ -1,8 +1,9 @@
 # Hard-stop for managed sessions: kill/stop semantics gap
 
 Analysis of the 2026-11-13 incident and the design for a real
-hard-stop path. Status: analysis + implementation plan, not yet
-implemented (issue #164).
+hard-stop path. Status: implemented - the layered ladder shipped in
+v0.15.7/v0.15.8 (issues #164, #167) and the env-marker attribution
+of section 6 in v0.15.9 (issue #168).
 
 ## 1. Incident
 
@@ -162,12 +163,60 @@ requeue, heartbeat is removed, and the `session_killed` audit
 row records that layers 0-2 ran first (new fields:
 `cancel_outcome`, `close_outcome`, `swept_pids[]`).
 
-## 6. Longer-term hardening (not v1)
+## 6. Env-marker attribution (implemented, issue #168)
 
-- **Env/cmdline marker for hook workers and spawned shells:**
-  pass `DEVIN_SESSION_ID=<sid>` into hook-spawned processes so
-  attribution stops being heuristic. Requires hook-config
-  cooperation, not bridge-only.
+`DEVIN_SESSION_ID=<sid>` in a process's **exec-time environment**
+(the only form `/proc/<pid>/environ` can attribute - an `export`
+inside a running shell never shows up there, verified live) is a
+STRONG marker equal to the cmdline markers: it sweeps regardless of
+process age and is recorded as `env:DEVIN_SESSION_ID`
+(`orphan_env:DEVIN_SESSION_ID` in the reparented-orphan pass).
+An env naming a DIFFERENT registered session is a foreign exclusion
+exactly like a foreign marker hit; a missing/foreign-unregistered
+value is dead text and the cwd/marker heuristics decide.
+
+The marker is injected ONLY where the bridge genuinely controls the
+process environment at spawn - pretending otherwise would stamp
+wrong or dead markers:
+
+- **acp-push workers** (`dispatch._spawn_worker`): every
+  `bridge _work` child is born marked; the worker's own `devin acp`
+  subprocess and every process that backend spawns for the session
+  inherit it - the deepest coverage the bridge owns.
+- **Managed-session watcher + drain observer**
+  (`mailbox.watcher_command_text`, the duty text): the rendered
+  commands carry a `DEVIN_SESSION_ID=<sid>` env-assignment prefix
+  (heredoc-wrapped watcher loop, `bash -c`-wrapped observer). This
+  is command text the session runs - coverage is best-effort,
+  LLM-mediated, not guaranteed.
+- **Hook worker** (`hooks/worker.py`): the sid arrives on stdin,
+  after exec - so the worker re-execs itself once with the marker
+  plus the drained payload relayed via
+  `SESSIONS_BRIDGE_HOOK_PAYLOAD` (a parked Stop hook is exactly the
+  lingering-orphan class the marker exists for). Children it spawns
+  (inotifywait) inherit the `os.environ` write regardless; a failed
+  exec degrades to child-only marking.
+
+Surfaces deliberately NOT marked (documented so coverage gaps are
+honest, not bugs):
+
+- the shared `devin acp` backend and the acp-host supervisor:
+  upstream-owned env, and a per-sid marker on the fleet-wide backend
+  would be wrong by definition;
+- exec shells the backend spawns for sessions delivered through the
+  acp-host (wake/hook paths): their env comes from the backend, not
+  from us;
+- hook commands installed by `install_hooks.sh`: the command is
+  per-repo and knows no sid at install time - the worker's re-exec
+  covers the hook process itself instead;
+- the bridge daemon, ingress forwarders, notify-send: host
+  infrastructure with no session scope.
+
+Marker-less or uncovered processes simply fall back to the existing
+cwd/cmdline heuristics - partial coverage is a win, never a
+misattribution vector.
+
+## 7. Longer-term hardening (not v1)
 - **Per-session cgroup:** the correct isolation model, but
   impossible while all sessions multiplex inside one `devin acp`
   backend - needs upstream host support (separate backend
@@ -175,7 +224,7 @@ row records that layers 0-2 ran first (new fields:
 - **`devin stop <sid>` upstream:** worth filing - the CLI has
   `rm` (refused while open) but no turn-stop verb at all.
 
-## 7. Implementation plan
+## 8. Implementation plan
 
 1. `wake/acp_host.py`: add `close_session(sid, force=True)`
    beside `cancel_turn` (same attach plumbing).
@@ -190,7 +239,7 @@ row records that layers 0-2 ran first (new fields:
    fake-attach harness covers layers 0-1); contract tests for
    attribution predicates.
 
-## 8. Correctness invariants
+## 9. Correctness invariants
 
 - Never signal the shared backend, acp-host, or MCP/tool
   servers - a fleet kill dressed as a session kill is worse than

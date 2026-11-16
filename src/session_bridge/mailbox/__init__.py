@@ -8,6 +8,7 @@ from .core import (
     mailbox_duty_text,
     next_message,
     queue_root,
+    watcher_command_text,
     watcher_loop_text,
     write_message,
 )
@@ -20,6 +21,7 @@ __all__ = [
     "mailbox_duty_text",
     "next_message",
     "queue_root",
+    "watcher_command_text",
     "watcher_loop_text",
     "write_message",
 ]

@@ -897,3 +897,80 @@ def test_item11_foreign_hook_with_non_string_command_ignored(tmp_path):
     assert non_str == [123, None]  # preserved verbatim
     for event in EVENT_NAMES:
         assert len(_our_hooks(data, event)) == 1
+
+
+# --- issue #168: DEVIN_SESSION_ID self-marking ---------------------------------
+
+
+def test_issue168_gwt1_self_mark_reexecs_with_marker_env(tmp_path, monkeypatch):
+    """[ISSUE-168.GWT-1] the payload-revealed sid is stamped into the
+    worker's own environment via a one-shot re-exec: the exec env
+    carries DEVIN_SESSION_ID=<sid>, the drained payload rides through
+    SESSIONS_BRIDGE_HOOK_PAYLOAD, and the guard var prevents a loop."""
+    calls = []
+    script = tmp_path / "worker.py"
+    script.write_text("# stub\n")
+    monkeypatch.setattr(sys, "argv", [str(script), "--hook-timeout", "60"])
+    monkeypatch.delenv("DEVIN_SESSION_ID", raising=False)
+    monkeypatch.delenv(worker._HOOK_ENV_MARKED, raising=False)
+    monkeypatch.delenv(worker._HOOK_PAYLOAD_ENV, raising=False)
+
+    worker._self_mark("s1", '{"x":1}', exec_fn=lambda *a: calls.append(a))
+
+    assert os.environ["DEVIN_SESSION_ID"] == "s1"  # children inherit
+    assert len(calls) == 1
+    exe, argv, env = calls[0]
+    assert exe == sys.executable
+    assert argv[:2] == [sys.executable, str(script)]
+    assert argv[2:] == ["--hook-timeout", "60"]
+    assert env["DEVIN_SESSION_ID"] == "s1"
+    assert env[worker._HOOK_ENV_MARKED] == "1"
+    assert env[worker._HOOK_PAYLOAD_ENV] == '{"x":1}'
+
+
+def test_issue168_gwt2_self_mark_degrades_without_reexec(tmp_path, monkeypatch):
+    """[ISSUE-168.GWT-2] argv-driven invocation, an already-marked
+    env, or a failed exec all degrade to child-only marking - the
+    marker is best-effort and never breaks the hook contract."""
+    calls = []
+    monkeypatch.delenv("DEVIN_SESSION_ID", raising=False)
+    monkeypatch.delenv(worker._HOOK_ENV_MARKED, raising=False)
+    # argv-driven (test) invocation: os.environ marked, no re-exec
+    worker._self_mark("s1", "{}", argv=["--db", "x"], exec_fn=lambda *a: calls.append(a))
+    assert calls == []
+    assert os.environ["DEVIN_SESSION_ID"] == "s1"
+    # re-exec guard present: never re-execs again
+    monkeypatch.setenv(worker._HOOK_ENV_MARKED, "1")
+    worker._self_mark("s1", "{}", exec_fn=lambda *a: calls.append(a))
+    assert calls == []
+    # exec failure: swallowed, the marker stays for children
+    monkeypatch.delenv(worker._HOOK_ENV_MARKED)
+    script = tmp_path / "worker.py"
+    script.write_text("# stub\n")
+    monkeypatch.setattr(sys, "argv", [str(script)])
+
+    def boom(*a):
+        raise OSError("no exec")
+
+    worker._self_mark("s1", "{}", exec_fn=boom)  # must not raise
+    assert os.environ["DEVIN_SESSION_ID"] == "s1"
+
+
+def test_issue168_gwt3_main_consumes_relayed_payload(env, monkeypatch, capsys):
+    """[ISSUE-168.GWT-3] the re-exec'd second pass reads the payload
+    from the env relay instead of the drained stdin - a SessionEnd
+    dispatched from SESSIONS_BRIDGE_HOOK_PAYLOAD runs normally."""
+    payload = {
+        "hook_event_name": "SessionEnd",
+        "session_id": SID,
+        "reason": "clear",
+    }
+    monkeypatch.setenv(worker._HOOK_PAYLOAD_ENV, json.dumps(payload))
+    monkeypatch.setenv(worker._HOOK_ENV_MARKED, "1")
+    # stdin deliberately empty: the env relay must be authoritative
+    monkeypatch.setattr(sys, "stdin", io.StringIO(""))
+    rc = worker.main(env["argv"])
+    assert rc == 0
+    row = db.get_session(SID, path=env["db"])
+    assert row is not None
+    assert "clear" in (row["note"] or "")

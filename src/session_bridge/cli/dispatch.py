@@ -38,6 +38,7 @@ from session_bridge.cli.contract import (
     ExitCode,
     JsonResponse,
 )
+from session_bridge.env_marker import marked_env
 from session_bridge.quota import DEFAULT_PARK_SECONDS, parse_quota_signal
 from session_bridge.state import db
 from session_bridge.state.contract import (
@@ -198,8 +199,15 @@ def _worker_log_tail(args, task_id: int):
     return path, "\n".join(lines[-_STDERR_TAIL_LINES:]) or None
 
 
-def _spawn_worker(task_id: int, owner: str, args) -> subprocess.Popen:
-    """Detach a ``bridge _work`` child for one acp-push task."""
+def _spawn_worker(task_id: int, owner: str, args, *, session_id: str = "") -> subprocess.Popen:
+    """Detach a ``bridge _work`` child for one acp-push task.
+
+    The child carries ``DEVIN_SESSION_ID=<sid>`` (issue #168): it is
+    the marker the layer-2 hard-stop sweep reads from
+    ``/proc/<pid>/environ``, and it propagates for free into the
+    worker's own ``devin acp`` subprocess and every process that
+    backend spawns for the session.
+    """
     argv = [sys.executable, "-m", "session_bridge.cli.bridge"]
     if args.db:
         argv += ["--db", args.db]
@@ -213,7 +221,7 @@ def _spawn_worker(task_id: int, owner: str, args) -> subprocess.Popen:
         "--timeout",
         str(_work_timeout(args)),
     ]
-    env = dict(os.environ)
+    env = marked_env(session_id)
     # make the package importable even when the parent ran from a
     # source checkout without an install
     src = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -417,7 +425,7 @@ def pump(args) -> dict:
                         saturated = True
                 continue
             try:
-                _spawn_worker(tid, owner, args)
+                _spawn_worker(tid, owner, args, session_id=sid)
             except OSError as e:
                 _log(f"worker spawn failed for task {tid}: {e}; requeueing for the hook path")
                 if _task_to_hook_queue(tid, owner, args):

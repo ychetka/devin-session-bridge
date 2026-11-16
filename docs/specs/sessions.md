@@ -70,9 +70,13 @@ fold the per-layer outcomes into the `session_killed` event body;
 `--dry-run` SHALL enumerate layers and sweep victims without sending,
 signalling, or tearing down. The sweep SHALL attribute only processes
 in the shared `devin acp` backend tree carrying the session's
-workspace cwd or explicit sid markers, and SHALL never signal the
+workspace cwd, explicit sid markers, or the
+`DEVIN_SESSION_ID=<sid>` environment marker read from
+`/proc/<pid>/environ` (a strong marker equal to cmdline markers;
+issue #168), and SHALL never signal the
 backend, the acp-host supervisor, MCP/tool servers, or processes
-attributed to other registered sessions.
+attributed to other registered sessions (including an env marker
+naming another registered session).
 
 #### Scenario: hard-stop kill tears down the bus last
 

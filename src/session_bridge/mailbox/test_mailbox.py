@@ -20,6 +20,7 @@ from session_bridge.mailbox import (
     mailbox_duty_text,
     next_message,
     queue_root,
+    watcher_command_text,
     watcher_loop_text,
     write_message,
 )
@@ -299,6 +300,56 @@ def test_item20_gwt6_duty_text_bans_interactive_dialogs(qdir):
     assert "question_answer" in text
     # the expiry notice path is documented in the kind table
     assert "expired" in text
+
+
+# --- issue #168: DEVIN_SESSION_ID env-marker injection ---------------------------
+
+
+def test_issue168_gwt1_watcher_command_marks_exec_env(qdir):
+    """[ISSUE-168.GWT-1] the watcher invocation carries
+    DEVIN_SESSION_ID=<sid> as an env-assignment prefix - the only
+    form /proc/<pid>/environ can attribute - wrapping the verbatim
+    loop in a quoted heredoc."""
+    cmd = watcher_command_text(SID, "/mb/x")
+    assert cmd.startswith(f"DEVIN_SESSION_ID={SID} bash <<'SB_WATCHER_EOF'\n")
+    # the verbatim loop still rides inside the heredoc
+    assert watcher_loop_text("/mb/x") in cmd
+    assert cmd.endswith("SB_WATCHER_EOF\n")
+
+
+def test_issue168_gwt2_duty_marks_watcher_and_observer(qdir):
+    """[ISSUE-168.GWT-2] the managed duty injects the marker on BOTH
+    watcher-mode commands: the resident watcher heredoc and the
+    drain-mode observer shell."""
+    text = mailbox_duty_text(SID, queue_dir=qdir)
+    assert f"DEVIN_SESSION_ID={SID} bash <<'SB_WATCHER_EOF'" in text
+    assert f"DEVIN_SESSION_ID={SID} bash -c 'while true;" in text
+    assert watcher_loop_text(mailbox_dir(SID, queue_dir=qdir)) in text
+
+
+@pytest.mark.skipif(
+    shutil.which("bash") is None or not os.path.isdir("/proc"),
+    reason="bash + /proc required",
+)
+def test_issue168_gwt3_watcher_command_execs_marked(qdir):
+    """[ISSUE-168.GWT-3] run the rendered command for real and read
+    the spawned watcher bash's /proc environ - proof the marker lands
+    in the exec-time environment the sweep reads."""
+    cmd = watcher_command_text(SID, mailbox_dir(SID, queue_dir=qdir), ttl_seconds=5, poll_seconds=1)
+    first, rest = cmd.split("\n", 1)
+    script = (
+        f"{first} & wpid=$!\n{rest}"
+        "sleep 0.3; tr '\\0' '\\n' < \"/proc/$wpid/environ\"; kill $wpid 2>/dev/null"
+    )
+    res = subprocess.run(
+        ["bash", "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    assert res.returncode == 0, res.stderr
+    assert f"DEVIN_SESSION_ID={SID}" in res.stdout.splitlines()
 
 
 def test_item15_gwt3_resident_path_not_regressed(qdir):

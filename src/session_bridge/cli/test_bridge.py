@@ -59,7 +59,7 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(
         dispatch,
         "_spawn_worker",
-        lambda tid, owner, args: spawned.append((tid, owner)),
+        lambda tid, owner, args, **kw: spawned.append((tid, owner)),
     )
     locks = {}
     monkeypatch.setattr(db, "is_locked", lambda sid: locks.get(sid, (False, None)))
@@ -4499,3 +4499,31 @@ def test_issue167_gwt6_kill_hard_stop_inherits_close_skip(env, capsys, monkeypat
     assert len(ev) == 1
     assert "stop_cancel=idle" in ev[0]["body"]
     assert "stop_close=skipped:idle" in ev[0]["body"]
+
+
+# --- issue #168: DEVIN_SESSION_ID injection into spawned workers ---------------
+
+
+def test_issue168_gwt1_spawn_worker_env_marker(tmp_path, monkeypatch):
+    """[ISSUE-168.GWT-1] the acp-push worker spawn injects
+    DEVIN_SESSION_ID=<sid> into the child's exec-time environment -
+    the marker the layer-2 sweep reads from /proc/<pid>/environ.
+    A missing sid leaves the environment untouched."""
+    captured = []
+
+    def fake_popen(argv, **kw):
+        captured.append((argv, kw))
+        return SimpleNamespace(pid=4321)
+
+    monkeypatch.setattr(dispatch.subprocess, "Popen", fake_popen)
+    db_path = str(tmp_path / "state.db")
+    db.init(db_path)  # the log path lookup reads task rows
+    args = SimpleNamespace(db=db_path, queue_dir=None, timeout=5)
+    dispatch._spawn_worker(7, "acp-s1-1-7", args, session_id="s1")
+    assert len(captured) == 1
+    _argv, kw = captured[0]
+    assert kw["env"]["DEVIN_SESSION_ID"] == "s1"
+    # spawn without a session context stamps no marker
+    captured.clear()
+    dispatch._spawn_worker(8, "acp-x-1-8", args)
+    assert "DEVIN_SESSION_ID" not in captured[0][1]["env"]

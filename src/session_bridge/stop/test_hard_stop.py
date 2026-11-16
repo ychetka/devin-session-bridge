@@ -30,13 +30,14 @@ BACKEND_PID = 101
 BACKEND_START = 1000.0
 
 
-def P(pid, ppid, argv, cwd=None, start=2000.0):
+def P(pid, ppid, argv, cwd=None, start=2000.0, env_sid=None):
     return ProcInfo(
         pid=pid,
         ppid=ppid,
         argv=tuple(argv),
         cwd=cwd,
         start_seconds=start,
+        devin_session_id=env_sid,
     )
 
 
@@ -468,6 +469,173 @@ def test_issue164_gwt15_foreign_root_cwd_no_blanket_exclusion():
     # marker legs stay unconditional even at a trivial foreign cwd
     marked = P(201, BACKEND_PID, ["bridge", "wait", "--session", "sX"], "/repo/w1", 2000.0)
     assert classify(marked, ctx) == ("excluded", "other_session:sX")
+
+
+# --- issue #168: DEVIN_SESSION_ID env-marker attribution -------------------------
+
+
+def test_issue168_gwt1_env_marker_strong_attribution():
+    """[ISSUE-168.GWT-1] a process carrying DEVIN_SESSION_ID=<sid> in
+    its /proc environ is a strong candidate - reason
+    env:DEVIN_SESSION_ID - even with no cmdline marker and a neutral
+    cwd, and even inside the backend spawn window."""
+    ctx = _ctx()
+    # plain argv, foreign-looking cwd, spawned inside the infra window -
+    # nothing but the env marker ties it to s1
+    proc = P(200, BACKEND_PID, ["bash", "-c", "x"], "/home/u", 1003.0, env_sid=SID)
+    verdict, detail = classify(proc, ctx)
+    assert verdict == "candidate"
+    assert detail == "env:DEVIN_SESSION_ID"
+
+
+def test_issue168_gwt2_foreign_env_is_exclusion():
+    """[ISSUE-168.GWT-2] env naming a DIFFERENT registered session is a
+    foreign exclusion exactly like a foreign cmdline marker - even
+    when the process also sits under our workspace cwd."""
+    ctx = _ctx()
+    proc = P(200, BACKEND_PID, ["bash", "-c", "x"], "/repo/w1/sub", 2000.0, env_sid="s2")
+    assert classify(proc, ctx) == ("excluded", "other_session:s2")
+
+
+def test_issue168_gwt3_markerless_falls_back_to_heuristics():
+    """[ISSUE-168.GWT-3] no env marker -> the existing cwd/marker
+    heuristics are unchanged: cwd attribution, spawn-window exclusion
+    and unrelated verdicts behave exactly as before."""
+    ctx = _ctx()
+    assert classify(P(200, BACKEND_PID, ["bash", "-c", "x"], "/repo/w1", 2000.0), ctx) == (
+        "candidate",
+        "cwd_under:/repo/w1",
+    )
+    assert classify(P(201, BACKEND_PID, ["/usr/bin/h", "--serve"], "/repo/w1", 1005.0), ctx) == (
+        "excluded",
+        "infra_spawn_window",
+    )
+    assert classify(P(202, BACKEND_PID, ["bash", "-c", "x"], "/other", 2000.0), ctx) == (
+        "unrelated",
+        "",
+    )
+
+
+def test_issue168_gwt4_env_plus_foreign_marker_resolves_to_exclusion():
+    """[ISSUE-168.GWT-4] env naming OUR sid but cmdline naming a
+    foreign session: exclusions run before attribution, so the
+    conflict resolves to exclusion - a misattributed kill is a second
+    incident, never a candidate."""
+    ctx = _ctx()
+    proc = P(
+        200,
+        BACKEND_PID,
+        ["bridge", "wait", "--session", "s2"],
+        "/home/u",
+        2000.0,
+        env_sid=SID,
+    )
+    assert classify(proc, ctx) == ("excluded", "other_session:s2")
+
+
+def test_issue168_gwt5_unregistered_env_value_is_not_attribution():
+    """An env marker naming a sid the bridge does not know (not the
+    target, not a foreign-registered session) is dead text: the
+    heuristics decide."""
+    ctx = _ctx()
+    proc = P(200, BACKEND_PID, ["bash", "-c", "x"], "/other", 2000.0, env_sid="s9")
+    assert classify(proc, ctx) == ("unrelated", "")
+    # ... and under our workspace cwd it is just a cwd candidate
+    proc2 = P(201, BACKEND_PID, ["bash", "-c", "x"], "/repo/w1", 2000.0, env_sid="s9")
+    assert classify(proc2, ctx) == ("candidate", "cwd_under:/repo/w1")
+
+
+def test_issue168_gwt6_env_marker_orphan_second_pass():
+    """[ISSUE-168.GWT-6] pass 2 finds an env-marked orphan reparented
+    outside the backend tree - the env marker is a STRONG marker for
+    the orphan pass and records orphan_env:DEVIN_SESSION_ID; an
+    env-marked orphan claimed by a foreign marker still loses."""
+    ctx = _ctx()
+    procs = [
+        *_fake_tree(),
+        # env-marked orphan, no cmdline marker at all
+        P(300, 1, ["bash", "-c", "watcher"], "/home/u", 2000.0, env_sid=SID),
+        # env-marked orphan BUT carrying a foreign cmdline marker
+        P(
+            301,
+            1,
+            ["bridge", "wait", "--session", "s2"],
+            "/home/u",
+            2000.0,
+            env_sid=SID,
+        ),
+        # foreign env only: silently skipped like foreign cmdline markers
+        P(302, 1, ["bash", "-c", "x"], "/home/u", 2000.0, env_sid="s2"),
+        # no markers at all: pass 2 must not cwd-attribute it
+        P(303, 1, ["bash", "-c", "x"], "/repo/w1", 2000.0),
+    ]
+    calls = []
+    res = sweep(
+        ctx,
+        procs,
+        signaler=lambda pid, sig: calls.append((pid, sig)),
+        gone=lambda pid: True,
+        start_of=_start_of(procs),
+        sleep=lambda s: None,
+    )
+    by_pid = {c["pid"]: c["reason"] for c in res["candidates"]}
+    assert by_pid[300] == "orphan_env:DEVIN_SESSION_ID"
+    assert 303 not in by_pid  # env-less orphan: heuristics do not reach pass 2
+    assert 302 not in by_pid  # foreign-env orphan is never our candidate
+    excluded = {s["pid"]: s["exclusion"] for s in res["skipped"]}
+    assert excluded[301] == "other_session:s2"
+
+
+def test_issue168_gwt7_env_candidate_recorded_and_swept():
+    """[ISSUE-168.GWT-7] end-to-end through sweep(): an env-marked
+    descendant is recorded with the env reason in candidates and
+    receives the SIGTERM volley like any marker hit."""
+    ctx = _ctx()
+    procs = [
+        *_fake_tree(),
+        P(200, BACKEND_PID, ["bash", "-c", "x"], "/tmp", 2000.0, env_sid=SID),
+    ]
+    calls = []
+    res = sweep(
+        ctx,
+        procs,
+        signaler=lambda pid, sig: calls.append((pid, sig)),
+        gone=lambda pid: True,
+        start_of=_start_of(procs),
+        sleep=lambda s: None,
+    )
+    reasons = {c["pid"]: c["reason"] for c in res["candidates"]}
+    assert reasons[200] == "env:DEVIN_SESSION_ID"
+    assert (200, signal.SIGTERM) in calls
+    by_pid = {e["pid"]: e for e in res["swept"]}
+    assert by_pid[200]["signal"] == "SIGTERM" and by_pid[200]["outcome"] == "gone"
+
+
+def test_issue168_gwt8_read_proc_parses_environ():
+    """[ISSUE-168.GWT-8] the real lister reads DEVIN_SESSION_ID from a
+    fabricated /proc/<pid>/environ (NUL-separated K=V); a missing
+    environ file degrades to None, never an error."""
+    root = tempfile.mkdtemp()
+    d = os.path.join(root, "10")
+    os.makedirs(d)
+    with open(os.path.join(d, "stat"), "wb") as fh:
+        fh.write(b"10 (comm) S 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 500")
+    with open(os.path.join(d, "cmdline"), "wb") as fh:
+        fh.write(b"bash\0-c\0work\0")
+    os.symlink("/repo/w1", os.path.join(d, "cwd"))
+    with open(os.path.join(d, "environ"), "wb") as fh:
+        fh.write(b"PATH=/bin\0DEVIN_SESSION_ID=s1\0HOME=/u\0")
+    procs = hard_stop.list_processes(root)
+    assert procs[0].devin_session_id == "s1"
+    # a pid dir without an environ file parses with marker None
+    d2 = os.path.join(root, "11")
+    os.makedirs(d2)
+    with open(os.path.join(d2, "stat"), "wb") as fh:
+        fh.write(b"11 (comm) S 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 600")
+    with open(os.path.join(d2, "cmdline"), "wb") as fh:
+        fh.write(b"bash\0")
+    procs = {p.pid: p for p in hard_stop.list_processes(root)}
+    assert procs[11].devin_session_id is None
 
 
 def test_issue164_gwt16_orphan_marker_second_pass():

@@ -40,8 +40,10 @@ context (item_15):
 
 import os
 import re
+import shlex
 import tempfile
 
+from session_bridge.env_marker import SESSION_ID_ENV
 from session_bridge.state import db
 from session_bridge.state.contract import TURN_TTL_CYCLES, WATCHER_TTL_SECONDS
 
@@ -53,6 +55,7 @@ __all__ = [
     "mailbox_duty_text",
     "next_message",
     "queue_root",
+    "watcher_command_text",
     "watcher_loop_text",
     "write_message",
 ]
@@ -246,6 +249,29 @@ def watcher_loop_text(
     )
 
 
+def watcher_command_text(
+    session_id: str,
+    mailbox_directory: str,
+    *,
+    ttl_seconds: int = WATCHER_TTL_SECONDS,
+    poll_seconds: int = POLL_SECONDS,
+) -> str:
+    """The watcher invocation carrying the ``DEVIN_SESSION_ID`` marker.
+
+    ``/proc/<pid>/environ`` only reflects the exec-time environment
+    (verified live: an ``export`` inside a running shell never shows
+    up there), so the marker goes on the command as an env-assignment
+    prefix - the watcher bash is born marked (issue #168). The loop
+    travels through a quoted heredoc so the duty text stays verbatim
+    paste-able; marking is best-effort - the session runs this text.
+    """
+    loop = watcher_loop_text(mailbox_directory, ttl_seconds=ttl_seconds, poll_seconds=poll_seconds)
+    return (
+        f"{SESSION_ID_ENV}={shlex.quote(session_id)} bash <<'SB_WATCHER_EOF'\n"
+        f"{loop}SB_WATCHER_EOF\n"
+    )
+
+
 def mailbox_duty_text(session_id: str, *, db_path=None, queue_dir=None) -> str:
     """additionalContext for a managed session: the mailbox duty.
 
@@ -259,14 +285,16 @@ def mailbox_duty_text(session_id: str, *, db_path=None, queue_dir=None) -> str:
     rotates the turn after TURN_TTL_CYCLES.
     """
     mdir = mailbox_dir(session_id, db_path=db_path, queue_dir=queue_dir)
-    loop = watcher_loop_text(mdir)
+    watcher = watcher_command_text(session_id, mdir)
     # Optional drain-mode observer: polls the mailbox and heartbeats
     # each cycle, keeping the session inside HEARTBEAT_STALE_SECONDS
     # between turns (a drain-mode session has no turn open to
-    # heartbeat from, so only a shell can do it).
+    # heartbeat from, so only a shell can do it). The env prefix marks
+    # the observer shell for the hard-stop sweep, same as the watcher.
     observer = (
-        f"while true; do bridge heartbeat {session_id}; "
-        f"ls -v {mdir}/msg_*.txt 2>/dev/null; sleep {POLL_SECONDS}; done"
+        f"{SESSION_ID_ENV}={shlex.quote(session_id)} bash -c '"
+        f"while true; do bridge heartbeat {shlex.quote(session_id)}; "
+        f"ls -v {shlex.quote(mdir)}/msg_*.txt 2>/dev/null; sleep {POLL_SECONDS}; done'"
     )
     return f"""[sessions-bridge] MANAGED MODE - mailbox duty (session {session_id})
 
@@ -296,12 +324,13 @@ latency for a free input line.
 
 == MODE RESIDENT - background watcher subagent (autonomous sessions) ==
 
-1. Arm the watcher NOW: spawn a background subagent running this bash
-   loop verbatim (never run it inline - its completion must land
-   inside this turn):
+1. Arm the watcher NOW: spawn a background subagent running this
+   command verbatim (never run it inline - its completion must land
+   inside this turn). The DEVIN_SESSION_ID env prefix is deliberate:
+   it marks the watcher shell for the hard-stop orphan sweep - keep it:
 
 ```bash
-{loop}
+{watcher}
 ```
 
 2. Keep working while the watcher lives. On its completion:

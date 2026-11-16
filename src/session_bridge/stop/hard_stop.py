@@ -22,19 +22,24 @@ Safety invariants (design doc section 8):
   predate the cancel by definition;
 - a process whose markers name a DIFFERENT registered session
   (``queue/<other-sid>``, ``--session <other-sid>``, a foreign
-  mailbox dir, or a cwd under a foreign session's workspace) is
+  mailbox dir, a ``DEVIN_SESSION_ID=<other-sid>`` environment
+  marker, or a cwd under a foreign session's workspace) is
   never signalled;
 - attribution is positive: a candidate must carry the session's
   workspace cwd or an explicit sid marker (``queue/<sid>``,
-  ``--session <sid>`` / ``--session=<sid>``, the mailbox dir path).
-  Marker attribution is strong and sweeps regardless of age; cwd
-  attribution is weak and yields to the startup-window exclusion.
+  ``--session <sid>`` / ``--session=<sid>``, the mailbox dir path,
+  or the ``DEVIN_SESSION_ID=<sid>`` environment marker the bridge
+  injects where it controls a process's exec-time environment -
+  issue #168, see ``session_bridge.env_marker``). Marker attribution
+  is strong and sweeps regardless of age; cwd attribution is weak
+  and yields to the startup-window exclusion.
 
 Two enumeration passes run before any signal:
 
 - pass 1 walks the backend's descendant tree;
 - pass 2 re-scans the whole process table for STRONG sid markers
-  only - setsid/double-forked victims reparent to init and are
+  only - cmdline markers or the ``DEVIN_SESSION_ID`` env marker -
+  setsid/double-forked victims reparent to init and are
   invisible to the descendant walk, which is the whole point of the
   incident. Pass 2 never uses cwd attribution: a reparented process
   may share a workspace path with unrelated infra.
@@ -98,6 +103,11 @@ _DEVIN_ACP_RE = re.compile(r"(?:^|[/\s])devin acp(?:\s|$)")
 #: would attribute half the host to one session.
 _MIN_CWD_DEPTH = 2
 
+#: the env marker prefix inside ``/proc/<pid>/environ`` (issue #168;
+#: injected where the bridge controls the exec-time environment -
+#: see ``session_bridge.env_marker`` for the covered surfaces).
+_ENV_MARK = b"DEVIN_SESSION_ID="
+
 
 class ProcInfo(NamedTuple):
     """One enumerated process - the injected-fake seam of the sweep."""
@@ -109,6 +119,10 @@ class ProcInfo(NamedTuple):
     #: seconds since boot (``/proc/<pid>/stat`` starttime / CLK_TCK);
     #: only relative comparisons against the backend's start matter.
     start_seconds: float
+    #: ``DEVIN_SESSION_ID`` from ``/proc/<pid>/environ`` - the
+    #: strong-attribution env marker; ``None`` when unreadable,
+    #: absent, or empty (issue #168).
+    devin_session_id: str | None = None
 
     @property
     def cmdline(self) -> str:
@@ -142,12 +156,25 @@ def _read_proc(proc_root: str, pid: int, hz: float) -> ProcInfo | None:
         cwd = os.readlink(os.path.join(base, "cwd"))
     except OSError:
         cwd = None
+    # same-uid readable like cmdline; kernel threads and foreign-uid
+    # processes read as empty/absent - the marker stays None and the
+    # heuristics decide instead of an error path
+    devin_session_id = None
+    try:
+        with open(os.path.join(base, "environ"), "rb") as fh:
+            for tok in fh.read().split(b"\0"):
+                if tok.startswith(_ENV_MARK):
+                    devin_session_id = tok[len(_ENV_MARK) :].decode("utf-8", "replace") or None
+                    break
+    except OSError:
+        pass
     return ProcInfo(
         pid=pid,
         ppid=ppid,
         argv=argv,
         cwd=cwd,
         start_seconds=start_ticks / hz,
+        devin_session_id=devin_session_id,
     )
 
 
@@ -310,7 +337,10 @@ class SweepContext(NamedTuple):
 def _foreign_hit(proc: ProcInfo, ctx: SweepContext) -> str | None:
     """The OTHER registered session this process belongs to, if any."""
     for sid, cwd in ctx.foreign_sessions:
-        if marker_hits(proc, sid, None):
+        # the env marker excludes exactly like a cmdline marker: an
+        # env naming a different registered session is unambiguous
+        # foreign ownership, no matter what else matches (issue #168)
+        if proc.devin_session_id == sid or marker_hits(proc, sid, None):
             return sid
         # the cwd leg carries the same trivial-workspace guard as the
         # target attribution: a foreign session registered at '/' (or
@@ -327,7 +357,9 @@ def classify(proc: ProcInfo, ctx: SweepContext) -> tuple[str, str]:
     Exclusions are evaluated before attribution and in order of
     blast radius: infrastructure pids first, foreign-session markers
     next (a misattributed kill is a second incident), the MCP
-    whitelist third, then the positive-attribution legs.
+    whitelist third, then the positive-attribution legs - the
+    ``DEVIN_SESSION_ID`` env marker first (issue #168), cmdline
+    markers second, workspace cwd last.
     """
     if proc.pid in ctx.protected_pids or proc.pid in ctx.backend_pids:
         return "excluded", "protected_infrastructure"
@@ -336,6 +368,10 @@ def classify(proc: ProcInfo, ctx: SweepContext) -> tuple[str, str]:
         return "excluded", f"other_session:{foreign}"
     if _MCP_TOKEN in proc.cmdline.lower():
         return "excluded", "mcp_server"
+    if proc.devin_session_id is not None and proc.devin_session_id == ctx.sid:
+        # the env marker is strong attribution equivalent to cmdline
+        # markers: it sweeps regardless of process age (issue #168)
+        return "candidate", "env:DEVIN_SESSION_ID"
     hits = marker_hits(proc, ctx.sid, ctx.mailbox_dir)
     if hits:
         # explicit sid markers are strong attribution: they sweep
@@ -435,15 +471,20 @@ def sweep(
     skipped = []
 
     def _consider(proc, orphan: bool) -> None:
+        env_hit = orphan and proc.devin_session_id is not None and proc.devin_session_id == ctx.sid
         hits = marker_hits(proc, ctx.sid, ctx.mailbox_dir) if orphan else []
-        if orphan and not hits:
+        if orphan and not hits and not env_hit:
             return  # pass 2: strong markers only, no cwd attribution
         verdict, detail = classify(proc, ctx)
         if verdict == "candidate":
+            if orphan:
+                reason = "orphan_env:DEVIN_SESSION_ID" if env_hit else f"orphan_marker:{hits[0]}"
+            else:
+                reason = detail
             candidates.append(
                 {
                     "pid": proc.pid,
-                    "reason": f"orphan_marker:{hits[0]}" if orphan else detail,
+                    "reason": reason,
                     "cmdline": proc.cmdline[:200],
                     "depth": _depth(proc.pid, by_pid, ctx.backend_pids),
                     "start_seconds": proc.start_seconds,
