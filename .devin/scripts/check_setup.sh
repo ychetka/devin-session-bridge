@@ -51,7 +51,8 @@ for s in check_setup.sh hygiene_check.sh cycle_log.sh \
          verify_constraints.sh ship_commit.sh ship_push.sh \
          repo_issue_create.sh repo_issue_close.sh repo_pr_open.sh \
          repo_status_check.sh repo_merge.sh repo_read.sh \
-         repo_release.sh repo_branch_delete.sh session_audit.sh; do
+         repo_release.sh repo_branch_delete.sh session_audit.sh \
+         msg_stamp.sh; do
   [ -x "$DEVIN_DIR/scripts/$s" ] || fail "missing/not executable: .devin/scripts/$s"
 done
 [ $fails -eq $before ] && ok "wrapper scripts"

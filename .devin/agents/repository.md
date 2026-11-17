@@ -46,8 +46,8 @@ branch_delete: IN {branch} -> OUT {branch, status}
   developer ruling) гейт усилен до PRE-MERGE: PR, трогающий
   shipping-пути (src/, pyproject.toml, uv.lock) без бампа версии,
   блокируется ДО merge с failure_class=version_not_bumped.
-  Исключения: diff только по non-shipping путям или label
-  `no-release` (фикс-ап к уже смерженной задаче). Ручной вызов
+  Исключения по non-shipping путям и label `no-release` отменены
+  рулингом 2026-11-17 (см. буллет ниже); ручной вызов
   repo_release.sh - только догоняющий путь для уже смерженного head
   (эскалация human-merge инцидента).
   repo_release.sh НЕ бампит версию: тег выводится из pyproject на

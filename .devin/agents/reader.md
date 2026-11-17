@@ -14,7 +14,7 @@ model: swe-2-medium
 IN : {targets: [{kind: file|command|url, ref, offset?, limit?}],
       mode: verbatim|extract, extract_spec?}
 OUT: {status: ok|error, parts: [{ref, total_lines, offset,
-        limit, truncated: false, text}],
+        limit, text, continuation?: {next_offset}}],
       failure_class?, message?}
 
 - `mode=verbatim` - возвращай текст ДОСЛОВНО и ПОЛНОСТЬЮ: весь
@@ -23,10 +23,10 @@ OUT: {status: ok|error, parts: [{ref, total_lines, offset,
 - `mode=extract` - выжимка по extract_spec (что искать, какой
   уровень детали), но coverage всё равно полный: ты обязан
   прочитать ВЕСЬ материал, а не первую страницу.
-- `total_lines` - реальная длина источника в строках; `truncated`
-  всегда false: если диапазон не влезает в один ответ, верни
-  часть и `continuation: {next_offset}` - сессия вызовет тебя
-  повторно с этим offset.
+- `total_lines` - реальная длина источника в строках; если
+  диапазон не влезает в один ответ, верни часть и
+  `continuation: {next_offset}` - сессия вызовет тебя повторно
+  с этим offset.
 - Один вызов - один читающий ход: читай пагинированно (offset/limit
   read'а, head/sed/awk для shell), пока весь диапазон не покрыт.
 
