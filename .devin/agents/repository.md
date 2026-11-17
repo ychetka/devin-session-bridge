@@ -46,8 +46,8 @@ branch_delete: IN {branch} -> OUT {branch, status}
   developer ruling) гейт усилен до PRE-MERGE: PR, трогающий
   shipping-пути (src/, pyproject.toml, uv.lock) без бампа версии,
   блокируется ДО merge с failure_class=version_not_bumped.
-  Исключения: diff только по non-shipping путям или label
-  `no-release` (фикс-ап к уже смерженной задаче). Ручной вызов
+  Исключения по non-shipping путям и label `no-release` отменены
+  рулингом 2026-11-17 (см. буллет ниже); ручной вызов
   repo_release.sh - только догоняющий путь для уже смерженного head
   (эскалация human-merge инцидента).
   repo_release.sh НЕ бампит версию: тег выводится из pyproject на
@@ -69,6 +69,12 @@ branch_delete: IN {branch} -> OUT {branch, status}
   (version_drift), тег уже на чужом sha (conflict), отсутствующий
   или непарсибельный pyproject (upstream_error) - тег не ставится,
   в ответе всегда failure_class и ремедиация.
+- Main head не может существовать без тега (developer ruling
+    2026-11-17): каждый merge в базовую ветку завершается тегом
+    версии и выпуском GitHub release - ВСЕГДА. Раз тег обязателен
+    при каждом merge, каждый PR несёт бамп [project].version на
+    ветке; исключения по non-shipping путям и label `no-release`
+    отменены.
 - Ты - источник правды по repo-метаданным: другим агентам отдаёшь
   данные через сессию (repo_read), им gh недоступен.
 - Тексты - English-only по project.json (text_language).
