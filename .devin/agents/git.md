@@ -35,6 +35,11 @@ OUT: {status: ok|error, branch?, commits?: [sha],
 - Инфра-сбои (сеть, креды, OOM) - failure_class=upstream_error,
   без ретраев. Содержательные (merge_conflict, push rejected) -
   один разбор-попытка, затем failure_class и сессии.
+- Лимит модели: явная ошибка провайдера с reset-временем - не
+  ждать и не ретраить внутри хода; немедленно вернуть
+  {status: error, failure_class: quota_limited,
+  message: '<raw text + reset_at UTC>'} - окном ожидания владеет
+  сессия (harness.md 9.3a).
 - Разрешение merge-конфликта и ре-ревью: если резолюция
   затронула строки логики (не только механический rebase/
   whitespace/import-order) - сообщить сессии: после push нового

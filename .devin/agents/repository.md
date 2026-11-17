@@ -42,8 +42,14 @@ branch_delete: IN {branch} -> OUT {branch, status}
 - Каждый успешный merge = обязательный релиз: repo_merge.sh сам
   вызывает repo_release.sh после merge, изменившего [project].version
   на head базовой ветки - merge через wrapper не может оставить
-  версию без тега. Ручной вызов repo_release.sh - только догоняющий
-  путь для уже смерженного head (эскалация human-merge инцидента).
+  версию без тега. С 2026-11-12 (инцидент no_version_change,
+  developer ruling) гейт усилен до PRE-MERGE: PR, трогающий
+  shipping-пути (src/, pyproject.toml, uv.lock) без бампа версии,
+  блокируется ДО merge с failure_class=version_not_bumped.
+  Исключения: diff только по non-shipping путям или label
+  `no-release` (фикс-ап к уже смерженной задаче). Ручной вызов
+  repo_release.sh - только догоняющий путь для уже смерженного head
+  (эскалация human-merge инцидента).
   repo_release.sh НЕ бампит версию: тег выводится из pyproject на
   base head (аргумент part принимается для совместимости).
 - Merge допустим ТОЛЬКО через repo_merge.sh. Обнаружил на main
@@ -68,4 +74,9 @@ branch_delete: IN {branch} -> OUT {branch, status}
 - Тексты - English-only по project.json (text_language).
 - Инфра-сбои - upstream_error без ретраев; содержательные -
   классифицируй и возвращай.
+- Лимит модели: явная ошибка провайдера с reset-временем - не
+  ждать и не ретраить внутри хода; немедленно вернуть
+  {status: error, failure_class: quota_limited,
+  message: '<raw text + reset_at UTC>'} - окном ожидания владеет
+  сессия (harness.md 9.3a).
 - Каждое действие - в .devin/cycle_log.jsonl.
