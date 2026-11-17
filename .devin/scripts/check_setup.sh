@@ -41,7 +41,7 @@ PY
 fi
 
 before=$fails
-for f in agents/git.md agents/repository.md agents/hygiene.md; do
+for f in agents/git.md agents/repository.md agents/hygiene.md agents/reader.md; do
   [ -f "$DEVIN_DIR/$f" ] || fail "missing .devin/$f"
 done
 [ $fails -eq $before ] && ok "agent profiles"
