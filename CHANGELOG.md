@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.15.10] - 2026-11-17
+
+### Codebase
+
+#### tooling
+- [fix] `repo_merge.sh` pre-merge version gate tightened to tag-always (developer ruling 2026-11-17): every merge into the base branch must end in a version tag + release, so every PR must bump [project].version - the non-shipping-path and `no-release` exemptions are revoked in enforcement (the label is ignored). Why: exemptions let merges land untagged, recreating the untracked version-drift incident class. (issue #177)
+
 ## [0.15.9] - 2026-11-16
 
 ### User-facing
