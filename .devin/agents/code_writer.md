@@ -50,6 +50,14 @@ G/W/T-сценариями, путь к контракту (read-only), addition
   прямо требует G/W/T-сценарий; каждое изменение существующего теста —
   отдельная строка в `DECISIONS` с причиной. Ослабить assert, чтобы
   получить зелёный прогон, запрещено.
+- Лимит модели — терминальный для прогона сигнал, а не повод ждать.
+  Явная ошибка провайдера с reset-временем ("rate limit", "quota",
+  "resource exhausted", "429" + "reset at/in ...") — зафиксируйте
+  чекпоинт (сделано / осталось / артефакты / ветка) и НЕМЕДЛЕННО
+  завершите прогон отчётом `RESULT: QUOTA` + `QUOTA_RESET_AT` +
+  сырой текст ошибки. Ждать, ретраить и спать внутри хода
+  запрещено — окном ожидания владеет вызывающая сессия
+  (harness.md 9.3a).
 
 # ПОРЯДОК ДЕЙСТВИЙ
 
@@ -87,7 +95,8 @@ G/W/T-сценариями, путь к контракту (read-only), addition
 # ОТЧЁТ (обязательный формат)
 
 ```
-RESULT: DONE | BLOCKED | CONTRACT_MISMATCH | SCOPE_DELTA | SPEC_CONFLICT
+RESULT: DONE | QUOTA | BLOCKED | CONTRACT_MISMATCH | SCOPE_DELTA | SPEC_CONFLICT
+QUOTA_RESET_AT: <ISO-8601 или 'HH:MM UTC' при RESULT=QUOTA, иначе N/A>
 BASELINE: <что было красным до правок, или 'clean'>
 SCOPE_ACTUAL: <список изменённых файлов из git diff --stat>
 SCOPE_DELTA: <файлы вне белого списка + причина, или 'none'>
