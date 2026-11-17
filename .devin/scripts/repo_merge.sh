@@ -103,44 +103,29 @@ VER_AT() { git show "$1:pyproject.toml" 2>/dev/null | awk -F= '
   inp && /^[[:space:]]*version[[:space:]]*=/ {
     v=$2; gsub(/["'"'"'[:space:]]/, "", v); print v; exit }'; }
 
-# Pre-merge version gate (developer ruling 2026-11-12, issue #161):
-# merging a diff that touches shipping paths without bumping
-# [project].version is a policy violation and must fail closed BEFORE
-# the merge - the post-merge "no_version_change" skip was an incident
-# source (untracked version drift). Exemptions: (a) diffs touching only
-# non-shipping paths (.devin/, docs/, tests/, workflows, fragments) -
-# nothing a release could cover; (b) PRs explicitly labeled no-release
-# (small fixups to an already-merged task). The version-tag CI check
+# Pre-merge version gate (developer ruling 2026-11-12, issue #161;
+# tightened to tag-always by developer ruling 2026-11-17): every merge
+# into the base branch must end in a version tag + release, so every PR
+# is required to bump [project].version on its branch - no exemptions:
+# neither non-shipping diffs nor the no-release label exempt a merge
+# from the bump (the label is ignored). The version-tag CI check
 # remains the backstop for merges done outside this wrapper.
-CHANGED=$(gh pr diff "$PR" --name-only 2>/dev/null) || {
-  echo '{"status":"error","failure_class":"upstream_error","message":"gh pr diff failed - cannot determine shipping-path exposure"}'
+[ -n "$PRE_MERGE_SHA" ] || {
+  echo '{"status":"error","failure_class":"upstream_error","message":"cannot resolve pre-merge base sha - refusing to merge"}'
   exit 1
 }
-SHIPPING=$(echo "$CHANGED" | grep -E '^src/|^pyproject\.toml$|^uv\.lock$' || true)
-if [ -n "$SHIPPING" ]; then
-  HAS_NORELEASE=$(INFO="$INFO" python3 -c 'import json,os
-labels = {l.get("name") for l in json.loads(os.environ["INFO"]).get("labels") or []}
-print("yes" if "no-release" in labels else "no")')
-  if [ "$HAS_NORELEASE" != "yes" ]; then
-    [ -n "$PRE_MERGE_SHA" ] || {
-      echo '{"status":"error","failure_class":"upstream_error","message":"cannot resolve pre-merge base sha - refusing to merge a shipping diff"}'
-      exit 1
-    }
-    git fetch "$REMOTE" "$EXPECTED" >/dev/null 2>&1 || {
-      echo '{"status":"error","failure_class":"upstream_error","message":"cannot fetch PR head sha"}'
-      exit 1
-    }
-    OLD_VER=$(VER_AT "$PRE_MERGE_SHA")
-    HEAD_VER=$(VER_AT "$EXPECTED")
-    if [ -n "$OLD_VER" ] && { [ -z "$HEAD_VER" ] || [ "$HEAD_VER" = "$OLD_VER" ]; }; then
-      SHIPPING="$SHIPPING" OLD_VER="$OLD_VER" HEAD_VER="$HEAD_VER" python3 -c 'import json,os
+git fetch "$REMOTE" "$EXPECTED" >/dev/null 2>&1 || {
+  echo '{"status":"error","failure_class":"upstream_error","message":"cannot fetch PR head sha"}'
+  exit 1
+}
+OLD_VER=$(VER_AT "$PRE_MERGE_SHA")
+HEAD_VER=$(VER_AT "$EXPECTED")
+if [ -n "$OLD_VER" ] && { [ -z "$HEAD_VER" ] || [ "$HEAD_VER" = "$OLD_VER" ]; }; then
+  OLD_VER="$OLD_VER" HEAD_VER="$HEAD_VER" python3 -c 'import json,os
 print(json.dumps({"status":"blocked","failure_class":"version_not_bumped",
-  "message":"diff touches shipping paths but [project].version is unchanged - bump the version or label the PR no-release",
-  "version":os.environ["OLD_VER"],"head_version":os.environ["HEAD_VER"] or None,
-  "shipping_paths":os.environ["SHIPPING"].splitlines()}))'
-      exit 1
-    fi
-  fi
+  "message":"every merge must land a version tag - bump [project].version on the branch (tag-always ruling 2026-11-17)",
+  "version":os.environ["OLD_VER"],"head_version":os.environ["HEAD_VER"] or None}))'
+  exit 1
 fi
 
 ERR=$(gh pr merge "$PR" --"$METHOD" --match-head-commit "$EXPECTED" 2>&1)
@@ -154,12 +139,11 @@ fi
 # incident - same fix ported here, issue #155): when the merge changed
 # [project].version on the base head, the release step is part of the
 # merge operation, not a separate agent duty - merges done through
-# this wrapper can no longer land untagged versions. After the
-# developer ruling of 2026-11-12 (issue #161) an unbumped shipping
-# merge is already blocked pre-merge, so a "no_version_change" result
-# here can only come from an exempted merge (non-shipping diff or
-# no-release label). Human merges via the GitHub UI are covered by the
-# version-tag CI check instead.
+# this wrapper can no longer land untagged versions. Since the
+# tag-always ruling of 2026-11-17 an unbumped merge is blocked
+# pre-merge outright, so a "no_version_change" result here can only
+# come from a merge done outside this wrapper. Human merges via the
+# GitHub UI are covered by the version-tag CI check instead.
 export RELEASE='"skipped"'
 if ! git fetch "$REMOTE" "$BASE" >/dev/null 2>&1; then
   RELEASE='{"status":"skipped","reason":"fetch_failed"}'
