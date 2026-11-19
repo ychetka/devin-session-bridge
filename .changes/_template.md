@@ -1,35 +1,15 @@
----
-# NNNN-slug.md - one file per PR, public-safe content only.
-# type: fix | feat | refactor | chore | docs
-type: fix
-# bump: patch | minor | major - release severity for repo_release.sh
-# (RoM: branches carry no version bump; release computes the next tag)
+# <slug>.md - one file per PR, public-safe content only.
+# Field lines first (no --- frontmatter), then a blank line, then the
+# prose body - the prose IS the changelog entry.
 bump: patch
-# scope: module/subsystem touched (cli, daemon, state, acp, ...)
-scope: cli
 user_visible: false
-breaking: false
-# user_summary: one sentence for the User-facing section; required
-# when user_visible is true, "-" otherwise.
-user_summary: "-"
-# dev_summary: one sentence for the Codebase section.
-dev_summary: what changed technically, in one sentence.
-# why: motivation/decision in one or two sentences. For fix/docs/
-# chore this file serves as the micro-ADR - make why carry it.
-why: why this change exists and why it was done this way.
-# refs: task IDs, issue/PR, directive/decision links.
-refs: issue #N
----
+issue: <N>
+
+One or two sentences of prose: what changed and why, phrased as a
+release-notes bullet. fix/docs/chore entries serve as the micro-ADR -
+the body must carry the decision.
 
 ## Spec impact
-# Required (task 226 / issue #107): list every docs/specs requirement
-# anchor this change touches - the PR applies its own spec delta, so
-# adds/modifies anchors must exist in docs/specs after the change and
-# removes anchors must be gone. Use a bare "-" when the change touches
-# no documented behavior. Anchors follow GitHub's heading rule for
-# "### Requirement: <name>" (lowercase, punctuation dropped, spaces
-# -> hyphens); tools/check_spec_anchors.sh validates them (the CI
-# lint job runs it).
 - adds: docs/specs/<domain>.md#<requirement-anchor>
 - modifies: docs/specs/<domain>.md#<requirement-anchor>
 - removes: docs/specs/<domain>.md#<requirement-anchor>
