@@ -4512,9 +4512,7 @@ def test_issue179_gwt4_kill_hard_stop_pre_halts_session(env, capsys, monkeypatch
     halted_at_cancel = []
 
     def _cancel(sid, **kw):
-        halted_at_cancel.append(
-            db.get_session(sid, path=env.db)["halted_at"] is not None
-        )
+        halted_at_cancel.append(db.get_session(sid, path=env.db)["halted_at"] is not None)
         return "idle"
 
     monkeypatch.setattr(sessions, "cancel_turn", _cancel)
