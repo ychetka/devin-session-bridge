@@ -10,4 +10,4 @@ refs: issue #179
 ---
 
 ## Spec impact
-- modifies: docs/specs/sessions.md#requirement-layered-stop-reports-observed-outcomes-only
+- modifies: docs/specs/sessions.md#layered-stop-reports-observed-outcomes-only
