@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
 # tools/release_notes.sh - aggregate .changes/*.md into release notes.
 #
+# LEGACY (issue #181, RoM canon v0.0.8): this tool parses the OLD
+# 8-field frontmatter fragment format and is NOT part of the
+# Release-on-Merge flow - the deployed .devin/bin/repo_release.sh
+# computes the version from fragment `bump:` fields and folds the
+# prose bodies itself. Kept for ad-hoc previews on old-format
+# fragments; it will error on canon 3-field fragments.
+#
 # Usage:
 #   tools/release_notes.sh                      print both sections
 #   tools/release_notes.sh --version X.Y.Z      print with a

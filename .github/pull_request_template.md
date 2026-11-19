@@ -13,7 +13,7 @@
 
 - [ ] `pytest` green
 - [ ] `uvx ruff@0.17.3 check src/` + `format --check` clean
-- [ ] `.devin/scripts/verify_constraints.sh` ALL PASS
+- [ ] `.devin/bin/verify_constraints.sh` ALL PASS
 - [ ] G/W/T tests added for behavior changes
 
 Closes #
