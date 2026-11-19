@@ -71,7 +71,7 @@ Storage layout (state dir = the directory holding `state.db`, default
    preserves foreign entries, backs up to `hooks.v1.json.bak`):
 
    ```bash
-   .devin/bin/install_hooks.sh /path/to/worker-repo
+   ./install_hooks.sh /path/to/worker-repo
    ```
 
    This registers `SessionStart`, `SessionEnd`, `UserPromptSubmit` and

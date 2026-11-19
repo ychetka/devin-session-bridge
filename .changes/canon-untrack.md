@@ -4,7 +4,7 @@ scope: canon
 user_visible: false
 breaking: false
 user_summary: "-"
-dev_summary: "untrack the deployed canonical harness: .windsurfrules, .devin/agents, .devin/scripts, .devin/config.json, controller-manager/, docs/specs/quota.md and install_hooks.sh leave the tree; .gitignore gains the canon block; deployed copies live under .devin/bin|agents|specs (canon_manifest v0.0.8)"
+dev_summary: "untrack the deployed canonical harness: .windsurfrules, .devin/agents, .devin/scripts, .devin/config.json, controller-manager/ and docs/specs/quota.md leave the tree; .gitignore gains the canon block; deployed copies live under .devin/bin|agents|specs (canon_manifest v0.0.8); install_hooks.sh stays tracked - unit tests execute it from repo root"
 why: canon is orchestrator-owned and deployed per-workspace - tracking it in the repo double-sources it and check_setup.sh rejects a deployed tree whose harness paths are gitignored elsewhere.
 refs: issue #181
 ---
