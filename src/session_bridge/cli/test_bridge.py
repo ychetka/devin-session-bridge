@@ -4520,7 +4520,7 @@ def test_issue179_gwt4_kill_hard_stop_pre_halts_session(env, capsys, monkeypatch
     monkeypatch.setattr(sessions, "cancel_turn", _cancel)
     monkeypatch.setattr(sessions, "close_session", lambda sid, **kw: "confirmed")
 
-    rc, out = _run(["kill", "w1", "--hard-stop", "--json"], capsys)
+    rc, _out = _run(["kill", "w1", "--hard-stop", "--json"], capsys)
 
     assert rc == ExitCode.OK
     assert halted_at_cancel == [True]  # halted before layer 0 ran
@@ -4534,7 +4534,7 @@ def test_issue179_gwt5_kill_dry_run_does_not_halt(env, capsys, monkeypatch):
     db.register("w1", "/repo/w", path=env.db)
     monkeypatch.setattr(sessions, "cancel_turn", lambda sid, **kw: "idle")
 
-    rc, out = _run(["kill", "w1", "--hard-stop", "--dry-run", "--json"], capsys)
+    rc, _out = _run(["kill", "w1", "--hard-stop", "--dry-run", "--json"], capsys)
 
     assert rc == ExitCode.OK
     assert db.get_session("w1", path=env.db)["halted_at"] is None
