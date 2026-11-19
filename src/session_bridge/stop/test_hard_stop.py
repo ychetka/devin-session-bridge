@@ -226,7 +226,12 @@ def test_issue179_gwt2_shared_user_daemon_excluded_even_when_marked():
     for argv in (
         ["/usr/bin/gpg-agent", "--daemon"],
         ["/usr/bin/ssh-agent", "-s"],
+        ["/usr/bin/dbus-launch", "--exit-with-session"],
         ["git", "fsmonitor--daemon", "start"],
+        # wrapped forms: the token hides inside one argv element or
+        # under the hyphenated binary name (review r2)
+        ["sh", "-c", "git fsmonitor--daemon start"],
+        ["/usr/lib/git-core/git-fsmonitor--daemon"],
     ):
         proc = P(1, 0, argv, "/repo/w1", 2000.0, env_sid=SID)
         assert classify(proc, ctx) == ("excluded", "shared_user_daemon"), argv

@@ -736,12 +736,14 @@ def _run_stop_layers(args, sid: str, *, hard: bool, dry_run: bool) -> dict:
             report["cancel_outcome"] = f"failed:{e.reason}"
         # Layer 1 escalation gate (issue #167, widened by review r1
         # finding 3): "requested" means the session still reports
-        # busy; "failed:<reason>" means the cancel transport itself
-        # broke - the session state is UNKNOWN, so the forced close
-        # is still attempted (a second rpc_error is honest, a skipped
-        # close leaves a live session respawning after the sweep).
-        # Only "idle"/"confirmed" are observed goal states that
-        # genuinely need no close.
+        # busy; "failed:<reason>" means the cancel path did not
+        # deliver a goal state - for a transport break the session
+        # state is UNKNOWN ("no_session" is the one observed
+        # absence, but it still escalates uniformly: close is a
+        # cheap attach+list and a skipped close on a transport
+        # failure leaves a live session respawning after the
+        # sweep). Only "idle"/"confirmed" are observed goal states
+        # that genuinely need no close.
         if report["cancel_outcome"] == "requested" or report["cancel_outcome"].startswith(
             "failed:"
         ):
@@ -1050,6 +1052,8 @@ def _cmd_kill_session(args) -> int:
             f" close={stop_report['close_outcome']}"
             f" swept={len(stop_report['swept'])}"
         )
+        if stop_report.get("pre_halt") not in (None, "skipped"):
+            human += f" pre_halt={stop_report['pre_halt']}"
         if stop_report.get("stop_exception"):
             human += f" stop_exception={stop_report['stop_exception']}"
     return _emit(args, resp, ExitCode.OK, human)

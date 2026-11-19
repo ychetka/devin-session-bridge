@@ -180,13 +180,18 @@ attribution can mislabel a shared-workspace process. A
 `db.kill_session` unchanged - the bus row flips dead, tasks
 requeue, heartbeat is removed, and the `session_killed` audit
 row records that layers 0-2 ran first (new fields:
-`cancel_outcome`, `close_outcome`, `swept_pids[]`).
+`cancel_outcome`, `close_outcome`, `swept_pids[]`, plus
+`stop_pre_halt` when the pre-ladder halt ran).
 
 Pre-ladder halt (review r1 finding 4): `bridge kill --hard-stop`
 sets `halted_at` BEFORE layer 0 runs, so the multi-second
 ladder cannot race a pump/relay wake or a new claim - the flag
 closes the window the dead-row teardown would otherwise leave
-open, and is harmless once the row lands in `dead`.
+open, and is harmless once the row lands in `dead`. The halt is
+best-effort: a failure does not abort the teardown, but the
+outcome is surfaced in the JSON/human output and folded into
+the `session_killed` event body (`stop_pre_halt=`) rather than
+swallowed.
 
 ## 6. Env-marker attribution (implemented, issue #168)
 

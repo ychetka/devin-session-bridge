@@ -92,7 +92,7 @@ interactive shell; issue #179).
 - **WHEN** `bridge kill <sid> --hard-stop` runs
 - **THEN** cancel and forced close precede the teardown, the
   `session_killed` event body carries `stop_cancel`/`stop_close`/
-  `swept_pids`, and the session row ends `dead`
+  `swept_pids`/`stop_pre_halt`, and the session row ends `dead`
 - **AND** `bridge kill <sid> --hard-stop --dry-run` leaves the row
   and every process untouched while still listing the would-be
   victims with attribution reasons

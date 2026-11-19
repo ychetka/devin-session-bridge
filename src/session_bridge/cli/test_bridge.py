@@ -4524,6 +4524,8 @@ def test_issue179_gwt4_kill_hard_stop_pre_halts_session(env, capsys, monkeypatch
     assert halted_at_cancel == [True]  # halted before layer 0 ran
     assert db.get_session("w1", path=env.db)["status"] == "dead"
     assert db.get_session("w1", path=env.db)["halted_at"] is not None
+    ev = db.list_events(session_id="w1", kind="session_killed", path=env.db)
+    assert "stop_pre_halt=ok" in ev[0]["body"]
 
 
 def test_issue179_gwt5_kill_dry_run_does_not_halt(env, capsys, monkeypatch):

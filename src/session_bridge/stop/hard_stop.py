@@ -113,6 +113,7 @@ _SHARED_DAEMON_NAMES = frozenset(
         "ssh-agent",
         "dbus-daemon",
         "dbus-broker",
+        "dbus-launch",
         "dconf-service",
         "gnome-keyring-d",
         "gvfsd",
@@ -251,10 +252,12 @@ def proc_start_seconds(pid: int, proc_root: str = "/proc") -> float | None:
 
 def _shared_daemon(proc: ProcInfo) -> bool:
     """True when the process is a shared host-level user daemon."""
-    if proc.argv:
-        if os.path.basename(proc.argv[0]) in _SHARED_DAEMON_NAMES:
-            return True
-    return any(tok in proc.argv for tok in _SHARED_DAEMON_TOKENS)
+    if proc.argv and os.path.basename(proc.argv[0]) in _SHARED_DAEMON_NAMES:
+        return True
+    # the token scan runs on the joined cmdline, not on exact argv
+    # elements - it also catches ``sh -c "git fsmonitor--daemon
+    # start"`` and the hyphenated ``git-fsmonitor--daemon`` form.
+    return any(tok in proc.cmdline for tok in _SHARED_DAEMON_TOKENS)
 
 
 def is_devin_acp(proc: ProcInfo) -> bool:
