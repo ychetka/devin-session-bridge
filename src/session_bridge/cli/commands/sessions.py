@@ -712,13 +712,13 @@ def _run_stop_layers(args, sid: str, *, hard: bool, dry_run: bool) -> dict:
     cancel's own confirm window is the ~5s grace the design asks
     for), forced ``session/close`` next, the attributed process
     sweep last and only under ``--hard``. Layer 1 is an ESCALATION,
-    not a fixed step (issue #167): it fires only when layer 0 left
-    the session busy - ``cancel_outcome == "requested"`` is the sole
-    state where escalation is warranted. Every other cancel outcome
-    skips the close with an honest ``skipped:<cancel_outcome>``
-    verdict: ``idle``/``confirmed`` already observed the goal state,
-    and a ``failed:<reason>`` transport would only fail the same way
-    for the close request. ``dry_run`` makes the whole ladder
+    not a fixed step (issue #167, widened by review r1 finding 3):
+    it fires when layer 0 left the session busy (``requested``) or
+    when the cancel transport failed outright (``failed:<reason>`` -
+    an unknown session state that still needs closing). The
+    observed goal states ``idle``/``confirmed`` are the only
+    outcomes that skip the close, recorded as honest
+    ``skipped:<cancel_outcome>``. ``dry_run`` makes the whole ladder
     side-effect-free: layers 0-1 report ``dry_run`` (nothing is
     sent) and the sweep enumerates without signalling - the only
     safe way to preview a real stop on a live host.
@@ -734,9 +734,17 @@ def _run_stop_layers(args, sid: str, *, hard: bool, dry_run: bool) -> dict:
             report["cancel_outcome"] = cancel_turn(sid, confirm_timeout=_STOP_CANCEL_CONFIRM)
         except WakeError as e:
             report["cancel_outcome"] = f"failed:{e.reason}"
-        # Layer 1 escalation gate (issue #167): only "requested" means
-        # the session still reports busy after the layer-0 grace.
-        if report["cancel_outcome"] == "requested":
+        # Layer 1 escalation gate (issue #167, widened by review r1
+        # finding 3): "requested" means the session still reports
+        # busy; "failed:<reason>" means the cancel transport itself
+        # broke - the session state is UNKNOWN, so the forced close
+        # is still attempted (a second rpc_error is honest, a skipped
+        # close leaves a live session respawning after the sweep).
+        # Only "idle"/"confirmed" are observed goal states that
+        # genuinely need no close.
+        if report["cancel_outcome"] == "requested" or report["cancel_outcome"].startswith(
+            "failed:"
+        ):
             try:
                 report["close_outcome"] = close_session(
                     sid, force=True, confirm_timeout=_STOP_CLOSE_CONFIRM
@@ -812,10 +820,10 @@ def _cmd_stop(args) -> int:
       ~3s on a live busy session;
     - layer 1: forced ``session/close`` (``cognition.ai/force``) -
       the strongest session-scoped primitive the host exposes -
-      fired ONLY when layer 0 left the session busy
-      (``cancel=requested``, issue #167); every other cancel outcome
-      records ``skipped:<cancel_outcome>`` instead of hitting the
-      same transport or a state that needs no close;
+      fired when layer 0 left the session busy (``cancel=requested``,
+      issue #167) or the cancel transport failed (``failed:*`` -
+      unknown state, review r1 #3); only ``idle``/``confirmed``
+      cancel outcomes record ``skipped:<cancel_outcome>``;
     - layer 2 (``--hard`` only): the attributed orphan sweep -
       SIGTERM -> grace -> SIGKILL for backend-tree processes
       attributable to this session (workspace cwd or explicit sid
@@ -909,13 +917,15 @@ def _cmd_kill_session(args) -> int:
     ``session_killed`` ``decision_events`` row, so the durable audit
     cannot separate from the effect.
 
-    ``--hard-stop`` (issue #164) runs the layered stop first - turn
-    cancel, forced ``session/close`` as an escalation only while the
-    session still reports busy (issue #167), attributed orphan
-    sweep - and the bus teardown LAST, so a failed sweep never
-    leaves the registry claiming alive while the session is dead;
-    the per-layer outcomes fold into the ``session_killed`` event
-    body.
+    ``--hard-stop`` (issue #164) first halts the session (claims and
+    daemon wakes are refused while the multi-second ladder runs -
+    review r1 finding 4), then runs the layered stop - turn cancel,
+    forced ``session/close`` as an escalation while the session
+    still reports busy or the cancel transport failed (issue #167,
+    review r1 finding 3), attributed orphan sweep - and the bus
+    teardown LAST, so a failed sweep never leaves the registry
+    claiming alive while the session is dead; the per-layer
+    outcomes fold into the ``session_killed`` event body.
     ``--dry-run`` previews the layers and the sweep without touching
     the session or the bus row.
     """
@@ -923,6 +933,7 @@ def _cmd_kill_session(args) -> int:
     want_hard = getattr(args, "hard_stop", False)
     dry_run = getattr(args, "dry_run", False)
     stop_report = None
+    pre_halt = "skipped"
     if want_hard or dry_run:
         if db.get_session(sid, path=args.db) is None:
             resp = JsonResponse(
@@ -931,6 +942,21 @@ def _cmd_kill_session(args) -> int:
                 error=f"no registration for {sid}",
             )
             return _emit(args, resp, ExitCode.NOT_FOUND, f"not registered: {sid}")
+        if want_hard and not dry_run:
+            # pre-halt (review r1, finding 4): between the layer-0
+            # cancel and the final db.kill_session the row is still
+            # live - a racing pump/relay could wake or re-dispatch it
+            # mid-teardown. halted_at blocks new claims and marks the
+            # undrained mail parked, closing the window; the flag is
+            # harmless once the session lands in dead.
+            try:
+                db.set_session_halted(sid, True, path=args.db)
+                pre_halt = "ok"
+            except Exception as e:
+                # best-effort gate - the teardown still runs, but the
+                # failure is surfaced in the report and event body,
+                # not swallowed (audit finding 4 follow-up).
+                pre_halt = f"failed:{e.__class__.__name__}: {e}"
         try:
             stop_report = _run_stop_layers(args, sid, hard=want_hard, dry_run=dry_run)
         except Exception as e:
@@ -979,6 +1005,7 @@ def _cmd_kill_session(args) -> int:
             if stop_report.get("stop_exception"):
                 human += f"; stop_exception={stop_report['stop_exception']}"
             return _emit(args, resp, ExitCode.OK, human)
+        stop_report["pre_halt"] = pre_halt
     verdict = db.kill_session(sid, stop_report=stop_report, path=args.db)
     if isinstance(verdict, KillNotFound):
         resp = JsonResponse(
@@ -1002,6 +1029,8 @@ def _cmd_kill_session(args) -> int:
             "swept": stop_report["swept"],
             "sweep_status": stop_report["sweep_status"],
         }
+        if stop_report.get("pre_halt") not in (None, "skipped"):
+            data["stop"]["pre_halt"] = stop_report["pre_halt"]
         if stop_report.get("stop_exception"):
             data["stop"]["stop_exception"] = stop_report["stop_exception"]
     resp = JsonResponse(

@@ -4245,9 +4245,10 @@ def test_issue164_gwt10_stop_all_layers_failed_is_internal(env, capsys, monkeypa
     """[ISSUE-164.CLI-10] review MINOR: every layer failing before
     delivery reports status=error AND exits non-zero - scripts read
     the exit code before the JSON, so a refused stop cannot masquerade
-    as an ok-with-caveats. Under the issue #167 gate a failed cancel
-    also skips the close (the same transport would refuse it), so
-    nothing was delivered on either layer."""
+    as an ok-with-caveats. Under the widened gate (issue #179, review
+    r1 finding 3) a failed cancel still escalates to the forced close
+    - the session state is unknown, so a second honest rpc_error is
+    attempted rather than skipped."""
     db.register("w1", "/repo/w", path=env.db)
 
     def _down(*a, **kw):
@@ -4261,7 +4262,7 @@ def test_issue164_gwt10_stop_all_layers_failed_is_internal(env, capsys, monkeypa
     assert rc == ExitCode.INTERNAL
     assert out["status"] == "error"
     assert out["data"]["cancel_outcome"] == "failed:wake_host_down"
-    assert out["data"]["close_outcome"] == "skipped:failed:wake_host_down"
+    assert out["data"]["close_outcome"] == "failed:wake_host_down"
     ev = db.list_events(session_id="w1", kind="session_stopped", path=env.db)
     assert len(ev) == 1 and "status=error" in ev[0]["body"]
 
@@ -4410,12 +4411,13 @@ def test_issue167_gwt3_stop_requested_cancel_runs_close(env, capsys, monkeypatch
     assert d["status"] == "stopped"
 
 
-def test_issue167_gwt4_stop_failed_cancel_skips_close(env, capsys, monkeypatch):
-    """[ISSUE-167.CLI-4] cancel=failed:<reason> means the transport
-    refused - a close attempt would hit the same dead transport, so
-    it is skipped with the honest skipped:failed:<reason> verdict
-    (the skip is recorded, not masked). No delivery happened, so the
-    verdict stays error and exits non-zero."""
+def test_issue167_gwt4_stop_failed_cancel_escalates_close(env, capsys, monkeypatch):
+    """[ISSUE-167.CLI-4, widened issue #179] cancel=failed:<reason>
+    means the cancel transport refused - the session state is
+    UNKNOWN (not observed-idle), so the forced close is still
+    attempted (review r1 finding 3): a live session skipped here
+    respawns fresh children after the --hard sweep. When the close
+    lands, the outcome is its own honest verdict."""
     db.register("w1", "/repo/w", path=env.db)
     sent = []
 
@@ -4431,16 +4433,16 @@ def test_issue167_gwt4_stop_failed_cancel_skips_close(env, capsys, monkeypatch):
 
     rc, out = _run(["stop", "w1", "--json"], capsys)
 
-    assert rc == ExitCode.INTERNAL
-    assert sent == []
-    assert out["status"] == "error"
+    assert rc == ExitCode.OK
+    assert sent == ["w1"]  # close was attempted despite failed cancel
     d = out["data"]
     assert d["cancel_outcome"] == "failed:wake_host_down"
-    assert d["close_outcome"] == "skipped:failed:wake_host_down"
+    assert d["close_outcome"] == "confirmed"
+    assert d["status"] == "stopped"
     ev = db.list_events(session_id="w1", kind="session_stopped", path=env.db)
     assert len(ev) == 1
-    assert "close=skipped:failed:wake_host_down" in ev[0]["body"]
-    assert "status=error" in ev[0]["body"]
+    assert "close=confirmed" in ev[0]["body"]
+    assert "status=stopped" in ev[0]["body"]
 
 
 def test_issue167_gwt5_real_close_rpc_error_stays_honest(env, capsys, monkeypatch):
@@ -4499,6 +4501,43 @@ def test_issue167_gwt6_kill_hard_stop_inherits_close_skip(env, capsys, monkeypat
     assert len(ev) == 1
     assert "stop_cancel=idle" in ev[0]["body"]
     assert "stop_close=skipped:idle" in ev[0]["body"]
+
+
+def test_issue179_gwt4_kill_hard_stop_pre_halts_session(env, capsys, monkeypatch):
+    """[ISSUE-179.R1-4] review r1 finding 4: the multi-second stop
+    ladder must not leave the row claimable/wakeable - kill
+    --hard-stop halts the session BEFORE layer 0, so a racing
+    pump/claim cannot re-dispatch it mid-teardown."""
+    db.register("w1", "/repo/w", path=env.db)
+    halted_at_cancel = []
+
+    def _cancel(sid, **kw):
+        halted_at_cancel.append(
+            db.get_session(sid, path=env.db)["halted_at"] is not None
+        )
+        return "idle"
+
+    monkeypatch.setattr(sessions, "cancel_turn", _cancel)
+    monkeypatch.setattr(sessions, "close_session", lambda sid, **kw: "confirmed")
+
+    rc, out = _run(["kill", "w1", "--hard-stop", "--json"], capsys)
+
+    assert rc == ExitCode.OK
+    assert halted_at_cancel == [True]  # halted before layer 0 ran
+    assert db.get_session("w1", path=env.db)["status"] == "dead"
+    assert db.get_session("w1", path=env.db)["halted_at"] is not None
+
+
+def test_issue179_gwt5_kill_dry_run_does_not_halt(env, capsys, monkeypatch):
+    """[ISSUE-179.R1-5] --dry-run is side-effect-free end to end:
+    the pre-halt gate must not fire on a preview."""
+    db.register("w1", "/repo/w", path=env.db)
+    monkeypatch.setattr(sessions, "cancel_turn", lambda sid, **kw: "idle")
+
+    rc, out = _run(["kill", "w1", "--hard-stop", "--dry-run", "--json"], capsys)
+
+    assert rc == ExitCode.OK
+    assert db.get_session("w1", path=env.db)["halted_at"] is None
 
 
 # --- issue #168: DEVIN_SESSION_ID injection into spawned workers ---------------

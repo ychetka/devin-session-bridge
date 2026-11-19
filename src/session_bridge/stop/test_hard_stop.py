@@ -30,7 +30,7 @@ BACKEND_PID = 101
 BACKEND_START = 1000.0
 
 
-def P(pid, ppid, argv, cwd=None, start=2000.0, env_sid=None):
+def P(pid, ppid, argv, cwd=None, start=2000.0, env_sid=None, tty=0):
     return ProcInfo(
         pid=pid,
         ppid=ppid,
@@ -38,6 +38,7 @@ def P(pid, ppid, argv, cwd=None, start=2000.0, env_sid=None):
         cwd=cwd,
         start_seconds=start,
         devin_session_id=env_sid,
+        tty_nr=tty,
     )
 
 
@@ -201,6 +202,51 @@ def test_issue164_gwt6_trivial_workspace_no_cwd_attribution():
     ctx = _ctx(session_cwd="/")
     proc = P(1, 0, ["bash", "-c", "x"], "/anything", 2000.0)
     assert classify(proc, ctx) == ("unrelated", "")
+
+
+# --- architect review r1 (issue #179) ------------------------------------------
+
+
+def test_issue179_gwt1_env_marker_outranks_mcp_token():
+    """[ISSUE-179.R1-1] an explicit DEVIN_SESSION_ID env marker is
+    unambiguous ownership - it must outrank the coincidental 'mcp'
+    cmdline substring (a session running MCP tests is still session
+    work, review r1 finding 9)."""
+    ctx = _ctx()
+    proc = P(1, 0, ["python3", "tests/test_mcp_server.py"], "/repo/w1", 2000.0, env_sid=SID)
+    assert classify(proc, ctx) == ("candidate", "env:DEVIN_SESSION_ID")
+
+
+def test_issue179_gwt2_shared_user_daemon_excluded_even_when_marked():
+    """[ISSUE-179.R1-2] shared host-level user daemons inherit the
+    spawning session's env marker but belong to the HOST, not the
+    session - killing them inside a session sweep breaks the fleet's
+    git/ssh stack (review r1 finding 11)."""
+    ctx = _ctx()
+    for argv in (
+        ["/usr/bin/gpg-agent", "--daemon"],
+        ["/usr/bin/ssh-agent", "-s"],
+        ["git", "fsmonitor--daemon", "start"],
+    ):
+        proc = P(1, 0, argv, "/repo/w1", 2000.0, env_sid=SID)
+        assert classify(proc, ctx) == ("excluded", "shared_user_daemon"), argv
+
+
+def test_issue179_gwt3_interactive_tty_excluded_on_cwd_leg():
+    """[ISSUE-179.R1-3] a human's interactive shell (controlling
+    terminal) sitting in the shared workspace survives the weak cwd
+    leg - while a marker-attributed process is still swept (review r1
+    finding 10)."""
+    ctx = _ctx()
+    assert classify(P(1, 0, ["bash"], "/repo/w1", 2000.0, tty=1024), ctx) == (
+        "excluded",
+        "interactive_tty",
+    )
+    # strong attribution still beats the tty exclusion: a marked
+    # session process holding a pty remains a sweep candidate
+    marked = P(1, 0, ["bridge", "wait", "--session", "s1"], "/repo/w1", 2000.0, tty=1024)
+    verdict, detail = classify(marked, ctx)
+    assert verdict == "candidate" and detail.startswith("cmdline:")
 
 
 # --- sweep: dry-run vs kill ordering ---------------------------------------------

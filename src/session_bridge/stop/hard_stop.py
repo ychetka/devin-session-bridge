@@ -93,9 +93,35 @@ SWEEP_TERM_GRACE_SECONDS = 2.0
 BACKEND_SPAWN_GRACE_SECONDS = 30.0
 
 #: conservative server whitelist: any cmdline containing this token
-#: is treated as a shared MCP/tool server and excluded, even when it
-#: also carries session markers (deliverable's literal rule).
+#: is treated as a shared MCP/tool server and excluded - UNLESS the
+#: process carries the target's own ``DEVIN_SESSION_ID`` env marker:
+#: an explicit env ownership claim outranks a coincidental substring
+#: (a session running ``pytest -k mcp`` must still be swept).
 _MCP_TOKEN = "mcp"
+
+#: shared host-level user daemons never belong to one session: they
+#: are auto-spawned by desktop/git/ssh machinery, inherit whatever
+#: environment the spawning session had (including a session's
+#: ``DEVIN_SESSION_ID``), and are shared by every session on the
+#: host - killing them inside a session-scoped sweep breaks the
+#: whole fleet's git/ssh/crypto stack (architect review r1, #11).
+#: Matched on basename(argv[0]); token list covers multi-word
+#: cmdlines like ``git fsmonitor--daemon``.
+_SHARED_DAEMON_NAMES = frozenset(
+    {
+        "gpg-agent",
+        "ssh-agent",
+        "dbus-daemon",
+        "dbus-broker",
+        "dconf-service",
+        "gnome-keyring-d",
+        "gvfsd",
+        "dmypy",
+        "xscreensaver",
+        "polkitd",
+    }
+)
+_SHARED_DAEMON_TOKENS = ("fsmonitor--daemon",)
 
 #: matches ``devin acp`` as an argv pair or inside a wrapper cmdline.
 _DEVIN_ACP_RE = re.compile(r"(?:^|[/\s])devin acp(?:\s|$)")
@@ -127,6 +153,10 @@ class ProcInfo(NamedTuple):
     #: strong-attribution env marker; ``None`` when unreadable,
     #: absent, or empty (issue #168).
     devin_session_id: str | None = None
+    #: ``/proc/<pid>/stat`` tty_nr - nonzero means the process holds a
+    #: controlling terminal: a human's interactive shell sitting in
+    #: the shared workspace (architect review r1, #10).
+    tty_nr: int = 0
 
     @property
     def cmdline(self) -> str:
@@ -148,6 +178,7 @@ def _read_proc(proc_root: str, pid: int, hz: float) -> ProcInfo | None:
     fields = raw[rparen + 2 :].split()
     try:
         ppid = int(fields[1])
+        tty_nr = int(fields[4])
         start_ticks = int(fields[19])
     except (IndexError, ValueError):
         return None
@@ -179,6 +210,7 @@ def _read_proc(proc_root: str, pid: int, hz: float) -> ProcInfo | None:
         cwd=cwd,
         start_seconds=start_ticks / hz,
         devin_session_id=devin_session_id,
+        tty_nr=tty_nr,
     )
 
 
@@ -215,6 +247,14 @@ def proc_start_seconds(pid: int, proc_root: str = "/proc") -> float | None:
         hz = 100.0
     info = _read_proc(proc_root, pid, hz)
     return info.start_seconds if info is not None else None
+
+
+def _shared_daemon(proc: ProcInfo) -> bool:
+    """True when the process is a shared host-level user daemon."""
+    if proc.argv:
+        if os.path.basename(proc.argv[0]) in _SHARED_DAEMON_NAMES:
+            return True
+    return any(tok in proc.argv for tok in _SHARED_DAEMON_TOKENS)
 
 
 def is_devin_acp(proc: ProcInfo) -> bool:
@@ -360,28 +400,38 @@ def classify(proc: ProcInfo, ctx: SweepContext) -> tuple[str, str]:
 
     Exclusions are evaluated before attribution and in order of
     blast radius: infrastructure pids first, foreign-session markers
-    next (a misattributed kill is a second incident), the MCP
-    whitelist third, then the positive-attribution legs - the
-    ``DEVIN_SESSION_ID`` env marker first (issue #168), cmdline
-    markers second, workspace cwd last.
+    next (a misattributed kill is a second incident), shared
+    host-level user daemons third (they inherit whatever env the
+    spawning session had - the marker is not ownership), then the
+    positive-attribution legs - the ``DEVIN_SESSION_ID`` env marker
+    first (issue #168, and it outranks the MCP substring whitelist:
+    an explicit ownership claim beats a coincidental token), the MCP
+    whitelist, cmdline markers, workspace cwd last.
     """
     if proc.pid in ctx.protected_pids or proc.pid in ctx.backend_pids:
         return "excluded", "protected_infrastructure"
     foreign = _foreign_hit(proc, ctx)
     if foreign is not None:
         return "excluded", f"other_session:{foreign}"
-    if _MCP_TOKEN in proc.cmdline.lower():
-        return "excluded", "mcp_server"
+    if _shared_daemon(proc):
+        return "excluded", "shared_user_daemon"
     if proc.devin_session_id is not None and proc.devin_session_id == ctx.sid:
         # the env marker is strong attribution equivalent to cmdline
         # markers: it sweeps regardless of process age (issue #168)
         return "candidate", "env:DEVIN_SESSION_ID"
+    if _MCP_TOKEN in proc.cmdline.lower():
+        return "excluded", "mcp_server"
     hits = marker_hits(proc, ctx.sid, ctx.mailbox_dir)
     if hits:
         # explicit sid markers are strong attribution: they sweep
         # regardless of process age
         return "candidate", f"cmdline:{hits[0]}"
     if _under(proc.cwd, ctx.session_cwd) and _cwd_usable(ctx.session_cwd):
+        if proc.tty_nr:
+            # a controlling terminal on the weak cwd leg means a
+            # human's interactive shell sharing the workspace - the
+            # strongest signal this is not session work (review #10)
+            return "excluded", "interactive_tty"
         if (
             ctx.backend_start is not None
             and proc.start_seconds <= ctx.backend_start + ctx.spawn_grace_seconds
