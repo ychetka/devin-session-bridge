@@ -2582,6 +2582,8 @@ def kill_session(session_id: str, *, stop_report: dict | None = None, path=None)
                         f" stop_close={stop_report.get('close_outcome')}"
                         f" swept_pids=[{pids}]"
                     )
+                    if stop_report.get("pre_halt") not in (None, "skipped"):
+                        body += f" stop_pre_halt={stop_report['pre_halt']}"
                     if stop_report.get("stop_exception"):
                         body += f" stop_exception={stop_report['stop_exception']}"
                 con.execute(

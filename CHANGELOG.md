@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.15.11] - 2026-11-19
+
+### Codebase
+
+#### fix
+- Hard-stop hardening from the external architect review (issue #179): `classify` now lets an explicit `DEVIN_SESSION_ID` env marker outrank the coincidental `mcp` cmdline substring; shared host-level user daemons (`gpg-agent`, `ssh-agent`, `dbus-*`, `fsmonitor--daemon`, ...) are excluded even when they inherit a session's env marker; a controlling-TTY process is refused on the weak workspace-cwd leg; forced `session/close` escalates on `cancel=failed:*` (unknown state), not only `requested`; `bridge kill --hard-stop` pre-halts the session so pump/claim cannot re-dispatch it mid-teardown. Why: post-audit boundary defects at the sweep's exclusion order, the layer-1 escalation gate and the teardown window. (issue #179)
+
+
+## [0.15.10] - 2026-11-17
+
+### Codebase
+
+#### tooling
+- [fix] `repo_merge.sh` pre-merge version gate tightened to tag-always (developer ruling 2026-11-17): every merge into the base branch must end in a version tag + release, so every PR must bump [project].version - the non-shipping-path and `no-release` exemptions are revoked in enforcement (the label is ignored). Why: exemptions let merges land untagged, recreating the untracked version-drift incident class. (issue #177)
+
 ## [0.15.9] - 2026-11-16
 
 ### User-facing
