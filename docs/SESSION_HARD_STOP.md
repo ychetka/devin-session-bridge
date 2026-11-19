@@ -130,6 +130,15 @@ continue to layer 2; a wedged turn inside an uninterruptible
 tool call may not survive this layer either, which is exactly
 why layer 2 exists.
 
+Layer-1 escalation contract (issues #167, #179): the close fires
+when layer 0 left the session busy (`cancel_outcome=requested`)
+OR when the cancel transport failed (`failed:<reason>`) - a
+failed cancel means the session state is UNKNOWN, and a live
+session skipped here would respawn fresh children after the
+layer-2 sweep (architect review r1 finding 3). Only the observed
+goal states `idle`/`confirmed` skip the close, recorded as
+`skipped:<outcome>`.
+
 ### Layer 2 - attributed orphan sweep (new code)
 
 Enumerate and signal host processes attributable to the session:
@@ -143,11 +152,21 @@ Enumerate and signal host processes attributable to the session:
     OR
   - its cmdline contains `queue/<sid>`, `--session <sid>`, or
     the session mailbox path.
-- Exclusions (never signalled): the backend and acp-host
-  supervisors themselves, MCP/tool server children matched
-  against the agent's configured server list or by start-time
-  older than the turn being killed, and any process whose
-  cmdline matches a different registered session's markers.
+- Exclusions (never signalled, in blast-radius order): the
+  backend and acp-host supervisors themselves; any process whose
+  markers, env or cwd name a different registered session;
+  shared host-level user daemons (`gpg-agent`, `ssh-agent`,
+  `dbus-*`, `dconf-service`, `gnome-keyring-d`, `gvfsd`,
+  `dmypy`, `git fsmonitor--daemon`, ...) that inherit whatever
+  env the spawning session had and are shared by the whole host
+  (review r1 finding 11); then, on the attribution legs, the
+  target's own `DEVIN_SESSION_ID` env marker outranks the
+  coincidental `mcp` cmdline substring (review r1 finding 9),
+  the MCP/tool server whitelist, explicit sid markers, and the
+  workspace-cwd fallback - which additionally refuses processes
+  holding a controlling TTY (a human's interactive shell sharing
+  the workspace, review r1 finding 10) and anything spawned in
+  the backend's startup window.
 - Signal order: SIGTERM, short grace, SIGKILL to survivors.
 - Every swept PID + attribution reason is recorded on the
   `session_stopped` decision event and returned in the JSON.
@@ -161,7 +180,18 @@ attribution can mislabel a shared-workspace process. A
 `db.kill_session` unchanged - the bus row flips dead, tasks
 requeue, heartbeat is removed, and the `session_killed` audit
 row records that layers 0-2 ran first (new fields:
-`cancel_outcome`, `close_outcome`, `swept_pids[]`).
+`cancel_outcome`, `close_outcome`, `swept_pids[]`, plus
+`stop_pre_halt` when the pre-ladder halt ran).
+
+Pre-ladder halt (review r1 finding 4): `bridge kill --hard-stop`
+sets `halted_at` BEFORE layer 0 runs, so the multi-second
+ladder cannot race a pump/relay wake or a new claim - the flag
+closes the window the dead-row teardown would otherwise leave
+open, and is harmless once the row lands in `dead`. The halt is
+best-effort: a failure does not abort the teardown, but the
+outcome is surfaced in the JSON/human output and folded into
+the `session_killed` event body (`stop_pre_halt=`) rather than
+swallowed.
 
 ## 6. Env-marker attribution (implemented, issue #168)
 

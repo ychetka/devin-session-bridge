@@ -56,16 +56,21 @@ to `queued` for re-claim - work survives the worker.
 
 `bridge stop` SHALL run the hard-stop ladder against a registered
 session in escalation order - `session/cancel`, then forced
-`session/close` as an escalation fired ONLY while the session still
+`session/close` as an escalation fired while the session still
 reports busy after the cancel's confirm window
-(`cancel_outcome=requested`; any other cancel outcome skips the
-close and reports `skipped:<cancel_outcome>`), then the attributed
+(`cancel_outcome=requested`) or when the cancel transport failed
+(`failed:<reason>` - unknown session state; only the observed
+goal states `idle`/`confirmed` skip the close and report
+`skipped:<cancel_outcome>`; issue #167, widened by issue #179),
+then the attributed
 orphan sweep under `--hard` - without touching the bus row, and
 SHALL report each layer's observed outcome
 (`idle`/`confirmed`/`requested`/`failed:<reason>`/
 `skipped:<reason>`) instead of claiming a stop that was only
 requested. `bridge kill <sid>
---hard-stop` SHALL run the same ladder BEFORE `db.kill_session` and
+--hard-stop` SHALL halt the session (`halted_at`) BEFORE layer 0
+so a racing pump or claim cannot re-dispatch it mid-teardown
+(issue #179), run the same ladder BEFORE `db.kill_session` and
 fold the per-layer outcomes into the `session_killed` event body;
 `--dry-run` SHALL enumerate layers and sweep victims without sending,
 signalling, or tearing down. The sweep SHALL attribute only processes
@@ -74,16 +79,20 @@ workspace cwd, explicit sid markers, or the
 `DEVIN_SESSION_ID=<sid>` environment marker read from
 `/proc/<pid>/environ` (a strong marker equal to cmdline markers;
 issue #168), and SHALL never signal the
-backend, the acp-host supervisor, MCP/tool servers, or processes
+backend, the acp-host supervisor, MCP/tool servers, processes
 attributed to other registered sessions (including an env marker
-naming another registered session).
+naming another registered session), shared host-level user
+daemons (`gpg-agent`, `ssh-agent`, `dbus-*`, `fsmonitor--daemon`,
+...) even when they inherit the target's env marker, or a process
+holding a controlling TTY on the workspace-cwd leg (a human's
+interactive shell; issue #179).
 
 #### Scenario: hard-stop kill tears down the bus last
 
 - **WHEN** `bridge kill <sid> --hard-stop` runs
 - **THEN** cancel and forced close precede the teardown, the
   `session_killed` event body carries `stop_cancel`/`stop_close`/
-  `swept_pids`, and the session row ends `dead`
+  `swept_pids`/`stop_pre_halt`, and the session row ends `dead`
 - **AND** `bridge kill <sid> --hard-stop --dry-run` leaves the row
   and every process untouched while still listing the would-be
   victims with attribution reasons
