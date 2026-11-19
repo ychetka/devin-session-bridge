@@ -1,13 +1,16 @@
----
-type: chore
-scope: canon
+bump: patch
 user_visible: false
-breaking: false
-user_summary: "-"
-dev_summary: "untrack the deployed canonical harness: .windsurfrules, .devin/agents, .devin/scripts, .devin/config.json, controller-manager/ and docs/specs/quota.md leave the tree; .gitignore gains the canon block; deployed copies live under .devin/bin|agents|specs (canon_manifest v0.0.8); install_hooks.sh stays tracked - unit tests execute it from repo root"
-why: canon is orchestrator-owned and deployed per-workspace - tracking it in the repo double-sources it and check_setup.sh rejects a deployed tree whose harness paths are gitignored elsewhere.
-refs: issue #181
----
+issue: 181
+
+Canon untrack v0.0.8: the orchestrator-owned canonical harness stops
+being tracked - `.windsurfrules`, `.devin/agents/`, `.devin/scripts/`,
+`.devin/config.json`, `controller-manager/` and `docs/specs/quota.md`
+leave the tree; deployed copies live under `.devin/bin|agents|specs/`
+stamped by `.devin/canon_manifest.json`. `.gitignore` gains the
+canonical-harness block (required by check_setup.sh on a deployed
+tree). `install_hooks.sh` stays tracked - unit tests execute it from
+the repo root. Tracked references repointed to `.devin/bin/` and the
+quota spec marked canon-deployed.
 
 ## Spec impact
 - removes: docs/specs/quota.md#quota-park-is-orthogonal-to-lifecycle

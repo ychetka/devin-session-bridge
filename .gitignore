@@ -5,9 +5,9 @@ __pycache__/
 .ruff_cache/
 state.db*
 queue/
-# .devin canon (agents/, scripts/, project.json, config.json) and
-# .windsurfrules are TRACKED. Only machine-local session state stays
-# ignored:
+# .devin canon (agents/, bin/, specs/, config.json) and .windsurfrules
+# are DEPLOYED, not tracked - see the canonical-harness block below.
+# Only machine-local session state stays ignored here:
 .devin/roadmap.md
 .devin/tasks/
 .devin/cycle_log.jsonl*

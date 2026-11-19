@@ -2,6 +2,9 @@
 # NNNN-slug.md - one file per PR, public-safe content only.
 # type: fix | feat | refactor | chore | docs
 type: fix
+# bump: patch | minor | major - release severity for repo_release.sh
+# (RoM: branches carry no version bump; release computes the next tag)
+bump: patch
 # scope: module/subsystem touched (cli, daemon, state, acp, ...)
 scope: cli
 user_visible: false

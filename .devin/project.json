@@ -4,8 +4,7 @@
   "cyrillic_paths": [
     ".devin/agents/",
     ".windsurfrules",
-    "controller-manager/",
-    ".devin/scripts/msg_stamp.sh"
+    ".devin/bin/msg_stamp.sh"
   ],
   "protected_paths": [
     ".devin/",

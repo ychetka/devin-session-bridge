@@ -36,7 +36,7 @@ directory is emptied at every release, so no tag arithmetic exists.
   `CHANGELOG.md` under the title and deletes the consumed entry files.
   Run it on the release branch (or the last PR before tagging) and
   commit the result together with the version bump -
-  `.devin/scripts/repo_release.sh` then tags the already-prepared
+  `.devin/bin/repo_release.sh` then tags the already-prepared
   head and passes `--generate-notes` or hand-fed notes to
   `gh release create`.
 

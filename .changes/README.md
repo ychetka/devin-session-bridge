@@ -9,7 +9,7 @@ published CHANGELOG/release notes.
 
 The entry is gated, not just conventional: `tools/check_changes_entry.sh`
 runs in the CI lint job on every pull request and as a pre-merge guard
-inside `.devin/scripts/repo_merge.sh`. A PR that changes files merges
+inside `.devin/bin/repo_merge.sh`. A PR that changes files merges
 only when it carries ONE of:
 
 - a new `.changes/<slug>.md` fragment (tooling/chore changes use
@@ -29,10 +29,14 @@ Required frontmatter fields (indented continuation lines fold into
 the previous field's value):
 
 - `type`: fix | feat | refactor | chore | docs
+- `bump`: patch | minor | major - release severity consumed by
+  `.devin/bin/repo_release.sh` under the Release-on-Merge model
+  (branches carry no version bump; the release commit computes
+  `next = bump(max(latest v* tag, version at base))`)
 - `scope`: the module/subsystem the change touches - one of
   `cli`, `daemon`, `state`, `acp`, `mailbox`, `wake`, `ingress`,
-  `tooling`, `docs`, `deploy` (extend the list here when a new
-  module lands)
+  `tooling`, `docs`, `deploy`, `canon` (extend the list here when a
+  new module lands)
 - `user_visible`: true | false - does an operator/integrator notice?
 - `breaking`: true | false - does anything consuming the CLI/API
   surface need to change?
