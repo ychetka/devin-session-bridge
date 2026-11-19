@@ -44,7 +44,7 @@ Hook delivery requires the bridge hooks in the target repo's
 `.devin/hooks.v1.json`:
 
 ```bash
-./install_hooks.sh /path/to/repo
+.devin/bin/install_hooks.sh /path/to/repo
 ```
 
 The script is idempotent: existing non-bridge hook entries are kept, a

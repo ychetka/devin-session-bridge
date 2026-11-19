@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.15.12] - 2026-11-19
+
+### Codebase
+
+#### chore
+- Canon untrack v0.0.8 (issue #181): the orchestrator-owned canonical harness stops being tracked - `.windsurfrules`, `.devin/agents/`, `.devin/scripts/`, `.devin/config.json`, `controller-manager/`, `docs/specs/quota.md` and root `install_hooks.sh` leave the tree; deployed copies live under `.devin/bin|agents|specs/` stamped by `.devin/canon_manifest.json`. `.gitignore` gains the canonical-harness block; tracked doc references repointed to deployed paths. Why: canon is deployed per-workspace, not versioned with product code. (issue #181)
+
+
 ## [0.15.11] - 2026-11-19
 
 ### Codebase

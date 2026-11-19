@@ -42,5 +42,6 @@ verifies every declared anchor resolves (or is gone, for removes).
 - [`wake.md`](wake.md) - daemon wake legs, suppression, policy
 - [`sessions.md`](sessions.md) - registration, liveness, HALT/RESUME,
   kill/unregister
-- [`quota.md`](quota.md) - `waiting_quota` step state, quota parks,
-  reset sweep and probes
+- `quota.md` - `waiting_quota` step state, quota parks, reset
+  sweep and probes (canon spec, deployed at `.devin/specs/quota.md`
+  since issue #181, not tracked here)

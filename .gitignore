@@ -16,3 +16,13 @@ queue/
 .devin/hooks.v1.json
 .devin/archive/
 .devin/migration_ok
+# >>> canonical harness (deployed by ai_controller canon, not tracked) >>>
+.windsurfrules
+.devin/agents/
+.devin/bin/
+.devin/specs/harness.md
+.devin/specs/quota.md
+.devin/config.json
+.devin/canon_manifest.json
+/.windsurfrules.bak
+# <<< canonical harness <<<
