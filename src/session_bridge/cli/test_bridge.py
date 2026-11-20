@@ -4613,9 +4613,7 @@ def test_issue183_r2_stop_holds_halt_during_ladder(env, capsys, monkeypatch):
     observed = []
 
     def _cancel(sid, **kw):
-        observed.append(
-            db.get_session(sid, path=env.db)["halted_at"] is not None
-        )
+        observed.append(db.get_session(sid, path=env.db)["halted_at"] is not None)
         return "confirmed"
 
     monkeypatch.setattr(sessions, "cancel_turn", _cancel)
@@ -4694,7 +4692,7 @@ def test_issue183_r2_kill_hard_stop_stamps_started_marker(env, capsys, monkeypat
         },
     )
 
-    rc, out = _run(["kill", "w1", "--hard-stop", "--json"], capsys)
+    rc, _out = _run(["kill", "w1", "--hard-stop", "--json"], capsys)
 
     assert rc == ExitCode.OK
     started = db.list_events(session_id="w1", kind="session_kill_started", path=env.db)

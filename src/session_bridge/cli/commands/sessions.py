@@ -939,11 +939,7 @@ def _cmd_stop(args) -> int:
             if report.get("weak_suspects")
             else ""
         )
-        + (
-            f" pre_halt={pre_halt}"
-            if pre_halt != "skipped" and pre_halt != "ok"
-            else ""
-        )
+        + (f" pre_halt={pre_halt}" if pre_halt != "skipped" and pre_halt != "ok" else "")
         + (f" halt_release={halt_release}" if halt_release.startswith("failed") else "")
         + (" [dry-run]" if args.dry_run else "")
     )

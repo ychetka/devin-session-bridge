@@ -3201,8 +3201,7 @@ def test_issue183_r2_interrupted_kill_finalized(env):
     assert row["status"] == "dead"
     ev = _one(
         env.db,
-        "SELECT kind,body FROM decision_events"
-        " WHERE kind='session_killed' AND session_id=?",
+        "SELECT kind,body FROM decision_events WHERE kind='session_killed' AND session_id=?",
         (SID,),
     )
     assert ev is not None and "interrupted" in ev["body"]
@@ -3246,8 +3245,7 @@ def _mk_question(path, sid, task_id, state="pending"):
     con = db.connect(path)
     try:
         cur = con.execute(
-            "INSERT INTO questions(task_id,session_id,text,state,asked_at)"
-            " VALUES(?,?,?,?,?)",
+            "INSERT INTO questions(task_id,session_id,text,state,asked_at) VALUES(?,?,?,?,?)",
             (task_id, sid, "q?", state, int(time.time())),
         )
         return cur.lastrowid
@@ -3263,8 +3261,12 @@ def test_issue183_r2_stale_question_answer_dropped(env):
     tid = db.enqueue(SID, "work", path=env.db)
     qid = _mk_question(env.db, SID, tid)
     nid = db.notify(
-        SID, NotificationKind.QUESTION_ANSWER, "ans", task_id=tid,
-        question_id=qid, path=env.db,
+        SID,
+        NotificationKind.QUESTION_ANSWER,
+        "ans",
+        task_id=tid,
+        question_id=qid,
+        path=env.db,
     )
     _exec(env.db, "UPDATE tasks SET status='failed' WHERE id=?", (tid,))
     assert daemon.run(env.db, env.qdir, once=True) == daemon.RUN_OK
@@ -3284,13 +3286,18 @@ def test_issue183_r2_live_task_answer_delivers(env):
     tid = db.enqueue(SID, "work", path=env.db)
     qid = _mk_question(env.db, SID, tid)
     db.notify(
-        SID, NotificationKind.QUESTION_ANSWER, "ans", task_id=tid,
-        question_id=qid, path=env.db,
+        SID,
+        NotificationKind.QUESTION_ANSWER,
+        "ans",
+        task_id=tid,
+        question_id=qid,
+        path=env.db,
     )
     _exec(env.db, "UPDATE tasks SET status='running', lease_owner='w1' WHERE id=?", (tid,))
     assert daemon.run(env.db, env.qdir, once=True) == daemon.RUN_OK
     files = _msg_files(Path(env.qdir) / SID)
-    assert len(files) == 1 and "kind: question_answer" in (Path(env.qdir) / SID / files[0]).read_text()
+    body = (Path(env.qdir) / SID / files[0]).read_text() if files else ""
+    assert len(files) == 1 and "kind: question_answer" in body
 
 
 def test_issue183_r2_stale_dispatch_dropped(env):
@@ -3323,4 +3330,5 @@ def test_issue183_r2_fresh_dispatch_delivers(env):
     db.notify(SID, NotificationKind.TASK_DISPATCH, "prompt", task_id=tid, path=env.db)
     assert daemon.run(env.db, env.qdir, once=True) == daemon.RUN_OK
     files = _msg_files(Path(env.qdir) / SID)
-    assert len(files) == 1 and "kind: task_dispatch" in (Path(env.qdir) / SID / files[0]).read_text()
+    body = (Path(env.qdir) / SID / files[0]).read_text() if files else ""
+    assert len(files) == 1 and "kind: task_dispatch" in body

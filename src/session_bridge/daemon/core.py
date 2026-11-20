@@ -459,9 +459,7 @@ def _question_answer_stale_reason(qid, *, db_path=None, con=None) -> str | None:
         return None
     try:
         if con is not None:
-            q = con.execute(
-                "SELECT task_id FROM questions WHERE id=?", (qid,)
-            ).fetchone()
+            q = con.execute("SELECT task_id FROM questions WHERE id=?", (qid,)).fetchone()
         else:
             q = db.get_question(qid, path=db_path)
     except Exception:
@@ -500,9 +498,7 @@ def _dispatch_stale_reason(tid, sid, *, db_path=None, con=None) -> str | None:
         return None
     try:
         if con is not None:
-            t = con.execute(
-                "SELECT session_id, status FROM tasks WHERE id=?", (tid,)
-            ).fetchone()
+            t = con.execute("SELECT session_id, status FROM tasks WHERE id=?", (tid,)).fetchone()
         else:
             t = db.get_task(tid, path=db_path)
     except Exception:
@@ -555,9 +551,7 @@ def _relay_pass(db_path, queue_dir, state_directory, now: int) -> None:
             # queued behind a daemon outage must not materialize once
             # its invitation already resolved (claim, requeue,
             # withdraw, kill) - the worker would drain a dead prompt
-            reason = _dispatch_stale_reason(
-                row["task_id"], row["session_id"], db_path=db_path
-            )
+            reason = _dispatch_stale_reason(row["task_id"], row["session_id"], db_path=db_path)
             if reason is not None:
                 db.mark_relayed(row["id"], path=db_path)
                 detail = f"notification={row['id']} kind={row['kind']} {reason}"
@@ -659,11 +653,7 @@ def _stale_control_pass(db_path, queue_dir, state_directory, now: int) -> None:
                     continue  # vanished mid-scan - already consumed
                 if leg in ("answer", "dispatch"):
                     hid = headers.get("question_id" if leg == "answer" else "task_id", "")
-                    hid = (
-                        int(hid)
-                        if hid.isascii() and hid.isdigit() and len(hid) <= 19
-                        else None
-                    )
+                    hid = int(hid) if hid.isascii() and hid.isdigit() and len(hid) <= 19 else None
                     if leg == "answer":
                         reason = _question_answer_stale_reason(hid, db_path=db_path, con=con)
                     else:
@@ -2031,7 +2021,7 @@ def _kill_teardown_pass(db_path, state_directory, notify_send, now: int) -> int:
             state_directory,
             "interrupted_kill_recovered",
             sid,
-            f"session_kill_started without session_killed; daemon finalized the teardown",
+            "session_kill_started without session_killed; daemon finalized the teardown",
         )
         if notify_send is not None:
             notify_send(
