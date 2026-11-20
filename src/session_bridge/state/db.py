@@ -155,6 +155,20 @@ SETTING_MAX_ACTIVE_SESSIONS: Final[str] = "max_active_sessions"
 #: (no CAS guard, no trip writes).
 THRASH_LIMIT: Final[int] = max(0, _env_int("SB_THRASH_LIMIT", 3))
 
+#: External-wait bound (architect review r2, #16): ``bridge wait``
+#: extends a running task's lease one LEASE_SECONDS at a time, so
+#: without a cap a worker that keeps calling can hold a task -
+#: and its session slot - forever while producing nothing.
+#: ``WAIT_MAX_SECONDS`` bounds the cumulative waiting inside one
+#: claim; ``WAIT_RENEWAL_CAP`` is the same bound in renewal units
+#: (each renewal covers at most LEASE_SECONDS of wall time, so a
+#: worker calling more often trips the bound early - conservative
+#: fail-safe, never bypassable). ``<=0`` disables the bound.
+WAIT_MAX_SECONDS: Final[int] = _env_int("SB_WAIT_MAX_S", 86400)
+WAIT_RENEWAL_CAP: Final[int] = (
+    max(1, WAIT_MAX_SECONDS // LEASE_SECONDS) if WAIT_MAX_SECONDS > 0 else 0
+)
+
 #: Session-slot admission predicate for CAS writes that move a
 #: queued task toward running (issue #121). Takes the cap twice as
 #: positional ``?`` parameters. A row proceeds when the cap is off,
@@ -170,13 +184,23 @@ _SLOT_STATUSES_SQL = ", ".join(
     f"'{v}'" for v in (TaskStatus.RUNNING.value, TaskStatus.DISPATCH_DECIDED.value)
 )
 
+#: A ``waiting_quota`` park keeps the task's lease and lifecycle
+#: status but frees the session slot for the park's duration
+#: (architect review r2, #15): a task sleeping until the provider's
+#: quota reset burns no worker capacity, so the slot predicate must
+#: not count it - otherwise long parks starve the fleet under
+#: ``SB_MAX_ACTIVE_SESSIONS``. Both legs exclude the step marker: a
+#: quota-parked session is neither a slot holder itself nor counted
+#: in the distinct-session total.
 _SLOT_SQL = (
     "( ?=0"
     " OR EXISTS(SELECT 1 FROM tasks t2"
     "  WHERE t2.session_id=tasks.session_id"
-    f"  AND t2.status IN ({_SLOT_STATUSES_SQL}))"
+    f"  AND t2.status IN ({_SLOT_STATUSES_SQL})"
+    "  AND COALESCE(t2.step_state,'')<>'waiting_quota')"
     " OR (SELECT COUNT(DISTINCT session_id) FROM tasks"
-    f"  WHERE status IN ({_SLOT_STATUSES_SQL}))<? )"
+    f"  WHERE status IN ({_SLOT_STATUSES_SQL})"
+    "  AND COALESCE(step_state,'')<>'waiting_quota')<? )"
 )
 
 
@@ -499,6 +523,14 @@ _TASK_COLUMN_MIGRATIONS = (
     # retry - exactly why an attempt-based bound cannot see a
     # fix-fail-fix loop.
     ("fail_streak", "INTEGER NOT NULL DEFAULT 0"),
+    # review r2, #16: cumulative wait renewals per claim. Each
+    # ``wait_task`` call covers at most one LEASE_SECONDS of external
+    # wait, so the counter bounds total waiting within the claim;
+    # entering running resets it (a reclaimed task gets a fresh
+    # budget). Capped by WAIT_RENEWAL_CAP = WAIT_MAX_SECONDS /
+    # LEASE_SECONDS - an unbounded wait can no longer hold a task
+    # forever on a worker that keeps calling ``bridge wait``.
+    ("wait_renewals", "INTEGER NOT NULL DEFAULT 0"),
 )
 
 # Columns the item_139 schema adds to wake_state, applied idempotently
@@ -847,7 +879,8 @@ def claim_managed(task_id: int, session_id: str, owner: str, *, path=None) -> bo
             cap = _effective_max_active(con)
             cur = con.execute(
                 "UPDATE tasks SET status=?, lease_owner=?,"
-                " lease_expires_at=?, lease_renewed_at=?, updated_at=?"
+                " lease_expires_at=?, lease_renewed_at=?,"
+                " wait_renewals=0, updated_at=?"
                 " WHERE id=? AND session_id=? AND (status=? OR (status=?"
                 " AND lease_owner=?)) AND COALESCE("
                 "  (SELECT queue_paused FROM sessions"
@@ -957,7 +990,7 @@ def mark_running(task_id: int, owner: str, *, max_running: int | None = None, pa
         try:
             sql = (
                 "UPDATE tasks SET status=?, lease_expires_at=?,"
-                " lease_renewed_at=?, updated_at=?"
+                " lease_renewed_at=?, wait_renewals=0, updated_at=?"
                 " WHERE id=? AND status=? AND lease_owner=?"
                 " AND lease_expires_at IS NOT NULL"
                 " AND lease_expires_at>?"
@@ -1121,28 +1154,42 @@ def wait_task(task_id: int, owner: str, note: str | None = None, *, path=None) -
     no clearing: it expires together with the lease it mirrors, so a
     worker that resumes real work (or dies) becomes wake-worthy
     again automatically.
+
+    Bounded cumulatively, not just per call (review r2, #16):
+    ``wait_renewals`` counts renewals inside the claim and the CAS
+    refuses once ``WAIT_RENEWAL_CAP`` is reached - each renewal
+    covers at most LEASE_SECONDS, so the cap is the same bound as
+    ``WAIT_MAX_SECONDS`` of wall waiting. A refused worker stops
+    renewing; the lease lapses into ``recover_stale`` and the task
+    requeues (a fresh claim gets a fresh budget - entering running
+    resets the counter). ``WAIT_RENEWAL_CAP=0`` disables the bound.
     """
     ts = _now()
 
     def op():
         con = connect(path)
         try:
-            cur = con.execute(
+            sql = (
                 "UPDATE tasks SET lease_expires_at=?, lease_renewed_at=?,"
-                " wait_until=?, wait_reason=?, note=COALESCE(?,note), updated_at=?"
-                " WHERE id=? AND status=? AND lease_owner=?",
-                (
-                    ts + LEASE_SECONDS,
-                    ts,
-                    ts + LEASE_SECONDS,
-                    note,
-                    note,
-                    ts,
-                    task_id,
-                    TaskStatus.RUNNING.value,
-                    owner,
-                ),
+                " wait_until=?, wait_reason=?, note=COALESCE(?,note),"
+                " wait_renewals=COALESCE(wait_renewals,0)+1, updated_at=?"
+                " WHERE id=? AND status=? AND lease_owner=?"
             )
+            args: list = [
+                ts + LEASE_SECONDS,
+                ts,
+                ts + LEASE_SECONDS,
+                note,
+                note,
+                ts,
+                task_id,
+                TaskStatus.RUNNING.value,
+                owner,
+            ]
+            if WAIT_RENEWAL_CAP:
+                sql += " AND COALESCE(wait_renewals,0)<?"
+                args.append(WAIT_RENEWAL_CAP)
+            cur = con.execute(sql, args)
             return cur.rowcount == 1
         finally:
             con.close()
@@ -2175,16 +2222,21 @@ def active_session_ids(*, path=None) -> set:
     active session never spends a new slot, which keeps the cap a
     concurrency-of-sessions bound rather than a task bound.
     ``awaiting_user`` is deliberately not a slot: a task parked on a
-    user reply burns no worker capacity. The distinction is semantic
-    only - the live-task unique index means an ``awaiting_user``
-    session can never hold a queued task the gate would evaluate.
+    user reply burns no worker capacity. The same applies to a
+    ``waiting_quota`` park (review r2, #15): the task sleeps until
+    the provider reset, so the session's slot is free for the
+    duration. The distinction is semantic only - the live-task
+    unique index means an ``awaiting_user`` session can never hold
+    a queued task the gate would evaluate.
     """
 
     def op():
         con = connect(path)
         try:
             rows = con.execute(
-                f"SELECT DISTINCT session_id FROM tasks WHERE status IN ({_SLOT_STATUSES_SQL})"
+                f"SELECT DISTINCT session_id FROM tasks"
+                f" WHERE status IN ({_SLOT_STATUSES_SQL})"
+                " AND COALESCE(step_state,'')<>'waiting_quota'"
             ).fetchall()
             return {r["session_id"] for r in rows}
         finally:
@@ -2350,6 +2402,64 @@ def set_session_halted(session_id: str, halted: bool, *, path=None) -> None:
             con.close()
 
     _retry(op)
+
+
+#: Sentinel ``halted_at`` value for the temporary hold ``bridge
+#: stop`` takes across its stop ladder (review r2): distinct from
+#: every timestamp a real ``bridge halt`` writes, so the CAS
+#: release can never match - and never un-park - a halt that
+#: landed inside the ladder window. ``halted_at`` is only ever
+#: NULL-tested, never read arithmetically.
+STOP_HOLD_TOKEN: Final[int] = -1
+
+
+def hold_session_halt(session_id: str, token: int, *, path=None) -> str:
+    """Atomically take the halt hold for ``session_id``.
+
+    Single-statement ``WHERE halted_at IS NULL`` so no read/write
+    gap can overwrite an existing park (review r2): the caller gets
+    ``"ok"`` when it took the hold, ``"already"`` when a halt -
+    operator or racing stop - was already in force.
+    """
+
+    def op():
+        con = connect(path)
+        try:
+            cur = con.execute(
+                "UPDATE sessions SET halted_at=?, updated_at=?"
+                " WHERE session_id=? AND halted_at IS NULL",
+                (token, _now(), session_id),
+            )
+            return "ok" if cur.rowcount == 1 else "already"
+        finally:
+            con.close()
+
+    return _retry(op)
+
+
+def release_session_halt(session_id: str, expected_halted_at, *, path=None) -> bool:
+    """Clear ``halted_at`` only while it still holds ``expected_halted_at``.
+
+    ``bridge stop`` releases the hold it took across the ladder -
+    but a ``bridge halt`` landing inside that window must not be
+    silently un-parked by the release (review r2): the CAS refuses
+    whenever another writer stamped a different value, leaving
+    their park in force.
+    """
+
+    def op():
+        con = connect(path)
+        try:
+            cur = con.execute(
+                "UPDATE sessions SET halted_at=NULL, updated_at=?"
+                " WHERE session_id=? AND halted_at=?",
+                (_now(), session_id, expected_halted_at),
+            )
+            return cur.rowcount == 1
+        finally:
+            con.close()
+
+    return _retry(op)
 
 
 def unregister_session(session_id: str, *, force: bool = False, path=None) -> UnregisterVerdict:
@@ -2584,6 +2694,10 @@ def kill_session(session_id: str, *, stop_report: dict | None = None, path=None)
                     )
                     if stop_report.get("pre_halt") not in (None, "skipped"):
                         body += f" stop_pre_halt={stop_report['pre_halt']}"
+                    if stop_report.get("kill_started") not in (None, "skipped", "ok"):
+                        body += f" stop_kill_started={stop_report['kill_started']}"
+                    if stop_report.get("interrupted_recovery"):
+                        body += f" recovered={stop_report['interrupted_recovery']}"
                     if stop_report.get("stop_exception"):
                         body += f" stop_exception={stop_report['stop_exception']}"
                 con.execute(
@@ -2606,6 +2720,43 @@ def kill_session(session_id: str, *, stop_report: dict | None = None, path=None)
         except BaseException:
             con.rollback()
             raise
+        finally:
+            con.close()
+
+    return _retry(op)
+
+
+def interrupted_hard_kills(now: int, *, min_age_seconds: int = 120, path=None) -> list:
+    """Sids whose ``kill --hard-stop`` died mid-ladder (crash wedge).
+
+    ``session_kill_started`` is stamped before the stop ladder; the
+    teardown's ``session_killed`` lands only when the CLI reaches it.
+    A started marker older than ``min_age_seconds`` with no later
+    ``session_killed`` means the CLI died between the two - the row
+    is still live (halted) and must be finalized so its slot and
+    live task release instead of wedging forever (architect review
+    r2, #5). The age bound keeps a still-running ladder untouched;
+    rows already ``dead`` need no recovery.
+    """
+
+    def op():
+        con = connect(path)
+        try:
+            return [
+                r["session_id"]
+                for r in con.execute(
+                    "SELECT DISTINCT e.session_id FROM decision_events e"
+                    " JOIN sessions s ON s.session_id=e.session_id"
+                    " WHERE e.kind='session_kill_started'"
+                    " AND e.created_at<=?"
+                    " AND s.status<>?"
+                    " AND NOT EXISTS ("
+                    "  SELECT 1 FROM decision_events k"
+                    "  WHERE k.session_id=e.session_id"
+                    "  AND k.kind='session_killed' AND k.id>e.id)",
+                    (now - min_age_seconds, SessionStatus.DEAD.value),
+                ).fetchall()
+            ]
         finally:
             con.close()
 

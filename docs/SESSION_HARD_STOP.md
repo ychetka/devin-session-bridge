@@ -159,17 +159,28 @@ Enumerate and signal host processes attributable to the session:
   `dbus-*`, `dconf-service`, `gnome-keyring-d`, `gvfsd`,
   `dmypy`, `git fsmonitor--daemon`, ...) that inherit whatever
   env the spawning session had and are shared by the whole host
-  (review r1 finding 11); then, on the attribution legs, the
-  target's own `DEVIN_SESSION_ID` env marker outranks the
-  coincidental `mcp` cmdline substring (review r1 finding 9),
-  the MCP/tool server whitelist, explicit sid markers, and the
-  workspace-cwd fallback - which additionally refuses processes
-  holding a controlling TTY (a human's interactive shell sharing
-  the workspace, review r1 finding 10) and anything spawned in
-  the backend's startup window.
+  (review r1 finding 11); the fleet-wide bridge daemon
+  (`bridge daemon run|once`, `python -m session_bridge ...
+  daemon`) - a foreground daemon started from a session shell
+  inherits its markers and must never be swept (review r2
+  finding 3); then, on the attribution legs, the target's own
+  `DEVIN_SESSION_ID` env marker outranks the coincidental `mcp`
+  cmdline substring (review r1 finding 9), the MCP/tool server
+  whitelist, explicit sid markers, and the workspace-cwd
+  fallback - which additionally refuses processes holding a
+  controlling TTY *only at backend depth 0* (a human's
+  interactive shell, review r1 finding 10): a pty allocated by
+  a deeper tool call (`script`/`expect`/test runners) is
+  session work, not a terminal (review r2 finding 4) - and
+  anything spawned in the backend's startup window.
 - Signal order: SIGTERM, short grace, SIGKILL to survivors.
 - Every swept PID + attribution reason is recorded on the
   `session_stopped` decision event and returned in the JSON.
+- Pass 2 (whole-table scan, strong markers only for signals)
+  also reports `weak_suspects`: non-tree processes whose only
+  attribution is the cwd leg. They are never signalled, but a
+  marker-less escapee is visible in the sweep result instead
+  of silently invisible (review r2 finding 9).
 
 Layer 2 is deliberately opt-in (`--hard`) for v1: heuristic
 attribution can mislabel a shared-workspace process. A
@@ -192,6 +203,24 @@ best-effort: a failure does not abort the teardown, but the
 outcome is surfaced in the JSON/human output and folded into
 the `session_killed` event body (`stop_pre_halt=`) rather than
 swallowed.
+
+`bridge stop` holds the same flag for the ladder's duration
+(review r2 finding 5) and releases it when the layers finish -
+stop interrupts the current work; parking until `bridge resume`
+stays `halt`'s contract, not stop's. The release is a CAS on the
+value stop wrote: a `bridge halt` landing inside the window keeps
+its park (`halt_release=held`), and a session already halted
+before `stop` is never un-parked (`pre_halt=already`).
+`pre_halt`/`halt_release` are reported and journalled.
+
+Interrupted-kill recovery (review r2 finding 5): `kill
+--hard-stop` stamps a durable `session_kill_started` decision
+event BEFORE the ladder. The daemon's `kill_teardown` pass
+finalizes any marker older than `SB_KILL_TEARDOWN_GRACE_S`
+(default 120s) with no later `session_killed` - running the
+same `db.kill_session` teardown the crashed CLI never reached,
+so a mid-ladder death cannot wedge a halted live row on its
+slot and task forever.
 
 ## 6. Env-marker attribution (implemented, issue #168)
 

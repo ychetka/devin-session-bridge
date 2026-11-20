@@ -41,8 +41,11 @@ Two enumeration passes run before any signal:
   only - cmdline markers or the ``DEVIN_SESSION_ID`` env marker -
   setsid/double-forked victims reparent to init and are
   invisible to the descendant walk, which is the whole point of the
-  incident. Pass 2 never uses cwd attribution: a reparented process
-  may share a workspace path with unrelated infra.
+  incident. Pass 2 never uses cwd attribution for SIGNALS: a
+  reparented process may share a workspace path with unrelated
+  infra. Cwd-attributed non-tree processes are still reported in
+  ``weak_suspects`` so a marker-less escapee is visible in the
+  sweep result rather than silently invisible (review r2, #9).
 
 Signal order: SIGTERM, grace (default 2s), SIGKILL to survivors -
 deepest tree members first so a dying parent cannot respawn or
@@ -124,6 +127,17 @@ _SHARED_DAEMON_NAMES = frozenset(
 )
 _SHARED_DAEMON_TOKENS = ("fsmonitor--daemon",)
 
+#: the bridge daemon is fleet-wide infrastructure: a foreground
+#: ``bridge daemon run|once`` launched inside a marked session shell
+#: keeps the exec-time ``DEVIN_SESSION_ID`` in /proc/<pid>/environ
+#: (``unmark_env`` inside ``daemon.run`` mutates only the live
+#: process env, never the exec-time copy the sweep reads), so the
+#: env-attribution leg would signal the supervisor itself and
+#: paralyse the bus (architect review r2, #3). ``daemon start``
+#: already detaches with ``start_new_session`` and strips the
+#: exec env; the foreground run/once forms are protected here.
+_BRIDGE_DAEMON_ARGV0 = frozenset({"bridge", "session-bridge"})
+
 #: matches ``devin acp`` as an argv pair or inside a wrapper cmdline.
 _DEVIN_ACP_RE = re.compile(r"(?:^|[/\s])devin acp(?:\s|$)")
 
@@ -131,6 +145,11 @@ _DEVIN_ACP_RE = re.compile(r"(?:^|[/\s])devin acp(?:\s|$)")
 #: a registration at the filesystem root (or an empty/relative cwd)
 #: would attribute half the host to one session.
 _MIN_CWD_DEPTH = 2
+
+#: bound on the reported pass-2 weak-suspect list (review r2, #9):
+#: observability, not a sweep list - capped so a hostile or path-
+#: shared host cannot bloat the stop report.
+_WEAK_SUSPECT_CAP = 20
 
 #: the env marker prefix inside ``/proc/<pid>/environ`` (issue #168;
 #: injected where the bridge controls the exec-time environment -
@@ -156,7 +175,10 @@ class ProcInfo(NamedTuple):
     devin_session_id: str | None = None
     #: ``/proc/<pid>/stat`` tty_nr - nonzero means the process holds a
     #: controlling terminal: a human's interactive shell sitting in
-    #: the shared workspace (architect review r1, #10).
+    #: the shared workspace (architect review r1, #10). The exclusion
+    #: only applies to direct backend children (depth 0): a pty
+    #: allocated by a deeper tool call (``script``/``expect``/test
+    #: runner) must not escape the sweep (architect review r2, #4).
     tty_nr: int = 0
 
     @property
@@ -258,6 +280,49 @@ def _shared_daemon(proc: ProcInfo) -> bool:
     # elements - it also catches ``sh -c "git fsmonitor--daemon
     # start"`` and the hyphenated ``git-fsmonitor--daemon`` form.
     return any(tok in proc.cmdline for tok in _SHARED_DAEMON_TOKENS)
+
+
+#: bridge global flags that carry a separate value token - skipped
+#: (payload included) when locating the first positional arg so
+#: ``bridge --db /x daemon run`` still resolves to the daemon
+#: subcommand and a flag VALUE never passes for it
+_VALUE_FLAGS = frozenset({"--db", "--queue-dir"})
+
+
+def _first_positional(argv) -> str | None:
+    """First non-flag argv token, skipping global flag payloads."""
+    skip_next = False
+    for tok in argv:
+        if skip_next:
+            skip_next = False
+            continue
+        if tok in _VALUE_FLAGS:
+            skip_next = True
+            continue
+        if tok.startswith("-"):
+            continue
+        return tok
+    return None
+
+
+def _bridge_daemon(proc: ProcInfo) -> bool:
+    """True when the process is the fleet-wide bridge daemon.
+
+    Covers the console-script form ``bridge daemon run|once`` (any
+    argv[0] path - basename is matched, global flags allowed before
+    the subcommand) and the module form ``python -m session_bridge.*
+    daemon``; the subcommand must be the first POSITIONAL token so a
+    session running an unrelated ``daemon``-named argv elsewhere
+    never gets free protection (review r2).
+    """
+    argv = proc.argv
+    if len(argv) >= 2 and os.path.basename(argv[0]) in _BRIDGE_DAEMON_ARGV0:
+        return _first_positional(argv[1:]) == "daemon"
+    if "-m" in argv:
+        i = argv.index("-m")
+        if i + 1 < len(argv) and argv[i + 1].startswith("session_bridge"):
+            return _first_positional(argv[i + 2 :]) == "daemon"
+    return False
 
 
 def is_devin_acp(proc: ProcInfo) -> bool:
@@ -398,18 +463,26 @@ def _foreign_hit(proc: ProcInfo, ctx: SweepContext) -> str | None:
     return None
 
 
-def classify(proc: ProcInfo, ctx: SweepContext) -> tuple[str, str]:
+def classify(proc: ProcInfo, ctx: SweepContext, depth: int | None = None) -> tuple[str, str]:
     """Attribute one process: ("candidate"|"excluded"|"unrelated", reason).
 
     Exclusions are evaluated before attribution and in order of
     blast radius: infrastructure pids first, foreign-session markers
     next (a misattributed kill is a second incident), shared
-    host-level user daemons third (they inherit whatever env the
-    spawning session had - the marker is not ownership), then the
-    positive-attribution legs - the ``DEVIN_SESSION_ID`` env marker
-    first (issue #168, and it outranks the MCP substring whitelist:
-    an explicit ownership claim beats a coincidental token), the MCP
-    whitelist, cmdline markers, workspace cwd last.
+    host-level user daemons and the fleet-wide bridge daemon third
+    (they inherit whatever env the spawning session had - the marker
+    is not ownership), then the positive-attribution legs - the
+    ``DEVIN_SESSION_ID`` env marker first (issue #168, and it
+    outranks the MCP substring whitelist: an explicit ownership
+    claim beats a coincidental token), the MCP whitelist, cmdline
+    markers, workspace cwd last.
+
+    ``depth`` is the process's tree depth below the backend (None
+    when unknown - callers that cannot compute it keep the
+    conservative exclusion): a controlling TTY on the weak cwd leg
+    protects a human's interactive terminal only when it hangs
+    directly off the backend; a pty allocated by a deeper tool call
+    is session work and must be swept (architect review r2, #4).
     """
     if proc.pid in ctx.protected_pids or proc.pid in ctx.backend_pids:
         return "excluded", "protected_infrastructure"
@@ -418,6 +491,8 @@ def classify(proc: ProcInfo, ctx: SweepContext) -> tuple[str, str]:
         return "excluded", f"other_session:{foreign}"
     if _shared_daemon(proc):
         return "excluded", "shared_user_daemon"
+    if _bridge_daemon(proc):
+        return "excluded", "bridge_daemon"
     if proc.devin_session_id is not None and proc.devin_session_id == ctx.sid:
         # the env marker is strong attribution equivalent to cmdline
         # markers: it sweeps regardless of process age (issue #168)
@@ -430,7 +505,7 @@ def classify(proc: ProcInfo, ctx: SweepContext) -> tuple[str, str]:
         # regardless of process age
         return "candidate", f"cmdline:{hits[0]}"
     if _under(proc.cwd, ctx.session_cwd) and _cwd_usable(ctx.session_cwd):
-        if proc.tty_nr:
+        if proc.tty_nr and (depth is None or depth == 0):
             # a controlling terminal on the weak cwd leg means a
             # human's interactive shell sharing the workspace - the
             # strongest signal this is not session work (review #10)
@@ -526,13 +601,34 @@ def sweep(
     by_pid = {p.pid: p for p in procs}
     candidates = []
     skipped = []
+    weak_suspects = []
 
     def _consider(proc, orphan: bool) -> None:
         env_hit = orphan and proc.devin_session_id is not None and proc.devin_session_id == ctx.sid
         hits = marker_hits(proc, ctx.sid, ctx.mailbox_dir) if orphan else []
         if orphan and not hits and not env_hit:
-            return  # pass 2: strong markers only, no cwd attribution
-        verdict, detail = classify(proc, ctx)
+            # pass 2 sweeps strong markers only; a detached process
+            # whose only attribution is the weak cwd leg is still
+            # REPORTED as a weak suspect so an escaped worker shows
+            # up in the sweep result instead of staying invisible
+            # (architect review r2, #9). classify() applies the same
+            # exclusions - a foreign/infra process is not a suspect.
+            if len(weak_suspects) < _WEAK_SUSPECT_CAP:
+                verdict, detail = classify(proc, ctx)
+                if verdict == "candidate":
+                    weak_suspects.append(
+                        {
+                            "pid": proc.pid,
+                            "reason": f"weak_orphan:{detail}",
+                            "cmdline": proc.cmdline[:200],
+                        }
+                    )
+            return
+        # the pass-1 tree walk knows the process's depth below the
+        # backend; classify uses it to gate the interactive-tty
+        # exclusion to direct children (architect review r2, #4)
+        depth = _depth(proc.pid, by_pid, ctx.backend_pids) if not orphan else None
+        verdict, detail = classify(proc, ctx, depth=depth)
         if verdict == "candidate":
             if orphan:
                 reason = "orphan_env:DEVIN_SESSION_ID" if env_hit else f"orphan_marker:{hits[0]}"
@@ -570,6 +666,7 @@ def sweep(
             {"pid": c["pid"], "reason": c["reason"], "cmdline": c["cmdline"]} for c in candidates
         ],
         "skipped": skipped,
+        "weak_suspects": weak_suspects,
         "swept": [],
         "status": "ok",
     }

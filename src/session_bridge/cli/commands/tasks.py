@@ -5,6 +5,7 @@ push / inspect / clear / unpark / retry / claim / finish / wait.
 
 import time
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from session_bridge.cli.common import (
     _emit,
@@ -497,12 +498,35 @@ def _cmd_claim(args) -> int:
     return _emit(args, resp, ExitCode.OK, f"task {tid}: claimed, running")
 
 
+def _payload_arg(args, name: str):
+    """Resolve a ``--<name>``/``--<name>-file`` pair to text.
+
+    A very large argv string can trip E2BIG when a worker shells the
+    CLI out of a constrained environment - the ``-file`` form carries
+    the payload off argv (review r2). Returns ``(text, error)``.
+    """
+    text = getattr(args, name)
+    file_arg = getattr(args, f"{name}_file", None)
+    if file_arg is None:
+        return text, None
+    if text is not None:
+        return None, f"--{name} and --{name}-file are mutually exclusive"
+    try:
+        return Path(file_arg).read_text(encoding="utf-8").strip(), None
+    except (OSError, UnicodeDecodeError) as e:
+        return None, f"cannot read --{name}-file {file_arg}: {e}"
+
+
 def _cmd_finish(args) -> int:
     """``bridge finish <task_id> --session <sid> [--fail] [--note T]``.
 
     Lease-owner CAS ``running > done|failed`` for a managed worker -
     the closing half of the claim lifecycle (item_18).
     """
+    note, note_err = _payload_arg(args, "note")
+    if note_err is not None:
+        resp = JsonResponse(session=args.session, status="invalid", error=note_err)
+        return _emit(args, resp, ExitCode.USAGE, f"invalid: {note_err}")
     tid = args.task_id
     sid = args.session
     task = db.get_task(tid, path=args.db)
@@ -528,7 +552,7 @@ def _cmd_finish(args) -> int:
         return _emit(args, resp, ExitCode.CONFLICT, f"conflict: {sid} is not managed")
     owner = _managed_owner(sid, tid)
     ok = not args.fail
-    if not db.finish_task(tid, owner, ok, note=args.note, path=args.db):
+    if not db.finish_task(tid, owner, ok, note=note, path=args.db):
         resp = JsonResponse(
             session=sid,
             status=task["status"],
@@ -584,6 +608,10 @@ def _cmd_wait(args) -> int:
     mid review-cycle. Repeat the call while waiting; a dead claimer
     simply stops renewing and the task requeues.
     """
+    reason, reason_err = _payload_arg(args, "reason")
+    if reason_err is not None:
+        resp = JsonResponse(session=args.session, status="invalid", error=reason_err)
+        return _emit(args, resp, ExitCode.USAGE, f"invalid: {reason_err}")
     tid = args.task_id
     sid = args.session
     task = db.get_task(tid, path=args.db)
@@ -611,15 +639,31 @@ def _cmd_wait(args) -> int:
         )
         return _emit(args, resp, ExitCode.CONFLICT, f"conflict: {sid} is not managed")
     owner = _managed_owner(sid, tid)
-    if not db.wait_task(tid, owner, args.reason, path=args.db):
+    if not db.wait_task(tid, owner, reason, path=args.db):
+        # cap-exhausted waits refuse with the same False as a wrong
+        # owner - name the actual cause so the worker does not retry
+        # a bound it cannot beat (review r2, #16)
+        if (
+            task["status"] == TaskStatus.RUNNING.value
+            and task["lease_owner"] == owner
+            and db.WAIT_RENEWAL_CAP
+            and (task["wait_renewals"] or 0) >= db.WAIT_RENEWAL_CAP
+        ):
+            detail = (
+                f"wait budget exhausted: {task['wait_renewals']} renewals"
+                f" >= cap {db.WAIT_RENEWAL_CAP} (~{db.WAIT_MAX_SECONDS}s;"
+                " finish, fail or let the lease lapse"
+            )
+        else:
+            detail = (
+                f"task {tid} is {task['status']}"
+                f" (lease_owner={task['lease_owner']}); only the claiming"
+                " session can wait on a running task"
+            )
         resp = JsonResponse(
             session=sid,
             status=task["status"],
-            error=(
-                f"wait refused: task {tid} is {task['status']}"
-                f" (lease_owner={task['lease_owner']}); only the claiming"
-                " session can wait on a running task"
-            ),
+            error=f"wait refused: {detail}",
         )
         return _emit(
             args,

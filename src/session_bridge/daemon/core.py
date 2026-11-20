@@ -49,9 +49,11 @@ import time
 
 from session_bridge.env_marker import unmark_env
 from session_bridge.mailbox import mailbox_dir, queue_root, write_message
+from session_bridge.mailbox.core import _dir_name
 from session_bridge.quota import DEFAULT_PARK_SECONDS, parse_quota_signal
 from session_bridge.state import db
 from session_bridge.state.contract import (
+    TERMINAL_STATUSES,
     WAKE_UNCONFIRMED_ESCALATE_STREAK,
     NotificationKind,
     QuestionState,
@@ -112,6 +114,21 @@ _NOTIFY_SEND_ENV = "SESSIONS_BRIDGE_NOTIFY_SEND"
 _INTERVAL_ENV = "SESSIONS_BRIDGE_DAEMON_INTERVAL"
 
 _LOCK_ERRNOS = (errno.EACCES, errno.EAGAIN)
+
+#: terminal task status values - the question_answer stale guard
+#: drops only on these (review r2, #19): a resumable ``paused``
+#: asker may still need the answer after unpark
+_TERMINAL_TASK_STATUS_VALUES = {s.value for s in TERMINAL_STATUSES}
+
+#: statuses in which a task_dispatch delivery is still a live
+#: invitation: queued (schedule-materialized and requeued rows are
+#: claimable from queued), the staged dispatch_decided window, and
+#: paused - a resumable hold whose invitation revives with the row
+_DISPATCH_LIVE_STATUSES = {
+    TaskStatus.QUEUED.value,
+    TaskStatus.DISPATCH_DECIDED.value,
+    TaskStatus.PAUSED.value,
+}
 
 
 def state_dir(db_path=None) -> str:
@@ -430,6 +447,84 @@ def _control_stale_reason(sid, nid, issued_at, now: int, *, db_path=None, con=No
     return None
 
 
+def _question_answer_stale_reason(qid, *, db_path=None, con=None) -> str | None:
+    """Why a ``question_answer`` delivery must be dropped, or ``None``.
+
+    Stale-guard for the answer channel (architect review r2, #19): an
+    answer - or the expiry notice, which rides the same kind - is
+    meaningful only while the asker's task still waits on it. Once
+    the task lands terminal the delivery is dead weight surfacing in
+    the session's next context, so the drop mirrors the control
+    staleness rule. An unresolvable question or a task-less question
+    cannot be judged - deliver, never drop on missing evidence.
+    ``con`` reuses a caller-held connection for the lookups.
+    """
+    if qid is None:
+        return None
+    try:
+        if con is not None:
+            q = con.execute("SELECT task_id FROM questions WHERE id=?", (qid,)).fetchone()
+        else:
+            q = db.get_question(qid, path=db_path)
+    except Exception:
+        return None
+    if q is None or q["task_id"] is None:
+        return None
+    tid = q["task_id"]
+    if con is not None:
+        t = con.execute("SELECT status FROM tasks WHERE id=?", (tid,)).fetchone()
+        status = t["status"] if t else None
+    else:
+        t = db.get_task(tid, path=db_path)
+        status = t["status"] if t else None
+    if status is None:
+        # unresolvable task row - same conservative rule as the
+        # dispatch guard: missing evidence never drops mail
+        return None
+    if status in _TERMINAL_TASK_STATUS_VALUES:
+        return f"task={tid} status={status} (asker gone)"
+    # anything non-terminal - queued/running/awaiting_user and the
+    # resumable paused - keeps the delivery: only a positively dead
+    # asker makes the answer dead weight
+    return None
+
+
+def _dispatch_stale_reason(tid, sid, *, db_path=None, con=None) -> str | None:
+    """Why a ``task_dispatch`` delivery must be dropped, or ``None``.
+
+    The file's invitation is outstanding while the task still waits
+    to be picked up by this session - ``queued`` (schedule-materialized
+    dispatches are claimable straight from queued) or
+    ``dispatch_decided`` (the staged claim window) for this session
+    (review r2, #18). Once the row is claimed (``running``), parked,
+    withdrawn or terminal, the delivery is a stale prompt a
+    re-register would otherwise drain. Unresolvable ids deliver -
+    missing evidence never drops mail.
+    """
+    if tid is None:
+        return None
+    try:
+        if con is not None:
+            t = con.execute("SELECT session_id, status FROM tasks WHERE id=?", (tid,)).fetchone()
+        else:
+            t = db.get_task(tid, path=db_path)
+    except Exception:
+        return None
+    if t is None:
+        # the task row is unresolvable - a corrupt or hand-written
+        # delivery carries no positive staleness evidence, and
+        # missing evidence never drops mail
+        return None
+    if t["status"] not in _DISPATCH_LIVE_STATUSES:
+        return f"task={tid} status={t['status']} (invitation resolved)"
+    if t["session_id"] != sid and _dir_name(t["session_id"]) != sid:
+        # mailbox dirs are named by the sanitized sid - a task whose
+        # session id carries sanitized characters still matches its
+        # own mailbox through the second leg
+        return f"task={tid} belongs to {t['session_id']}, not {sid}"
+    return None
+
+
 def _relay_pass(db_path, queue_dir, state_directory, now: int) -> None:
     """Drain the outbox: unrelayed -> fs msg file -> mark_relayed.
 
@@ -449,6 +544,29 @@ def _relay_pass(db_path, queue_dir, state_directory, now: int) -> None:
                 detail = f"notification={row['id']} kind={row['kind']} {reason}"
                 _decision(state_directory, "stale_control_dropped", row["session_id"], detail)
                 db.record_event(row["session_id"], "stale_control_dropped", detail, path=db_path)
+                continue
+        elif row["kind"] == NotificationKind.QUESTION_ANSWER.value:
+            # stale-answer guard (review r2, #19): an answer whose
+            # asker's task already went terminal never reaches the
+            # wire - same consume-and-journal drop as control mail
+            reason = _question_answer_stale_reason(row["question_id"], db_path=db_path)
+            if reason is not None:
+                db.mark_relayed(row["id"], path=db_path)
+                detail = f"notification={row['id']} kind={row['kind']} {reason}"
+                _decision(state_directory, "stale_answer_dropped", row["session_id"], detail)
+                db.record_event(row["session_id"], "stale_answer_dropped", detail, path=db_path)
+                continue
+        elif row["kind"] == NotificationKind.TASK_DISPATCH.value:
+            # stale-dispatch guard (review r2, #18): an outbox row
+            # queued behind a daemon outage must not materialize once
+            # its invitation already resolved (claim, requeue,
+            # withdraw, kill) - the worker would drain a dead prompt
+            reason = _dispatch_stale_reason(row["task_id"], row["session_id"], db_path=db_path)
+            if reason is not None:
+                db.mark_relayed(row["id"], path=db_path)
+                detail = f"notification={row['id']} kind={row['kind']} {reason}"
+                _decision(state_directory, "stale_dispatch_dropped", row["session_id"], detail)
+                db.record_event(row["session_id"], "stale_dispatch_dropped", detail, path=db_path)
                 continue
         try:
             path = write_message(
@@ -487,7 +605,9 @@ def _stale_control_pass(db_path, queue_dir, state_directory, now: int) -> None:
     than ``_CONTROL_TTL_SECONDS`` - evaluated per file. Genuine relay
     artifacts resolve their real sid + issue time through the
     notification row; unverifiable files fall back to ``issued_at``
-    header or file mtime for the age leg only.
+    header or file mtime for the age leg only. ``question_answer``
+    files get the answer-side guard (review r2, #19): the file is
+    dead weight once the asker's task is terminal.
     """
     root = queue_root(db_path, queue_dir)
     try:
@@ -507,7 +627,22 @@ def _stale_control_pass(db_path, queue_dir, state_directory, now: int) -> None:
             for name in names:
                 path = os.path.join(mdir, name)
                 headers = _msg_headers(path)
-                if headers.get("kind") not in db.CONTROL_KINDS:
+                kind = headers.get("kind")
+                if kind in db.CONTROL_KINDS:
+                    leg = "control"
+                elif kind == NotificationKind.QUESTION_ANSWER.value:
+                    # stale-answer files get the same janitor leg
+                    # (review r2, #19): a file delivered while fresh
+                    # is dead weight once the asker's task is terminal
+                    leg = "answer"
+                elif kind == NotificationKind.TASK_DISPATCH.value:
+                    # stale-dispatch files (review r2, #18): the
+                    # invitation the file carries is dead once the
+                    # task left dispatch_decided - claimed, requeued,
+                    # withdrawn or killed. A re-register draining the
+                    # old file would otherwise meet a stale prompt.
+                    leg = "dispatch"
+                else:
                     continue
                 nid = _msg_nid(name)
                 sid = dirname  # mailbox dirs are named by sanitized sid
@@ -526,6 +661,23 @@ def _stale_control_pass(db_path, queue_dir, state_directory, now: int) -> None:
                     mtime = int(os.path.getmtime(path))
                 except OSError:
                     continue  # vanished mid-scan - already consumed
+                if leg in ("answer", "dispatch"):
+                    hid = headers.get("question_id" if leg == "answer" else "task_id", "")
+                    hid = int(hid) if hid.isascii() and hid.isdigit() and len(hid) <= 19 else None
+                    if leg == "answer":
+                        reason = _question_answer_stale_reason(hid, db_path=db_path, con=con)
+                    else:
+                        reason = _dispatch_stale_reason(hid, sid, db_path=db_path, con=con)
+                    if reason is None:
+                        continue
+                    try:
+                        os.unlink(path)
+                    except OSError:
+                        continue  # raced with the consumer
+                    detail = f"file={name} kind={kind} {reason}"
+                    _decision(state_directory, f"stale_{leg}_dropped", sid, detail)
+                    db.record_event(sid, f"stale_{leg}_dropped", detail, path=db_path)
+                    continue
                 if issued_at is None:
                     # unverified file: its self-claimed issued_at header
                     # cannot push the TTL out past the real file age -
@@ -1256,6 +1408,13 @@ _MAIL_STALL_SECONDS = _env_int(
 #: is the last human-visible signal for a wedged drain contract.
 _MAIL_STALL_REALERT_SECONDS = _env_int("SB_STALL_REALERT_S", 3600)
 
+#: Grace bound for interrupted-kill recovery (review r2, #5): a
+#: ``session_kill_started`` marker younger than this may belong to a
+#: still-running stop ladder - the daemon leaves it alone. Older
+#: than this and unmatched by ``session_killed`` the CLI is dead and
+#: the daemon finalizes the teardown itself.
+_KILL_TEARDOWN_GRACE = _env_int("SB_KILL_TEARDOWN_GRACE_S", 120)
+
 #: Busy grace has a ceiling (task #174 review): a session whose
 #: statusEnum reports live work defers escalation only while the mail
 #: is younger than this. Past it the session may be wedged mid-turn -
@@ -1836,6 +1995,52 @@ def _recovery_pass(db_path, state_directory, notify_send) -> None:
         )
 
 
+def _kill_teardown_pass(db_path, state_directory, notify_send, now: int) -> int:
+    """Finalize kills whose CLI died mid-ladder (architect review r2, #5).
+
+    ``bridge kill <sid> --hard-stop`` stamps ``session_kill_started``
+    BEFORE the stop ladder and pre-halt; the registry teardown lands
+    only when the CLI reaches ``db.kill_session``. A crash in the
+    window between leaves the row live and halted - slot held, live
+    task wedged, session unpumpable until a human notices. The
+    daemon sweeps for started markers older than
+    ``_KILL_TEARDOWN_GRACE`` with no later ``session_killed`` and
+    runs the same ``kill_session`` teardown the CLI would have:
+    requeue/fold, heartbeat removal, dead row, deduped
+    ``session_killed`` event. The grace bound keeps a still-running
+    ladder untouched; CAS inside ``kill_session`` makes a late CLI
+    arrival idempotent (``pinned``). A failed teardown leaves the
+    marker unmatched, so the next pass retries.
+    """
+    recovered = 0
+    for sid in db.interrupted_hard_kills(now, min_age_seconds=_KILL_TEARDOWN_GRACE, path=db_path):
+        verdict = db.kill_session(
+            sid,
+            stop_report={
+                "cancel_outcome": "interrupted:cli_died_mid_ladder",
+                "close_outcome": "interrupted:cli_died_mid_ladder",
+                "swept": [],
+                "interrupted_recovery": "daemon",
+            },
+            path=db_path,
+        )
+        if isinstance(verdict, db.KillNotFound):
+            continue
+        recovered += 1
+        _decision(
+            state_directory,
+            "interrupted_kill_recovered",
+            sid,
+            "session_kill_started without session_killed; daemon finalized the teardown",
+        )
+        if notify_send is not None:
+            notify_send(
+                "sessions-bridge",
+                f"{sid}: interrupted kill finalized by daemon",
+            )
+    return recovered
+
+
 def _mail_stall_pass(
     db_path,
     state_directory,
@@ -2405,6 +2610,17 @@ def run(
                 # tasks renew first, only genuinely lapsed leases
                 # fold into recover_stale here (task #207 item b)
                 _timed("recovery", _recovery_pass, db_path, state_directory, notify)
+                # kill teardown (review r2, #5): a CLI that dies
+                # mid-ladder leaves a halted live row wedged on its
+                # slot - finalize it the same pass, after recovery
+                _timed(
+                    "kill_teardown",
+                    _kill_teardown_pass,
+                    db_path,
+                    state_directory,
+                    notify,
+                    now,
+                )
                 _timed("sweep", _sweep_pass, db_path, state_directory, notify, now)
                 stall_age = _timed(
                     "mail_stall",

@@ -723,3 +723,101 @@ def test_issue164_gwt16_orphan_marker_second_pass():
     excluded = {s["pid"]: s["exclusion"] for s in res["skipped"]}
     assert excluded[303] == "other_session:s2"
     assert {pid for pid, _ in calls} == {104, 105, 106, 107, 111, 300, 301}
+
+
+def test_issue183_r2_tty_depth0_excluded_depth1_swept():
+    """[ISSUE-183.R2-1] the interactive-tty exclusion applies only to
+    DIRECT backend children (depth 0): a pty allocated by a deeper
+    tool call - ``script``/``expect``/test-runner - is session work
+    and must stay sweepable (architect review r2, #4)."""
+    ctx = _ctx()
+    direct = P(400, BACKEND_PID, ["bash"], "/repo/w1", 2000.0, tty=1)
+    deep = P(401, 104, ["script", "-q", "out.txt"], "/repo/w1", 2000.0, tty=2)
+    assert classify(direct, ctx, depth=0) == ("excluded", "interactive_tty")
+    assert classify(deep, ctx, depth=1) == ("candidate", "cwd_under:/repo/w1")
+    # unknown depth keeps the conservative exclusion (pre-r2 shape)
+    assert classify(deep, ctx)[0] == "excluded"
+
+
+def test_issue183_r2_deep_pty_swept_end_to_end():
+    """A pty grandchild inside the backend tree is signalled; a
+    direct-child interactive shell is not."""
+    ctx = _ctx()
+    procs = [
+        *_fake_tree(),
+        P(402, BACKEND_PID, ["bash"], "/repo/w1", 2000.0, tty=1),
+        P(403, 104, ["expect", "run.exp"], "/repo/w1", 2000.0, tty=3),
+    ]
+    calls = []
+    res = sweep(
+        ctx,
+        procs,
+        signaler=lambda pid, sig: calls.append((pid, sig)),
+        gone=lambda pid: True,
+        start_of=_start_of(procs),
+        sleep=lambda s: None,
+    )
+    signalled = {pid for pid, _ in calls}
+    assert 403 in signalled and 402 not in signalled
+    excluded = {s["pid"]: s["exclusion"] for s in res["skipped"]}
+    assert excluded[402] == "interactive_tty"
+
+
+def test_issue183_r2_bridge_daemon_protected():
+    """[ISSUE-183.R2-4] the fleet-wide bridge daemon is excluded:
+    a foreground ``bridge daemon run|once`` started from a session
+    shell (inheriting its markers and cwd) must never be signalled
+    (architect review r2, #3). Both argv forms are covered; a
+    session command merely named like the daemon gets no free pass.
+    """
+    ctx = _ctx()
+    for argv in (
+        ["/home/u/.venv/bin/bridge", "daemon", "run"],
+        ["session-bridge", "daemon", "once"],
+        ["python3", "-m", "session_bridge", "daemon", "run"],
+        ["python3", "-m", "session_bridge.cli.bridge", "daemon", "run"],
+        # global flags may precede the subcommand (review round):
+        ["bridge", "--db", "/x/state.db", "daemon", "run"],
+        ["bridge", "--json", "--db=/x", "daemon", "once"],
+    ):
+        proc = P(410, BACKEND_PID, argv, "/repo/w1", 2000.0, env_sid=SID)
+        assert classify(proc, ctx, depth=0) == ("excluded", "bridge_daemon"), argv
+    # 'daemon' elsewhere in the argv does not buy protection: the
+    # subcommand must be the first positional token
+    for argv in (
+        ["bridge", "status"],
+        ["bridge", "--db", "daemon", "status"],  # 'daemon' is a flag VALUE
+        ["bridge", "task", "daemon", "run"],  # decoy token after a subcommand
+        ["python3", "-m", "session_bridge.cli.bridge", "status", "--json"],
+    ):
+        plain = P(411, BACKEND_PID, argv, "/repo/w1", 2000.0)
+        assert classify(plain, ctx, depth=0) == ("candidate", "cwd_under:/repo/w1"), argv
+
+
+def test_issue183_r2_weak_suspect_reported_not_swept():
+    """[ISSUE-183.R2-5] pass 2 sweeps strong markers only, but a
+    marker-less orphan attributable through the weak cwd leg is
+    still REPORTED in weak_suspects - visible, never signalled
+    (architect review r2, #9)."""
+    ctx = _ctx()
+    procs = [
+        *_fake_tree(),
+        # detached from the backend tree: no marker, cwd-only
+        P(500, 1, ["bash", "-c", "x"], "/repo/w1", 2000.0),
+        # a foreign-session cwd-only orphan is not even a suspect
+        P(501, 1, ["bash", "-c", "y"], "/repo/w2", 2000.0),
+    ]
+    calls = []
+    res = sweep(
+        ctx,
+        procs,
+        signaler=lambda pid, sig: calls.append((pid, sig)),
+        gone=lambda pid: True,
+        start_of=_start_of(procs),
+        sleep=lambda s: None,
+    )
+    assert [w["pid"] for w in res["weak_suspects"]] == [500]
+    assert res["weak_suspects"][0]["reason"].startswith("weak_orphan:cwd_under:")
+    signalled = {pid for pid, _ in calls}
+    assert 500 not in signalled and 501 not in signalled
+    assert 500 not in {c["pid"] for c in res["candidates"]}

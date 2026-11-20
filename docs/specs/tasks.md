@@ -76,6 +76,17 @@ the waiter drains and finishes/fails the task itself. No external
 poller (GitHub, CI) is part of the design - the resolution signal
 comes from the side that knows the condition resolved.
 
+The wait channel SHALL be bounded cumulatively inside one claim
+(issue #183): `tasks.wait_renewals` counts `bridge wait` renewals
+and the CAS refuses once `WAIT_RENEWAL_CAP`
+(`SB_WAIT_MAX_S`/`LEASE_SECONDS`, default 86400s total) is
+reached - each renewal covers at most one lease of wall time, so
+the counter is a wall-clock bound a worker cannot stretch by
+calling more often. A refused wait stops renewing and the lease
+lapses into `recover_stale`; entering `running` resets the
+counter, so a reclaimed task gets a fresh budget. `SB_WAIT_MAX_S<=0`
+disables the bound.
+
 #### Scenario: wait beats expiry
 
 - **WHEN** the lease owner calls `bridge wait <task_id>` before expiry
@@ -192,7 +203,11 @@ hook, user kick, managed claim) honors the cap atomically. A
 at stage time. A task refused by the cap stays `queued` and is
 counted as slot-waiting in `bridge status`, which SHALL report the
 active session count, the configured cap, and the backlog. A
-default of `0` means unlimited.
+`waiting_quota` park SHALL release the session's slot for the
+park's duration (issue #183): a task sleeping until the provider
+reset burns no worker capacity, and `active_session_ids` and the
+slot predicate both exclude parked rows. A default of `0` means
+unlimited.
 
 The configured value SHALL be durable: the daemon persists its
 env-resolved cap to `bridge_settings` at startup, and every claim
