@@ -2404,14 +2404,47 @@ def set_session_halted(session_id: str, halted: bool, *, path=None) -> None:
     _retry(op)
 
 
+#: Sentinel ``halted_at`` value for the temporary hold ``bridge
+#: stop`` takes across its stop ladder (review r2): distinct from
+#: every timestamp a real ``bridge halt`` writes, so the CAS
+#: release can never match - and never un-park - a halt that
+#: landed inside the ladder window. ``halted_at`` is only ever
+#: NULL-tested, never read arithmetically.
+STOP_HOLD_TOKEN: Final[int] = -1
+
+
+def hold_session_halt(session_id: str, token: int, *, path=None) -> str:
+    """Atomically take the halt hold for ``session_id``.
+
+    Single-statement ``WHERE halted_at IS NULL`` so no read/write
+    gap can overwrite an existing park (review r2): the caller gets
+    ``"ok"`` when it took the hold, ``"already"`` when a halt -
+    operator or racing stop - was already in force.
+    """
+
+    def op():
+        con = connect(path)
+        try:
+            cur = con.execute(
+                "UPDATE sessions SET halted_at=?, updated_at=?"
+                " WHERE session_id=? AND halted_at IS NULL",
+                (token, _now(), session_id),
+            )
+            return "ok" if cur.rowcount == 1 else "already"
+        finally:
+            con.close()
+
+    return _retry(op)
+
+
 def release_session_halt(session_id: str, expected_halted_at, *, path=None) -> bool:
     """Clear ``halted_at`` only while it still holds ``expected_halted_at``.
 
-    ``bridge stop`` holds the flag for its ladder's duration and
-    releases it afterward - but a ``bridge halt`` landing inside
-    that window must not be silently un-parked by the release
-    (review r2): the CAS refuses whenever another writer stamped a
-    newer value, leaving their park in force.
+    ``bridge stop`` releases the hold it took across the ladder -
+    but a ``bridge halt`` landing inside that window must not be
+    silently un-parked by the release (review r2): the CAS refuses
+    whenever another writer stamped a different value, leaving
+    their park in force.
     """
 
     def op():

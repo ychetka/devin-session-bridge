@@ -862,19 +862,15 @@ def _cmd_stop(args) -> int:
         )
         return _emit(args, resp, ExitCode.NOT_FOUND, f"not registered: {sid}")
     pre_halt = "skipped"
-    held_ts = None
     if not args.dry_run:
-        if session["halted_at"]:
-            # already parked by `bridge halt` - the flag is not ours
-            # to release afterward
-            pre_halt = "already"
-        else:
-            try:
-                db.set_session_halted(sid, True, path=args.db)
-                held_ts = db.get_session(sid, path=args.db)["halted_at"]
-                pre_halt = "ok"
-            except Exception as e:
-                pre_halt = f"failed:{e.__class__.__name__}: {e}"
+        try:
+            # atomic hold (review r2): no read/write gap, and the
+            # sentinel token cannot collide with a halt timestamp -
+            # an already-parked session reports "already" and is
+            # never un-parked by our release
+            pre_halt = db.hold_session_halt(sid, db.STOP_HOLD_TOKEN, path=args.db)
+        except Exception as e:
+            pre_halt = f"failed:{e.__class__.__name__}: {e}"
     try:
         report = _run_stop_layers(args, sid, hard=args.hard, dry_run=args.dry_run)
     except Exception as e:
@@ -901,9 +897,12 @@ def _cmd_stop(args) -> int:
     if pre_halt == "ok":
         try:
             # CAS release (review r2): a `bridge halt` landing inside
-            # the ladder window stamps a newer halted_at - the CAS
-            # refuses and their park stays in force
-            halt_release = "ok" if db.release_session_halt(sid, held_ts, path=args.db) else "held"
+            # the ladder window stamps a real timestamp that cannot
+            # equal the sentinel - the CAS refuses and their park
+            # stays in force
+            halt_release = (
+                "ok" if db.release_session_halt(sid, db.STOP_HOLD_TOKEN, path=args.db) else "held"
+            )
         except Exception as e:
             halt_release = f"failed:{e.__class__.__name__}: {e}"
     status = _stop_status(report)
