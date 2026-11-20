@@ -67,11 +67,21 @@ orphan sweep under `--hard` - without touching the bus row, and
 SHALL report each layer's observed outcome
 (`idle`/`confirmed`/`requested`/`failed:<reason>`/
 `skipped:<reason>`) instead of claiming a stop that was only
-requested. `bridge kill <sid>
---hard-stop` SHALL halt the session (`halted_at`) BEFORE layer 0
+requested. A non-dry-run `stop` SHALL hold `halted_at` for the
+ladder's duration so a racing pump cannot stage new work
+mid-stop, and SHALL release it when the layers finish - stop
+interrupts current work, parking until `bridge resume` remains
+`halt`'s contract (issue #183). `bridge kill <sid>
+--hard-stop` SHALL stamp a durable `session_kill_started`
+decision event and halt the session (`halted_at`) BEFORE layer 0
 so a racing pump or claim cannot re-dispatch it mid-teardown
-(issue #179), run the same ladder BEFORE `db.kill_session` and
-fold the per-layer outcomes into the `session_killed` event body;
+(issues #179, #183), run the same ladder BEFORE `db.kill_session`
+and fold the per-layer outcomes into the `session_killed` event
+body; the daemon SHALL finalize a `session_kill_started` marker
+older than `SB_KILL_TEARDOWN_GRACE_S` with no later
+`session_killed` by running the same `kill_session` teardown -
+a mid-ladder CLI death must not wedge a halted live row on its
+slot and task forever (issue #183).
 `--dry-run` SHALL enumerate layers and sweep victims without sending,
 signalling, or tearing down. The sweep SHALL attribute only processes
 in the shared `devin acp` backend tree carrying the session's
@@ -83,9 +93,16 @@ backend, the acp-host supervisor, MCP/tool servers, processes
 attributed to other registered sessions (including an env marker
 naming another registered session), shared host-level user
 daemons (`gpg-agent`, `ssh-agent`, `dbus-*`, `fsmonitor--daemon`,
-...) even when they inherit the target's env marker, or a process
-holding a controlling TTY on the workspace-cwd leg (a human's
-interactive shell; issue #179).
+...) even when they inherit the target's env marker, the
+fleet-wide bridge daemon (`bridge daemon run|once`,
+`python -m session_bridge ... daemon`; issue #183), or a process
+holding a controlling TTY *at backend depth 0* on the
+workspace-cwd leg (a human's interactive shell; issue #179) -
+a pty allocated by a deeper tool call is session work and SHALL
+be swept (issue #183). The pass-2 orphan scan signals strong
+markers only, but SHALL report cwd-attributed non-tree
+processes as `weak_suspects` so a marker-less escapee is
+visible rather than silently invisible (issue #183).
 
 #### Scenario: hard-stop kill tears down the bus last
 

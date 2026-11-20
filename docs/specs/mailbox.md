@@ -63,6 +63,17 @@ drain during the outage meets the same mailbox state. The durable
 flag the command accompanied is unaffected - `halted_at` enforcement
 lives in the database, the file is only a courtesy signal.
 
+Non-control deliveries get their own content-aware stale guards
+(issue #183), applied at both relay and the janitor leg: a
+`question_answer` (including the expiry notice riding the same
+kind) SHALL be dropped once its asker's task is terminal - the
+answer is dead weight in a new context - and a `task_dispatch`
+SHALL be dropped once its invitation resolved (the task left
+`queued`/`dispatch_decided`, or belongs to a different session),
+so a re-register draining old files never meets a stale prompt.
+Drops journal `stale_answer_dropped`/`stale_dispatch_dropped`;
+unresolvable refs deliver - missing evidence never drops mail.
+
 #### Scenario: superseded halt never reaches the drain
 
 - **WHEN** a `halt` then a `resume` notification exist for one session

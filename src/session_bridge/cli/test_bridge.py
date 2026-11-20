@@ -1935,6 +1935,39 @@ def test_item18_gwt3_finish_ok_and_fail(env, capsys):
     assert row["note"] == "boom"
 
 
+def test_r2_finish_note_file_and_exclusive(env, capsys, tmp_path):
+    """review r2: --note-file carries a payload too large for argv."""
+    db.set_session_mode(SID, SessionMode.MANAGED, path=env.db)
+    big = tmp_path / "note.txt"
+    big.write_text("x" * 200000 + " tail", encoding="utf-8")
+    t1 = _task(env)
+    assert _run(["claim", str(t1), "--session", SID, "--json"], capsys)[0] == ExitCode.OK
+    rc, _ = _run(
+        ["finish", str(t1), "--session", SID, "--note-file", str(big), "--json"],
+        capsys,
+    )
+    assert rc == ExitCode.OK
+    assert db.get_task(t1, path=env.db)["note"].endswith(" tail")
+    t2 = _task(env)
+    assert _run(["claim", str(t2), "--session", SID, "--json"], capsys)[0] == ExitCode.OK
+    rc, out = _run(
+        [
+            "finish",
+            str(t2),
+            "--session",
+            SID,
+            "--note",
+            "a",
+            "--note-file",
+            str(big),
+            "--json",
+        ],
+        capsys,
+    )
+    assert rc == ExitCode.USAGE
+    assert "mutually exclusive" in out["error"]
+
+
 def test_item18_gwt4_claim_terminal_refused(env, capsys):
     db.set_session_mode(SID, SessionMode.MANAGED, path=env.db)
     """[ITEM-18.GWT-4] done/failed tasks are not claimable."""
@@ -4566,3 +4599,108 @@ def test_issue168_gwt1_spawn_worker_env_marker(tmp_path, monkeypatch):
     captured.clear()
     dispatch._spawn_worker(8, "acp-x-1-8", args)
     assert "DEVIN_SESSION_ID" not in captured[0][1]["env"]
+
+
+# --- issue #183: review r2 stop/kill hardening --------------------------------
+
+
+def test_issue183_r2_stop_holds_halt_during_ladder(env, capsys, monkeypatch):
+    """[ISSUE-183.R2-CLI-1] `bridge stop` holds ``halted_at`` for the
+    ladder's duration (review r2, #5): a racing pump cannot stage
+    new work mid-stop. The flag releases after - stop interrupts
+    the current work, it does not park the session like ``halt``."""
+    db.register("w1", "/repo/w", path=env.db)
+    observed = []
+
+    def _cancel(sid, **kw):
+        observed.append(
+            db.get_session(sid, path=env.db)["halted_at"] is not None
+        )
+        return "confirmed"
+
+    monkeypatch.setattr(sessions, "cancel_turn", _cancel)
+    monkeypatch.setattr(sessions, "close_session", lambda sid, **kw: "confirmed")
+
+    rc, out = _run(["stop", "w1", "--json"], capsys)
+
+    assert rc == ExitCode.OK
+    assert observed == [True]
+    d = out["data"]
+    assert d["pre_halt"] == "ok" and d["halt_release"] == "ok"
+    assert db.get_session("w1", path=env.db)["halted_at"] is None
+    ev = db.list_events(session_id="w1", kind="session_stopped", path=env.db)
+    assert len(ev) == 1
+    assert "pre_halt=ok" in ev[0]["body"] and "halt_release=ok" in ev[0]["body"]
+
+
+def test_issue183_r2_stop_dry_run_writes_no_halt(env, capsys, monkeypatch):
+    """[ISSUE-183.R2-CLI-2] `stop --dry-run` touches nothing: no
+    halt write, no transport attach, pre_halt reports skipped."""
+    db.register("w1", "/repo/w", path=env.db)
+
+    def _boom(*a, **kw):
+        raise AssertionError("dry_run must not attach")
+
+    monkeypatch.setattr(sessions, "cancel_turn", _boom)
+    monkeypatch.setattr(sessions, "close_session", _boom)
+
+    rc, out = _run(["stop", "w1", "--dry-run", "--json"], capsys)
+
+    assert rc == ExitCode.OK
+    assert out["data"]["pre_halt"] == "skipped"
+    assert db.get_session("w1", path=env.db)["halted_at"] is None
+
+
+def test_issue183_r2_stop_failure_still_releases_halt(env, capsys, monkeypatch):
+    """[ISSUE-183.R2-CLI-3] a ladder exception still releases the
+    pre-halt: a crashed stop must not strand the session parked -
+    the failure path reports stop_exception, not a silent wedge."""
+    db.register("w1", "/repo/w", path=env.db)
+
+    def _boom(args, sid, **kw):
+        raise RuntimeError("layer crash")
+
+    monkeypatch.setattr(sessions, "_run_stop_layers", _boom)
+
+    rc, out = _run(["stop", "w1", "--json"], capsys)
+
+    # every layer failing is a real failure - but the halt must not
+    # outlive the crashed ladder
+    assert rc == ExitCode.INTERNAL
+    d = out["data"]
+    assert d["status"] == "error" and "RuntimeError" in d["stop_exception"]
+    assert d["pre_halt"] == "ok" and d["halt_release"] == "ok"
+    assert db.get_session("w1", path=env.db)["halted_at"] is None
+
+
+def test_issue183_r2_kill_hard_stop_stamps_started_marker(env, capsys, monkeypatch):
+    """[ISSUE-183.R2-CLI-4] `kill --hard-stop` stamps the durable
+    ``session_kill_started`` marker BEFORE the ladder - the daemon's
+    kill-teardown pass can only recover a wedge it can see."""
+    db.register("w1", "/repo/w", path=env.db)
+    monkeypatch.setattr(sessions, "cancel_turn", lambda sid, **kw: "confirmed")
+    monkeypatch.setattr(sessions, "close_session", lambda sid, **kw: "confirmed")
+    monkeypatch.setattr(
+        sessions,
+        "_run_sweep",
+        lambda args, sid, **kw: {
+            "sweep_status": "ok",
+            "swept": [],
+            "candidates": [],
+            "sweep_excluded": [],
+            "weak_suspects": [],
+            "acp_host_pid": 100,
+            "backend_pid": 101,
+        },
+    )
+
+    rc, out = _run(["kill", "w1", "--hard-stop", "--json"], capsys)
+
+    assert rc == ExitCode.OK
+    started = db.list_events(session_id="w1", kind="session_kill_started", path=env.db)
+    killed = db.list_events(session_id="w1", kind="session_killed", path=env.db)
+    assert len(started) == 1 and len(killed) == 1
+    # ordering: the marker precedes the teardown event
+    assert started[0]["id"] < killed[0]["id"]
+    # the daemon finds nothing unmatched to recover
+    assert db.interrupted_hard_kills(int(time.time()), min_age_seconds=0, path=env.db) == []

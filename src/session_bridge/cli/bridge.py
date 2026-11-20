@@ -444,6 +444,11 @@ def _parse_args(argv) -> argparse.Namespace:
     sp.add_argument("--session", required=True, help="finishing session id")
     sp.add_argument("--fail", action="store_true", help="mark failed instead of done")
     sp.add_argument("--note", default=None, help="optional completion note")
+    sp.add_argument(
+        "--note-file",
+        default=None,
+        help="read the completion note from a file (payloads too large for argv)",
+    )
     _add_json(sp)
 
     # item_22: declare an external wait - one LEASE_SECONDS renewal per
@@ -458,6 +463,11 @@ def _parse_args(argv) -> argparse.Namespace:
         "--reason",
         default=None,
         help="what you are waiting on (lands in the task note)",
+    )
+    sp.add_argument(
+        "--reason-file",
+        default=None,
+        help="read the wait reason from a file (payloads too large for argv)",
     )
     _add_json(sp)
 

@@ -3533,3 +3533,115 @@ def test_issue153_gwt8_trip_below_threshold_is_noop(db_path):
     assert db.trip_thrash_breaker(9999, path=db_path) is None
     assert db.list_events(kind="thrash_breaker", path=db_path) == []
     assert _thrash_escalations(db_path) == []
+
+
+# --- issue #183: review r2 slot/wait hardening --------------------------------
+
+
+def test_issue183_r2_waiting_quota_frees_session_slot(db_path, monkeypatch):
+    """[ISSUE-183.R2-9] a waiting_quota park releases the session
+    slot for the park's duration (review r2, #15): a task sleeping
+    until the provider reset burns no worker capacity, so another
+    session claims while it is parked."""
+    monkeypatch.setattr(db, "MAX_ACTIVE_SESSIONS", 1)
+    db.set_max_active_sessions(1, path=db_path)
+    db.register("s1", "/repo/a", path=db_path)
+    t1 = db.enqueue("s1", "a", path=db_path)
+    assert db.claim_queued(t1, "w1", Transport.ACP_PUSH, path=db_path)
+    assert db.mark_running(t1, "w1", path=db_path)
+    # cap reached: a second session cannot claim yet
+    db.register("s2", "/repo/b", path=db_path)
+    t2 = db.enqueue("s2", "b", path=db_path)
+    assert not db.claim_queued(t2, "w2", Transport.ACP_PUSH, path=db_path)
+    # park the first task -> its slot frees for the park's duration
+    assert db.quota_park(
+        t1, "s1", int(time.time()) + 900, "reset", "self-report", path=db_path
+    )
+    assert db.claim_queued(t2, "w2", Transport.ACP_PUSH, path=db_path)
+    assert db.mark_running(t2, "w2", path=db_path)
+    # active_session_ids agrees: the parked session holds no slot
+    assert db.active_session_ids(path=db_path) == {"s2"}
+    # release the park -> the task is live again, holds its slot,
+    # and a third session is refused by the same cap
+    assert db.quota_resume(t1, "s1", path=db_path)
+    db.register("s3", "/repo/c", path=db_path)
+    t3 = db.enqueue("s3", "c", path=db_path)
+    assert not db.claim_queued(t3, "w3", Transport.ACP_PUSH, path=db_path)
+    assert db.active_session_ids(path=db_path) == {"s1", "s2"}
+
+
+def test_issue183_r2_wait_budget_bounded(db_path, monkeypatch):
+    """[ISSUE-183.R2-10] cumulative waiting inside one claim is
+    bounded (review r2, #16): wait_renewals caps at WAIT_RENEWAL_CAP
+    and the renewal refuses - a worker calling forever can no
+    longer hold the task indefinitely."""
+    monkeypatch.setattr(db, "WAIT_RENEWAL_CAP", 3)
+    db.register("s1", "/repo/a", path=db_path)
+    tid = db.enqueue("s1", "a", path=db_path)
+    assert db.claim_queued(tid, "w1", Transport.ACP_PUSH, path=db_path)
+    assert db.mark_running(tid, "w1", path=db_path)
+    for _ in range(3):
+        assert db.wait_task(tid, "w1", "waiting", path=db_path)
+    # the bound trips: no further wait renewal inside this claim
+    assert not db.wait_task(tid, "w1", "still waiting", path=db_path)
+    row = db.get_task(tid, path=db_path)
+    assert row["wait_renewals"] == 3 and row["status"] == "running"
+    # only the wait channel is capped - the plain lease renewal and
+    # the finish path are untouched
+    assert db.renew_lease(tid, "w1", path=db_path)
+    # requeue + reclaim resets the budget for the fresh claim
+    _exec(db_path, "UPDATE tasks SET status='queued' WHERE id=?", (tid,))
+    assert db.claim_managed(tid, "s1", "w1", path=db_path)
+    row = db.get_task(tid, path=db_path)
+    assert row["wait_renewals"] == 0
+    assert db.wait_task(tid, "w1", "waiting", path=db_path)
+
+
+def test_issue183_r2_wait_budget_disabled(db_path, monkeypatch):
+    """WAIT_RENEWAL_CAP=0 disables the bound - explicit opt-out keeps
+    the pre-r2 unbounded shape for fleets that need it."""
+    monkeypatch.setattr(db, "WAIT_RENEWAL_CAP", 0)
+    db.register("s1", "/repo/a", path=db_path)
+    tid = db.enqueue("s1", "a", path=db_path)
+    assert db.claim_queued(tid, "w1", Transport.ACP_PUSH, path=db_path)
+    assert db.mark_running(tid, "w1", path=db_path)
+    for _ in range(50):
+        assert db.wait_task(tid, "w1", "waiting", path=db_path)
+
+
+def test_issue183_r2_interrupted_hard_kills_query(db_path):
+    """The query contract: only old, unmatched session_kill_started
+    markers on non-dead sessions qualify - matched pairs, fresh
+    markers and dead rows are all excluded."""
+    db.register("s1", "/repo/a", path=db_path)
+    db.register("s2", "/repo/b", path=db_path)
+    db.register("s3", "/repo/c", path=db_path)
+    now = int(time.time())
+    # s1: old unmatched marker -> qualifies
+    db.record_event("s1", "session_kill_started", "hard_stop=1", path=db_path)
+    _exec(
+        db_path,
+        "UPDATE decision_events SET created_at=? WHERE kind='session_kill_started'",
+        (now - 200,),
+    )
+    # s2: matched pair -> excluded
+    db.record_event("s2", "session_kill_started", "hard_stop=1", path=db_path)
+    db.record_event("s2", "session_killed", "done", path=db_path)
+    _exec(
+        db_path,
+        "UPDATE decision_events SET created_at=? WHERE session_id='s2'",
+        (now - 200,),
+    )
+    # s3: dead row -> excluded even with an old unmatched marker
+    db.record_event("s3", "session_kill_started", "hard_stop=1", path=db_path)
+    _exec(
+        db_path,
+        "UPDATE decision_events SET created_at=? WHERE session_id='s3'",
+        (now - 200,),
+    )
+    _exec(db_path, "UPDATE sessions SET status='dead' WHERE session_id='s3'")
+    assert db.interrupted_hard_kills(now, min_age_seconds=120, path=db_path) == ["s1"]
+    # a fresh marker is not stale enough
+    db.register("s4", "/repo/d", path=db_path)
+    db.record_event("s4", "session_kill_started", "hard_stop=1", path=db_path)
+    assert db.interrupted_hard_kills(now, min_age_seconds=120, path=db_path) == ["s1"]

@@ -679,6 +679,7 @@ def _run_sweep(args, sid: str, *, dry_run: bool) -> dict:
         "swept": [],
         "candidates": [],
         "sweep_excluded": [],
+        "weak_suspects": [],
         "acp_host_pid": None,
         "backend_pid": None,
     }
@@ -700,6 +701,7 @@ def _run_sweep(args, sid: str, *, dry_run: bool) -> dict:
     out["swept"] = res["swept"]
     out["candidates"] = res["candidates"]
     out["sweep_excluded"] = res["skipped"]
+    out["weak_suspects"] = res.get("weak_suspects", [])
     out["acp_host_pid"] = res.get("acp_host_pid")
     out["backend_pid"] = res.get("backend_pid")
     return out
@@ -763,6 +765,7 @@ def _run_stop_layers(args, sid: str, *, hard: bool, dry_run: bool) -> dict:
             "swept": [],
             "candidates": [],
             "sweep_excluded": [],
+            "weak_suspects": [],
             "acp_host_pid": None,
             "backend_pid": None,
         }
@@ -834,21 +837,42 @@ def _cmd_stop(args) -> int:
       victims with reasons and kills nothing - and suppresses layers
       0-1 too, so a dry run never touches the live session.
 
-    The bus row is untouched: ``stop`` is process/session level only.
     For the full teardown chain ``bridge kill <sid> --hard-stop``
     runs these layers first and ``db.kill_session`` LAST, folding the
     layer outcomes into the ``session_killed`` event. Every stop
     writes a ``session_stopped`` decision event carrying the
     per-layer outcomes.
+
+    Pre-halt (architect review r2, #5): a real (non-dry-run) stop
+    holds ``halted_at`` for the duration of the ladder - the
+    multi-second window otherwise lets a racing pump stage new
+    tasks onto a session that is being stopped. The flag is
+    released once the ladder finishes (``stop`` interrupts the
+    current work; parking until ``bridge resume`` is ``halt``'s
+    contract, not stop's). Both the hold and the release are
+    recorded honestly - a failed write is surfaced, not swallowed.
     """
     sid = args.session_id
-    if db.get_session(sid, path=args.db) is None:
+    session = db.get_session(sid, path=args.db)
+    if session is None:
         resp = JsonResponse(
             session=sid,
             status="not_found",
             error=f"no registration for {sid}",
         )
         return _emit(args, resp, ExitCode.NOT_FOUND, f"not registered: {sid}")
+    pre_halt = "skipped"
+    if not args.dry_run:
+        if session["halted_at"]:
+            # already parked by `bridge halt` - the flag is not ours
+            # to release afterward
+            pre_halt = "already"
+        else:
+            try:
+                db.set_session_halted(sid, True, path=args.db)
+                pre_halt = "ok"
+            except Exception as e:
+                pre_halt = f"failed:{e.__class__.__name__}: {e}"
     try:
         report = _run_stop_layers(args, sid, hard=args.hard, dry_run=args.dry_run)
     except Exception as e:
@@ -866,12 +890,27 @@ def _cmd_stop(args) -> int:
             "swept": [],
             "candidates": [],
             "sweep_excluded": [],
+            "weak_suspects": [],
             "acp_host_pid": None,
             "backend_pid": None,
             "stop_exception": f"{e.__class__.__name__}: {e}",
         }
+    halt_release = "skipped"
+    if pre_halt == "ok":
+        try:
+            db.set_session_halted(sid, False, path=args.db)
+            halt_release = "ok"
+        except Exception as e:
+            halt_release = f"failed:{e.__class__.__name__}: {e}"
     status = _stop_status(report)
-    db.record_event(sid, "session_stopped", _stop_event_body(report), path=args.db)
+    if pre_halt not in ("skipped", "ok"):
+        report["pre_halt"] = pre_halt
+    db.record_event(
+        sid,
+        "session_stopped",
+        _stop_event_body(report) + f" pre_halt={pre_halt} halt_release={halt_release}",
+        path=args.db,
+    )
     data = {
         "cancel_outcome": report["cancel_outcome"],
         "close_outcome": report["close_outcome"],
@@ -879,7 +918,10 @@ def _cmd_stop(args) -> int:
         "sweep_status": report["sweep_status"],
         "candidates": report["candidates"],
         "sweep_excluded": report["sweep_excluded"],
+        "weak_suspects": report.get("weak_suspects", []),
         "status": status,
+        "pre_halt": pre_halt,
+        "halt_release": halt_release,
     }
     if report.get("stop_exception"):
         data["stop_exception"] = report["stop_exception"]
@@ -892,6 +934,17 @@ def _cmd_stop(args) -> int:
         f"stop {sid}: cancel={report['cancel_outcome']}"
         f" close={report['close_outcome']}"
         + (f" sweep={report['sweep_status']} swept={len(swept)}" if args.hard else "")
+        + (
+            f" weak_suspects={len(report.get('weak_suspects') or [])}"
+            if report.get("weak_suspects")
+            else ""
+        )
+        + (
+            f" pre_halt={pre_halt}"
+            if pre_halt != "skipped" and pre_halt != "ok"
+            else ""
+        )
+        + (f" halt_release={halt_release}" if halt_release.startswith("failed") else "")
         + (" [dry-run]" if args.dry_run else "")
     )
     if report.get("stop_exception"):
@@ -936,6 +989,7 @@ def _cmd_kill_session(args) -> int:
     dry_run = getattr(args, "dry_run", False)
     stop_report = None
     pre_halt = "skipped"
+    kill_started = "skipped"
     if want_hard or dry_run:
         if db.get_session(sid, path=args.db) is None:
             resp = JsonResponse(
@@ -945,6 +999,19 @@ def _cmd_kill_session(args) -> int:
             )
             return _emit(args, resp, ExitCode.NOT_FOUND, f"not registered: {sid}")
         if want_hard and not dry_run:
+            # durable start marker (architect review r2, #5): if the
+            # CLI dies between here and db.kill_session, the daemon's
+            # kill-teardown pass finds the unmatched
+            # session_kill_started and finalizes the row instead of
+            # leaving a halted session wedged on its slot and task.
+            try:
+                db.record_event(sid, "session_kill_started", "hard_stop=1", path=args.db)
+                kill_started = "ok"
+            except Exception as e:
+                # best-effort: losing the marker degrades recovery to
+                # the pre-marker behaviour - the kill still proceeds,
+                # but the failure is surfaced, not swallowed.
+                kill_started = f"failed:{e.__class__.__name__}: {e}"
             # pre-halt (review r1, finding 4): between the layer-0
             # cancel and the final db.kill_session the row is still
             # live - a racing pump/relay could wake or re-dispatch it
@@ -1008,6 +1075,7 @@ def _cmd_kill_session(args) -> int:
                 human += f"; stop_exception={stop_report['stop_exception']}"
             return _emit(args, resp, ExitCode.OK, human)
         stop_report["pre_halt"] = pre_halt
+        stop_report["kill_started"] = kill_started
     verdict = db.kill_session(sid, stop_report=stop_report, path=args.db)
     if isinstance(verdict, KillNotFound):
         resp = JsonResponse(

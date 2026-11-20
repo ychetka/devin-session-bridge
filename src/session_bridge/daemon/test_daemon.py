@@ -3176,3 +3176,151 @@ def test_issue168_spawn_daemon_strips_marker_from_exec_env(env, monkeypatch):
     # the marker is stripped only from the child's copy - the caller's
     # own environment is untouched
     assert os.environ[SESSION_ID_ENV] == "s1"
+
+
+# --- review r2: interrupted hard-kill teardown (finding 5) ----------------------
+
+
+def test_issue183_r2_interrupted_kill_finalized(env):
+    """[ISSUE-183.R2-6] a ``session_kill_started`` marker older than
+    the grace bound with no later ``session_killed`` means the CLI
+    died mid-ladder - the daemon finalizes the teardown: dead row,
+    deduped event, notify."""
+    res = db.register(SID, "/repo/ws", path=env.db)
+    assert res.accepted
+    db.record_event(SID, "session_kill_started", "hard_stop=1", path=env.db)
+    # age the marker past _KILL_TEARDOWN_GRACE
+    _exec(
+        env.db,
+        "UPDATE decision_events SET created_at=? WHERE kind='session_kill_started'",
+        (int(time.time()) - daemon._KILL_TEARDOWN_GRACE - 10,),
+    )
+    n = daemon._kill_teardown_pass(env.db, env.sdir, env.notifier, int(time.time()))
+    assert n == 1
+    row = _one(env.db, "SELECT status FROM sessions WHERE session_id=?", (SID,))
+    assert row["status"] == "dead"
+    ev = _one(
+        env.db,
+        "SELECT kind,body FROM decision_events"
+        " WHERE kind='session_killed' AND session_id=?",
+        (SID,),
+    )
+    assert ev is not None and "interrupted" in ev["body"]
+    assert env.sent, "operator must be notified of the recovered wedge"
+    # idempotent: a second pass finds nothing unmatched
+    assert daemon._kill_teardown_pass(env.db, env.sdir, env.notifier, int(time.time())) == 0
+
+
+def test_issue183_r2_fresh_kill_marker_untouched(env):
+    """A marker younger than the grace bound may belong to a
+    still-running ladder - the daemon leaves it alone."""
+    res = db.register(SID, "/repo/ws", path=env.db)
+    assert res.accepted
+    db.record_event(SID, "session_kill_started", "hard_stop=1", path=env.db)
+    assert daemon._kill_teardown_pass(env.db, env.sdir, env.notifier, int(time.time())) == 0
+    row = _one(env.db, "SELECT status FROM sessions WHERE session_id=?", (SID,))
+    assert row["status"] == "active"
+
+
+def test_issue183_r2_completed_kill_not_recovered(env):
+    """A started marker followed by ``session_killed`` is a finished
+    kill - no recovery, no second kill."""
+    res = db.register(SID, "/repo/ws", path=env.db)
+    assert res.accepted
+    db.record_event(SID, "session_kill_started", "hard_stop=1", path=env.db)
+    db.record_event(SID, "session_killed", "cancel=idle", path=env.db)
+    _exec(
+        env.db,
+        "UPDATE decision_events SET created_at=? WHERE kind='session_kill_started'",
+        (int(time.time()) - daemon._KILL_TEARDOWN_GRACE - 10,),
+    )
+    assert daemon._kill_teardown_pass(env.db, env.sdir, env.notifier, int(time.time())) == 0
+    row = _one(env.db, "SELECT status FROM sessions WHERE session_id=?", (SID,))
+    assert row["status"] == "active"
+
+
+# --- review r2: stale answer/dispatch guards (findings 18-19) -------------------
+
+
+def _mk_question(path, sid, task_id, state="pending"):
+    con = db.connect(path)
+    try:
+        cur = con.execute(
+            "INSERT INTO questions(task_id,session_id,text,state,asked_at)"
+            " VALUES(?,?,?,?,?)",
+            (task_id, sid, "q?", state, int(time.time())),
+        )
+        return cur.lastrowid
+    finally:
+        con.close()
+
+
+def test_issue183_r2_stale_question_answer_dropped(env):
+    """[ISSUE-183.R2-7] a question_answer whose asker's task went
+    terminal is consumed without delivery - the answer is dead
+    weight in a new context (review r2, #19). The drop journals
+    ``stale_answer_dropped`` and still marks the row relayed."""
+    tid = db.enqueue(SID, "work", path=env.db)
+    qid = _mk_question(env.db, SID, tid)
+    nid = db.notify(
+        SID, NotificationKind.QUESTION_ANSWER, "ans", task_id=tid,
+        question_id=qid, path=env.db,
+    )
+    _exec(env.db, "UPDATE tasks SET status='failed' WHERE id=?", (tid,))
+    assert daemon.run(env.db, env.qdir, once=True) == daemon.RUN_OK
+    mdir = Path(env.qdir) / SID
+    assert not mdir.exists() or _msg_files(mdir) == []
+    assert db.unrelayed_notifications(path=env.db) == []
+    ev = _one(
+        env.db,
+        "SELECT kind,body FROM decision_events WHERE kind='stale_answer_dropped'",
+    )
+    assert ev is not None and f"notification={nid}" in ev["body"]
+
+
+def test_issue183_r2_live_task_answer_delivers(env):
+    """A question_answer for a still-live asker is unaffected by the
+    stale guard and relays normally."""
+    tid = db.enqueue(SID, "work", path=env.db)
+    qid = _mk_question(env.db, SID, tid)
+    db.notify(
+        SID, NotificationKind.QUESTION_ANSWER, "ans", task_id=tid,
+        question_id=qid, path=env.db,
+    )
+    _exec(env.db, "UPDATE tasks SET status='running', lease_owner='w1' WHERE id=?", (tid,))
+    assert daemon.run(env.db, env.qdir, once=True) == daemon.RUN_OK
+    files = _msg_files(Path(env.qdir) / SID)
+    assert len(files) == 1 and "kind: question_answer" in (Path(env.qdir) / SID / files[0]).read_text()
+
+
+def test_issue183_r2_stale_dispatch_dropped(env):
+    """[ISSUE-183.R2-8] a task_dispatch outbox row whose invitation
+    already resolved (task no longer dispatch_decided) is dropped,
+    not materialized as a stale prompt (review r2, #18)."""
+    tid = db.enqueue(SID, "work", path=env.db)
+    nid = db.notify(SID, NotificationKind.TASK_DISPATCH, "prompt", task_id=tid, path=env.db)
+    # the invitation resolved while the row sat in the outbox
+    _exec(env.db, "UPDATE tasks SET status='failed' WHERE id=?", (tid,))
+    assert daemon.run(env.db, env.qdir, once=True) == daemon.RUN_OK
+    mdir = Path(env.qdir) / SID
+    assert not mdir.exists() or _msg_files(mdir) == []
+    assert db.unrelayed_notifications(path=env.db) == []
+    ev = _one(
+        env.db,
+        "SELECT kind,body FROM decision_events WHERE kind='stale_dispatch_dropped'",
+    )
+    assert ev is not None and f"notification={nid}" in ev["body"]
+
+
+def test_issue183_r2_fresh_dispatch_delivers(env):
+    """A dispatch_decided invitation still relays normally."""
+    tid = db.enqueue(SID, "work", path=env.db)
+    _exec(
+        env.db,
+        "UPDATE tasks SET status='dispatch_decided', lease_owner='w1' WHERE id=?",
+        (tid,),
+    )
+    db.notify(SID, NotificationKind.TASK_DISPATCH, "prompt", task_id=tid, path=env.db)
+    assert daemon.run(env.db, env.qdir, once=True) == daemon.RUN_OK
+    files = _msg_files(Path(env.qdir) / SID)
+    assert len(files) == 1 and "kind: task_dispatch" in (Path(env.qdir) / SID / files[0]).read_text()
