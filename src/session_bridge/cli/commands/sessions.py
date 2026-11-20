@@ -862,6 +862,7 @@ def _cmd_stop(args) -> int:
         )
         return _emit(args, resp, ExitCode.NOT_FOUND, f"not registered: {sid}")
     pre_halt = "skipped"
+    held_ts = None
     if not args.dry_run:
         if session["halted_at"]:
             # already parked by `bridge halt` - the flag is not ours
@@ -870,6 +871,7 @@ def _cmd_stop(args) -> int:
         else:
             try:
                 db.set_session_halted(sid, True, path=args.db)
+                held_ts = db.get_session(sid, path=args.db)["halted_at"]
                 pre_halt = "ok"
             except Exception as e:
                 pre_halt = f"failed:{e.__class__.__name__}: {e}"
@@ -898,8 +900,10 @@ def _cmd_stop(args) -> int:
     halt_release = "skipped"
     if pre_halt == "ok":
         try:
-            db.set_session_halted(sid, False, path=args.db)
-            halt_release = "ok"
+            # CAS release (review r2): a `bridge halt` landing inside
+            # the ladder window stamps a newer halted_at - the CAS
+            # refuses and their park stays in force
+            halt_release = "ok" if db.release_session_halt(sid, held_ts, path=args.db) else "held"
         except Exception as e:
             halt_release = f"failed:{e.__class__.__name__}: {e}"
     status = _stop_status(report)
@@ -940,7 +944,7 @@ def _cmd_stop(args) -> int:
             else ""
         )
         + (f" pre_halt={pre_halt}" if pre_halt != "skipped" and pre_halt != "ok" else "")
-        + (f" halt_release={halt_release}" if halt_release.startswith("failed") else "")
+        + (f" halt_release={halt_release}" if halt_release not in ("skipped", "ok") else "")
         + (" [dry-run]" if args.dry_run else "")
     )
     if report.get("stop_exception"):

@@ -71,7 +71,10 @@ requested. A non-dry-run `stop` SHALL hold `halted_at` for the
 ladder's duration so a racing pump cannot stage new work
 mid-stop, and SHALL release it when the layers finish - stop
 interrupts current work, parking until `bridge resume` remains
-`halt`'s contract (issue #183). `bridge kill <sid>
+`halt`'s contract (issue #183). The release is a CAS on the value
+stop itself wrote: a `bridge halt` landing inside the ladder
+window keeps its park, and an already-halted session is never
+un-parked by `stop`. `bridge kill <sid>
 --hard-stop` SHALL stamp a durable `session_kill_started`
 decision event and halt the session (`halted_at`) BEFORE layer 0
 so a racing pump or claim cannot re-dispatch it mid-teardown

@@ -207,8 +207,11 @@ swallowed.
 `bridge stop` holds the same flag for the ladder's duration
 (review r2 finding 5) and releases it when the layers finish -
 stop interrupts the current work; parking until `bridge resume`
-stays `halt`'s contract, not stop's. `pre_halt`/`halt_release`
-are reported and journalled.
+stays `halt`'s contract, not stop's. The release is a CAS on the
+value stop wrote: a `bridge halt` landing inside the window keeps
+its park (`halt_release=held`), and a session already halted
+before `stop` is never un-parked (`pre_halt=already`).
+`pre_halt`/`halt_release` are reported and journalled.
 
 Interrupted-kill recovery (review r2 finding 5): `kill
 --hard-stop` stamps a durable `session_kill_started` decision

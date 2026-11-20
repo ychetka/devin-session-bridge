@@ -2404,6 +2404,31 @@ def set_session_halted(session_id: str, halted: bool, *, path=None) -> None:
     _retry(op)
 
 
+def release_session_halt(session_id: str, expected_halted_at, *, path=None) -> bool:
+    """Clear ``halted_at`` only while it still holds ``expected_halted_at``.
+
+    ``bridge stop`` holds the flag for its ladder's duration and
+    releases it afterward - but a ``bridge halt`` landing inside
+    that window must not be silently un-parked by the release
+    (review r2): the CAS refuses whenever another writer stamped a
+    newer value, leaving their park in force.
+    """
+
+    def op():
+        con = connect(path)
+        try:
+            cur = con.execute(
+                "UPDATE sessions SET halted_at=NULL, updated_at=?"
+                " WHERE session_id=? AND halted_at=?",
+                (_now(), session_id, expected_halted_at),
+            )
+            return cur.rowcount == 1
+        finally:
+            con.close()
+
+    return _retry(op)
+
+
 def unregister_session(session_id: str, *, force: bool = False, path=None) -> UnregisterVerdict:
     """Delete a session registration and every session-scoped row.
 

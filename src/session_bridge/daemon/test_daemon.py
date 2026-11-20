@@ -3332,3 +3332,55 @@ def test_issue183_r2_fresh_dispatch_delivers(env):
     files = _msg_files(Path(env.qdir) / SID)
     body = (Path(env.qdir) / SID / files[0]).read_text() if files else ""
     assert len(files) == 1 and "kind: task_dispatch" in body
+
+
+def test_issue183_r2_paused_asker_keeps_answer(env):
+    """[review-round] ``paused`` is resumable, not terminal: the
+    answer to a paused asker's question still relays - only a
+    positively dead task makes it dead weight."""
+    tid = db.enqueue(SID, "work", path=env.db)
+    qid = _mk_question(env.db, SID, tid)
+    db.notify(
+        SID,
+        NotificationKind.QUESTION_ANSWER,
+        "ans",
+        task_id=tid,
+        question_id=qid,
+        path=env.db,
+    )
+    _exec(env.db, "UPDATE tasks SET status='paused' WHERE id=?", (tid,))
+    assert daemon.run(env.db, env.qdir, once=True) == daemon.RUN_OK
+    files = _msg_files(Path(env.qdir) / SID)
+    body = (Path(env.qdir) / SID / files[0]).read_text() if files else ""
+    assert len(files) == 1 and "kind: question_answer" in body
+
+
+def test_issue183_r2_paused_task_keeps_dispatch(env):
+    """[review-round] a ``paused`` task's dispatch invitation is a
+    resumable hold, not a resolved one - the file relays."""
+    tid = db.enqueue(SID, "work", path=env.db)
+    _exec(env.db, "UPDATE tasks SET status='paused' WHERE id=?", (tid,))
+    db.notify(SID, NotificationKind.TASK_DISPATCH, "prompt", task_id=tid, path=env.db)
+    assert daemon.run(env.db, env.qdir, once=True) == daemon.RUN_OK
+    files = _msg_files(Path(env.qdir) / SID)
+    body = (Path(env.qdir) / SID / files[0]).read_text() if files else ""
+    assert len(files) == 1 and "kind: task_dispatch" in body
+
+
+def test_issue183_r2_sanitized_sid_dispatch_not_dropped(env):
+    """[review-round] the janitor leg judges unverified dispatch
+    files against the sanitized mailbox dirname - a task whose raw
+    session id carries sanitized characters must not be dropped as
+    'belongs to another session'."""
+    raw_sid = "s/1"
+    db.register(raw_sid, "/repo/raw", path=env.db)
+    tid = db.enqueue(raw_sid, "work", path=env.db)
+    # mailbox dirs are sanitized: s/1 -> s_1
+    path = _foreign_msg(
+        env,
+        "s_1",
+        nid=777,
+        body=f"notification_id: 777\nkind: task_dispatch\ntask_id: {tid}\n\nx",
+    )
+    assert daemon.run(env.db, env.qdir, once=True) == daemon.RUN_OK
+    assert os.path.exists(path)  # delivered file survives the guard

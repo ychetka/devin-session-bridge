@@ -775,12 +775,23 @@ def test_issue183_r2_bridge_daemon_protected():
         ["/home/u/.venv/bin/bridge", "daemon", "run"],
         ["session-bridge", "daemon", "once"],
         ["python3", "-m", "session_bridge", "daemon", "run"],
+        ["python3", "-m", "session_bridge.cli.bridge", "daemon", "run"],
+        # global flags may precede the subcommand (review round):
+        ["bridge", "--db", "/x/state.db", "daemon", "run"],
+        ["bridge", "--json", "--db=/x", "daemon", "once"],
     ):
         proc = P(410, BACKEND_PID, argv, "/repo/w1", 2000.0, env_sid=SID)
         assert classify(proc, ctx, depth=0) == ("excluded", "bridge_daemon"), argv
-    # 'daemon' elsewhere in the argv does not buy protection
-    plain = P(411, BACKEND_PID, ["bridge", "status"], "/repo/w1", 2000.0)
-    assert classify(plain, ctx, depth=0) == ("candidate", "cwd_under:/repo/w1")
+    # 'daemon' elsewhere in the argv does not buy protection: the
+    # subcommand must be the first positional token
+    for argv in (
+        ["bridge", "status"],
+        ["bridge", "--db", "daemon", "status"],  # 'daemon' is a flag VALUE
+        ["bridge", "task", "daemon", "run"],  # decoy token after a subcommand
+        ["python3", "-m", "session_bridge.cli.bridge", "status", "--json"],
+    ):
+        plain = P(411, BACKEND_PID, argv, "/repo/w1", 2000.0)
+        assert classify(plain, ctx, depth=0) == ("candidate", "cwd_under:/repo/w1"), argv
 
 
 def test_issue183_r2_weak_suspect_reported_not_swept():

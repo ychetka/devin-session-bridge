@@ -282,22 +282,46 @@ def _shared_daemon(proc: ProcInfo) -> bool:
     return any(tok in proc.cmdline for tok in _SHARED_DAEMON_TOKENS)
 
 
+#: bridge global flags that carry a separate value token - skipped
+#: (payload included) when locating the first positional arg so
+#: ``bridge --db /x daemon run`` still resolves to the daemon
+#: subcommand and a flag VALUE never passes for it
+_VALUE_FLAGS = frozenset({"--db", "--queue-dir"})
+
+
+def _first_positional(argv) -> str | None:
+    """First non-flag argv token, skipping global flag payloads."""
+    skip_next = False
+    for tok in argv:
+        if skip_next:
+            skip_next = False
+            continue
+        if tok in _VALUE_FLAGS:
+            skip_next = True
+            continue
+        if tok.startswith("-"):
+            continue
+        return tok
+    return None
+
+
 def _bridge_daemon(proc: ProcInfo) -> bool:
     """True when the process is the fleet-wide bridge daemon.
 
     Covers the console-script form ``bridge daemon run|once`` (any
-    argv[0] path - basename is matched) and the module form
-    ``python -m session_bridge ... daemon``; the subcommand token
-    must follow the program token so a session running an unrelated
-    ``daemon``-named argv elsewhere never gets free protection.
+    argv[0] path - basename is matched, global flags allowed before
+    the subcommand) and the module form ``python -m session_bridge.*
+    daemon``; the subcommand must be the first POSITIONAL token so a
+    session running an unrelated ``daemon``-named argv elsewhere
+    never gets free protection (review r2).
     """
     argv = proc.argv
     if len(argv) >= 2 and os.path.basename(argv[0]) in _BRIDGE_DAEMON_ARGV0:
-        return argv[1] == "daemon"
+        return _first_positional(argv[1:]) == "daemon"
     if "-m" in argv:
         i = argv.index("-m")
         if i + 1 < len(argv) and argv[i + 1].startswith("session_bridge"):
-            return "daemon" in argv[i + 2 :]
+            return _first_positional(argv[i + 2 :]) == "daemon"
     return False
 
 

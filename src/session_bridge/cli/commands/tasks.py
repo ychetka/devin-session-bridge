@@ -513,7 +513,7 @@ def _payload_arg(args, name: str):
         return None, f"--{name} and --{name}-file are mutually exclusive"
     try:
         return Path(file_arg).read_text(encoding="utf-8").strip(), None
-    except OSError as e:
+    except (OSError, UnicodeDecodeError) as e:
         return None, f"cannot read --{name}-file {file_arg}: {e}"
 
 

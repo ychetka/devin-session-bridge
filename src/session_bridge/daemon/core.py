@@ -49,10 +49,11 @@ import time
 
 from session_bridge.env_marker import unmark_env
 from session_bridge.mailbox import mailbox_dir, queue_root, write_message
+from session_bridge.mailbox.core import _dir_name
 from session_bridge.quota import DEFAULT_PARK_SECONDS, parse_quota_signal
 from session_bridge.state import db
 from session_bridge.state.contract import (
-    LIVE_STATUSES,
+    TERMINAL_STATUSES,
     WAKE_UNCONFIRMED_ESCALATE_STREAK,
     NotificationKind,
     QuestionState,
@@ -114,16 +115,19 @@ _INTERVAL_ENV = "SESSIONS_BRIDGE_DAEMON_INTERVAL"
 
 _LOCK_ERRNOS = (errno.EACCES, errno.EAGAIN)
 
-#: live task status values - the question_answer stale guard judges
-#: terminal-vs-live on these (review r2, #19)
-_LIVE_TASK_STATUS_VALUES = {s.value for s in LIVE_STATUSES}
+#: terminal task status values - the question_answer stale guard
+#: drops only on these (review r2, #19): a resumable ``paused``
+#: asker may still need the answer after unpark
+_TERMINAL_TASK_STATUS_VALUES = {s.value for s in TERMINAL_STATUSES}
 
 #: statuses in which a task_dispatch delivery is still a live
 #: invitation: queued (schedule-materialized and requeued rows are
-#: claimable from queued) and the staged dispatch_decided window
+#: claimable from queued), the staged dispatch_decided window, and
+#: paused - a resumable hold whose invitation revives with the row
 _DISPATCH_LIVE_STATUSES = {
     TaskStatus.QUEUED.value,
     TaskStatus.DISPATCH_DECIDED.value,
+    TaskStatus.PAUSED.value,
 }
 
 
@@ -477,8 +481,11 @@ def _question_answer_stale_reason(qid, *, db_path=None, con=None) -> str | None:
         # unresolvable task row - same conservative rule as the
         # dispatch guard: missing evidence never drops mail
         return None
-    if status not in _LIVE_TASK_STATUS_VALUES:
+    if status in _TERMINAL_TASK_STATUS_VALUES:
         return f"task={tid} status={status} (asker gone)"
+    # anything non-terminal - queued/running/awaiting_user and the
+    # resumable paused - keeps the delivery: only a positively dead
+    # asker makes the answer dead weight
     return None
 
 
@@ -510,7 +517,10 @@ def _dispatch_stale_reason(tid, sid, *, db_path=None, con=None) -> str | None:
         return None
     if t["status"] not in _DISPATCH_LIVE_STATUSES:
         return f"task={tid} status={t['status']} (invitation resolved)"
-    if t["session_id"] != sid:
+    if t["session_id"] != sid and _dir_name(t["session_id"]) != sid:
+        # mailbox dirs are named by the sanitized sid - a task whose
+        # session id carries sanitized characters still matches its
+        # own mailbox through the second leg
         return f"task={tid} belongs to {t['session_id']}, not {sid}"
     return None
 

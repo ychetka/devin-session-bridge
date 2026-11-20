@@ -4671,6 +4671,64 @@ def test_issue183_r2_stop_failure_still_releases_halt(env, capsys, monkeypatch):
     assert db.get_session("w1", path=env.db)["halted_at"] is None
 
 
+def test_issue183_r2_stop_never_unparks_existing_halt(env, capsys, monkeypatch):
+    """[review-round] a session already parked by ``bridge halt``
+    keeps its park through ``stop`` - the pre-halt check reports
+    ``already`` and the release never clears a flag stop did not
+    write."""
+    db.register("w1", "/repo/w", path=env.db)
+    db.set_session_halted("w1", True, path=env.db)
+    monkeypatch.setattr(sessions, "cancel_turn", lambda sid, **kw: "confirmed")
+
+    rc, out = _run(["stop", "w1", "--json"], capsys)
+
+    assert rc == ExitCode.OK
+    d = out["data"]
+    assert d["pre_halt"] == "already" and d["halt_release"] == "skipped"
+    assert db.get_session("w1", path=env.db)["halted_at"] is not None
+
+
+def test_issue183_r2_stop_release_is_cas(env, capsys, monkeypatch):
+    """[review-round] a ``bridge halt`` landing INSIDE the ladder
+    window stamps a newer ``halted_at`` - the CAS release refuses
+    (``halt_release=held``) and the operator's park survives."""
+    db.register("w1", "/repo/w", path=env.db)
+
+    def _concurrent_halt(args, sid, **kw):
+        # another writer stamps a newer halt mid-ladder
+        con = db.connect(env.db)
+        try:
+            con.execute(
+                "UPDATE sessions SET halted_at=halted_at+1 WHERE session_id=?",
+                (sid,),
+            )
+            con.commit()
+        finally:
+            con.close()
+        return {
+            "hard": False,
+            "dry_run": False,
+            "cancel_outcome": "confirmed",
+            "close_outcome": "skipped:confirmed",
+            "sweep_status": "skipped:no_hard",
+            "swept": [],
+            "candidates": [],
+            "sweep_excluded": [],
+            "weak_suspects": [],
+            "acp_host_pid": None,
+            "backend_pid": None,
+        }
+
+    monkeypatch.setattr(sessions, "_run_stop_layers", _concurrent_halt)
+
+    rc, out = _run(["stop", "w1", "--json"], capsys)
+
+    assert rc == ExitCode.OK
+    d = out["data"]
+    assert d["pre_halt"] == "ok" and d["halt_release"] == "held"
+    assert db.get_session("w1", path=env.db)["halted_at"] is not None
+
+
 def test_issue183_r2_kill_hard_stop_stamps_started_marker(env, capsys, monkeypatch):
     """[ISSUE-183.R2-CLI-4] `kill --hard-stop` stamps the durable
     ``session_kill_started`` marker BEFORE the ladder - the daemon's
