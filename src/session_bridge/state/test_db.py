@@ -3554,9 +3554,7 @@ def test_issue183_r2_waiting_quota_frees_session_slot(db_path, monkeypatch):
     t2 = db.enqueue("s2", "b", path=db_path)
     assert not db.claim_queued(t2, "w2", Transport.ACP_PUSH, path=db_path)
     # park the first task -> its slot frees for the park's duration
-    assert db.quota_park(
-        t1, "s1", int(time.time()) + 900, "reset", "self-report", path=db_path
-    )
+    assert db.quota_park(t1, "s1", int(time.time()) + 900, "reset", "self-report", path=db_path)
     assert db.claim_queued(t2, "w2", Transport.ACP_PUSH, path=db_path)
     assert db.mark_running(t2, "w2", path=db_path)
     # active_session_ids agrees: the parked session holds no slot
